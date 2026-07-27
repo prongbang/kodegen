@@ -43,6 +43,14 @@ jobs:
       - name: Check mysql backend
         run: cargo check --locked --features mysql
 
+      # The one backend that is not Diesel. Additive here like the two above —
+      # `default = ["sqlite"]` is still on, so this proves the lock already pins
+      # `mongodb` and resolves it, not that the project compiles with Diesel
+      # gated out. That state only exists after `kodegen add mongodb` rewrites
+      # `bootstrap.rs` too, so it is kodegen's CI that compiles it, not this one.
+      - name: Check document backend
+        run: cargo check --locked --features document
+
       # Not a backend — `cache` sits alongside one. Turning it on with no cache
       # adapter generated is still the check that matters: it is what proves the
       # lock already pins `redis` before `kodegen add redis` needs it.

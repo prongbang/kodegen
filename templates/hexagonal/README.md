@@ -38,7 +38,7 @@ GRPC_PORT=50052 cargo run       # + inbound gRPC features on 0.0.0.0:50052
 cargo test
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `cache`, `blob`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `document`, `cache`, `blob`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
 
 ### Examples
 
@@ -83,6 +83,7 @@ curl localhost:8080/hello/world
 | `GRPC_PORT` | unset | Optional. When set, inbound gRPC features (`bootstrap::grpc_routes`) are served on this port alongside HTTP. |
 | `RUST_LOG` | `info` | Tracing log filter (`EnvFilter`) |
 | `DATABASE_URL` | unset (in-memory repo) | Optional. Connection string for the Diesel-backed `UserRepository`; the format depends on which backend is enabled (see [Capabilities](#capabilities)). Unset falls back to the in-memory adapter. |
+| `MONGODB_URL` / `MONGODB_DB` | unset (in-memory repo) | Optional, and only meaningful after `kodegen add mongodb`, which replaces `DATABASE_URL` with these: e.g. `mongodb://127.0.0.1:27017` and the database name (`app` if unset). Unset falls back to the in-memory adapter. |
 | `REDIS_URL` | unset (in-memory cache) | Optional, and only meaningful after `kodegen add redis`. Redis/Valkey connection string for the `Cache` port, e.g. `redis://127.0.0.1:6379`. Unset falls back to the in-memory adapter. |
 | `S3_BUCKET` | unset (files on disk) | Optional, and only meaningful after `kodegen add s3`. The bucket the `BlobStore` port writes to, and the switch that selects the S3 adapter. Unset falls back to the filesystem adapter. |
 | `S3_ENDPOINT` | unset (real AWS) | Only for a self-hosted server (RustFS, MinIO, Ceph): setting it also turns on path-style addressing, which those need. |
@@ -113,13 +114,15 @@ an **optional** dependency. Switching is one command — from
 kodegen add postgres      # Diesel + PostgreSQL
 kodegen add mysql         # Diesel + MySQL
 kodegen add mariadb       # same driver as mysql; MariaDB image
+kodegen add mongodb       # the same UserRepository, on the Mongo driver
 kodegen add redis         # the Cache port + a Redis adapter (Valkey too)
 kodegen add s3            # the BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
 kodegen add --list        # what's supported + what this project has on
 ```
 
-The first three are **relational backends** and replace each other; `redis` and
-`s3` are different axes and sit alongside whichever one is on, and each other.
+The first four are **datastores** — four adapters of the same `UserRepository` —
+and replace each other; `redis` and `s3` are different axes and sit alongside
+whichever one is on, and each other.
 
 ### Relational backend
 
@@ -137,8 +140,9 @@ It touches six files:
 Everything else — the ports, `Db::run`, the repositories, `bootstrap.rs`, the
 API — is untouched, which is the point of keeping the pool in one file.
 
-Only **one** relational backend at a time: `Db` wraps a single connection type,
-so a second `add` is refused rather than half-applied. `add` also refuses if
+Only **one** datastore at a time: `Db` wraps a single connection type, so a
+second `add` — another relational backend or `mongodb` — is refused rather than
+half-applied. `add` also refuses if
 `diesel_db.rs` or the generated test module no longer match what
 `kodegen new` wrote — your edits are never overwritten silently. Queries you
 added to `diesel_repo.rs` above the test module are kept.
@@ -153,6 +157,44 @@ Doing it by hand instead: set the feature in `[features] default`, swap
 in particular **cannot** use `TEXT PRIMARY KEY` — indexing a `TEXT` column needs
 a prefix length, so the users table uses `VARCHAR(64)` there. That one fails at
 migration time, not compile time.
+
+### Document store (`kodegen add mongodb`)
+
+The same datastore slot as a relational backend, on a driver that is not Diesel:
+`UserRepository` is unchanged, so the ports, the application layer and the API
+never learn about it.
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | `default = [...]` loses the relational feature and gains `document` |
+| `src/infrastructure/mongo_repo.rs` | the `Mongo` handle + the `UserRepository` adapter |
+| `src/infrastructure/mod.rs` | one `#[cfg(feature = "document")] pub mod mongo_repo;` appended — the Diesel modules were already gated on `relational` by the template, and their files stay on disk |
+| `src/bootstrap.rs` | `MONGODB_URL`/`MONGODB_DB` replace `DATABASE_URL`; `build_user_service` takes `Option<&Mongo>` |
+| `docker-compose.dev.yml` | a `mongo:8` service with a healthcheck (created if missing) |
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+MONGODB_URL=mongodb://127.0.0.1:27017 MONGODB_DB=app cargo run
+```
+
+The client is dialed **lazily**, through a `tokio::sync::OnceCell` on the first
+query: every `mongodb` constructor is `async` while `build_services_from_env()`
+is a plain `fn`. A database that is down cannot stop the process from booting,
+and a failed dial is not cached — the next request tries again. What it costs is
+the first request against an unreachable server: the driver spends its
+server-selection timeout (30s by default) looking for one before the request
+fails with `503`. Add `?serverSelectionTimeoutMS=2000` to `MONGODB_URL` to fail
+faster.
+
+There is no migration to run. `save` upserts on `_id`, which is the domain id,
+so it stays insert-or-update and never returns `NotFound`.
+
+Going back is `default = ["sqlite"]` in `Cargo.toml` plus the three Diesel blocks
+in `bootstrap.rs`. Nothing has to be deleted: `mongo_repo.rs` is gated on
+`document` exactly as the Diesel modules are gated on `relational`, so whichever
+one is off is simply not compiled. `relational` also carries the Diesel
+dependencies, so with `document` selected the ORM is not in the build graph at
+all — `cargo tree -e normal | grep diesel` is empty.
 
 ### Cache (`kodegen add redis`)
 

@@ -7,7 +7,7 @@ switching their infrastructure capabilities.
 |---|---|
 | `kodegen new <name>` | Generate a project from a template |
 | `kodegen feature <name>` | Scaffold one feature across every layer and wire it up |
-| `kodegen add <capability>` | Add infrastructure: a relational backend (postgres/mysql/mariadb), a cache (redis) or object storage (s3) |
+| `kodegen add <capability>` | Add infrastructure: a datastore (postgres/mysql/mariadb/mongodb), a cache (redis) or object storage (s3) |
 | `kodegen list` | List built-in and cached templates |
 | `kodegen update <template>` | Re-clone a cached remote template |
 
@@ -103,6 +103,7 @@ later, not only on day one:
 kodegen add postgres                     # Diesel + PostgreSQL
 kodegen add mysql                        # Diesel + MySQL
 kodegen add mariadb                      # same driver as mysql, MariaDB image + docs
+kodegen add mongodb                      # the same UserRepository, on the Mongo driver
 kodegen add redis                        # a Cache port + a Redis adapter (Valkey too)
 kodegen add s3                           # a BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
 kodegen add postgres --path ~/svc        # run from outside the project
@@ -116,12 +117,14 @@ kodegen new svc --with postgres,redis,s3 # generate, then add, in one command
 | `postgres` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
 | `mysql` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
 | `mariadb` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
+| `mongodb` | document | the existing `UserRepository` | in-memory repo | `MONGODB_URL` (+ `MONGODB_DB`) |
 | `redis` | cache | **`Cache`** (new) | in-memory cache | `REDIS_URL` |
 | `s3` | object storage | **`BlobStore`** (new) | files under `./data/blobs` | `S3_BUCKET` (+ endpoint/credentials) |
 
-`--with` takes at most one **relational** backend — a project can only have one,
-so a second is rejected before `new` writes anything — but capabilities on
-different axes combine freely (`--with postgres,redis,s3`).
+`--with` takes at most one **datastore** — the three relational backends and
+`mongodb` are four adapters of the same `UserRepository`, so a second is rejected
+before `new` writes anything — but capabilities on different axes combine freely
+(`--with postgres,redis,s3`, `--with mongodb,redis,s3`).
 
 `add postgres` rewrites the six things that actually differ between dialects:
 
@@ -147,10 +150,11 @@ than fail.
 
 Two rules the command enforces:
 
-- **One relational backend per project.** The `Db` handle wraps a single
-  connection type, so `add mysql` on top of `postgres` is refused with the
-  steps to undo the first one, not applied halfway. `add redis` and `add s3`
-  are not backends and are never caught by this rule.
+- **One datastore per project.** The composition root builds a single handle
+  behind `UserRepository` — `Db` for the relational backends, `Mongo` for
+  MongoDB — so `add mysql` on top of `postgres`, or either on top of `mongodb`,
+  is refused with the steps to undo the first one, not applied halfway. `add
+  redis` and `add s3` are not datastores and are never caught by this rule.
 - **Adding the same capability twice** is an error, not a no-op rewrite.
 
 Two of those are replacements, not edits, so both are guarded: `diesel_db.rs`
@@ -175,6 +179,48 @@ compose image and the wording differ. Valkey stands in the same relation to
 `redis`: same RESP protocol, same client, same generated Rust — swap the image
 in `docker-compose.dev.yml` and nothing else changes. So do MinIO and Ceph to
 `s3`: one API, one adapter, one endpoint variable.
+
+#### `add mongodb`
+
+Not a fourth dialect: a second driver behind the same port. `UserRepository` is
+unchanged, so nothing above `infrastructure/` moves — which is why it takes the
+datastore slot instead of sitting alongside a relational backend.
+
+```
+Cargo.toml                              default = ["sqlite"] -> ["document"]
+src/infrastructure/mongo_repo.rs        the Mongo handle + the UserRepository adapter
+src/infrastructure/mod.rs               one cfg-gated `pub mod mongo_repo;` appended
+src/bootstrap.rs                        MONGODB_URL/MONGODB_DB instead of DATABASE_URL
+docker-compose.dev.yml                  a mongo:8 service with a healthcheck (created if absent)
+```
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+MONGODB_URL=mongodb://127.0.0.1:27017 MONGODB_DB=app cargo run
+```
+
+Four things follow from the driver, not from taste:
+
+- **Every module in the datastore slot is cfg-gated, both ways.** The template
+  already ships `diesel_db.rs` and `diesel_repo.rs` behind `relational` (which
+  every SQL backend turns on and `document` does not), and `add mongodb` appends
+  `mongo_repo.rs` behind `document` the same way. `relational` carries the Diesel
+  dependencies themselves, so a Mongo project does not build the ORM at all —
+  `cargo tree -e normal | grep diesel` comes back empty. Undo is
+  `default = ["sqlite"]` plus the three Diesel blocks in `bootstrap.rs`: no file
+  has to be deleted, in either direction.
+- **The client is dialed lazily**, through a `tokio::sync::OnceCell` on first
+  query: every `mongodb` constructor is `async` and the composition root is a
+  plain `fn`. A dead database cannot stop the process from booting, and a failed
+  dial is not cached — the next request retries. The cost is that the *first*
+  request against an unreachable server takes the driver's server-selection
+  timeout to fail (30s by default) before it answers `503`; shorten it in the
+  URL if that matters — `?serverSelectionTimeoutMS=2000`.
+- **No migration.** `save` upserts on `_id` (the domain id), so it is still an
+  insert-or-update and never `NotFound`, with no `CREATE TABLE` step to run
+  first.
+- **Leaving `MONGODB_URL` unset** selects the in-memory adapter, exactly as an
+  unset `DATABASE_URL` does. `cargo test` stays green with no server.
 
 #### `add redis`
 

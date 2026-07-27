@@ -28,6 +28,11 @@ jobs:
   # mariadb is skipped because it is byte-for-byte identical to mysql (same
   # feature, same connection type, same migration; only the image differs).
   #
+  # `mongodb` is the only one where compiling is more than a typo check: it is
+  # what puts a rustc in front of a project whose Diesel modules are gated out
+  # of `infrastructure/mod.rs` and whose `bootstrap.rs` no longer names them.
+  # Nothing else — here or in the template's own CI — ever compiles that state.
+  #
   # `s3` is the slow one: the AWS SDK brings rustls and aws-lc-sys, which builds
   # C from source. It stays a full fmt/clippy/check/test job anyway — this is the
   # only place that compiles the adapter at all, and a cheaper job would prove
@@ -37,7 +42,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        capability: [postgres, mysql, redis, s3]
+        capability: [postgres, mysql, mongodb, redis, s3]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -69,6 +74,15 @@ jobs:
           cargo run --locked -- new demo --output "$RUNNER_TEMP"
           cargo run --locked -- feature order --path "$RUNNER_TEMP/demo"
           cargo run --locked -- add ${{ matrix.capability }} --path "$RUNNER_TEMP/demo"
+
+      # ...and then the other order, into the same project, because the two are
+      # not symmetric: a feature scaffolded *after* `add mongodb` has to name the
+      # handle that capability left behind, and only this direction compiles it.
+      # `notification` rather than a short name on purpose — it is long enough
+      # that `cargo fmt` wraps the generated signature, which is the shape the
+      # first order has to find and rewrite.
+      - name: Scaffold another feature on top of the capability
+        run: cargo run --locked -- feature notification --path "$RUNNER_TEMP/demo"
 
       - name: new --with is the same thing in one command
         run: cargo run --locked -- new demo-with --with ${{ matrix.capability }} --output "$RUNNER_TEMP"
@@ -102,6 +116,21 @@ jobs:
   generated-all:
     runs-on: ubuntu-latest
     services:
+      # The datastore here is mongodb, not postgres, because it is the only one
+      # whose adapter this job can actually run: Diesel needs its migration
+      # applied before a query works and there is no step here that applies one,
+      # while `save` upserts on `_id` and needs nothing set up. So the datastore
+      # slot is proven at compile time in the matrix above (postgres, mysql) and
+      # at runtime here.
+      mongo:
+        image: mongo:8
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
       redis:
         image: redis:7-alpine
         ports:
@@ -153,7 +182,7 @@ jobs:
           echo "rustfs did not come up"; exit 1
 
       - name: Generate with every capability on
-        run: cargo run --locked -- new demo-all --with postgres,redis,s3 --output "$RUNNER_TEMP"
+        run: cargo run --locked -- new demo-all --with mongodb,redis,s3 --output "$RUNNER_TEMP"
 
       - name: Format check
         run: cargo fmt --check
@@ -163,15 +192,18 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: ${{ runner.temp }}/demo-all
 
-      # REDIS_URL and the S3 variables set, DATABASE_URL not: both additive
-      # adapters are exercised against the service containers above, and the
-      # Diesel tests skip as they do everywhere else (Postgres is proven at
-      # compile time here, not at runtime). The blob test creates its own bucket,
-      # so there is no setup step between booting the server and using it.
-      - name: Test against a live cache and a live object store
+      # Every URL set, so every adapter written by an `add` runs against the
+      # server above rather than skipping — including `tests/api.rs`, which goes
+      # through `bootstrap::build_router()` and therefore through the Mongo
+      # repository here. Nothing needs seeding first: the blob test creates its
+      # own bucket, and the Mongo tests upsert. Re-running the job against a
+      # database a previous run left non-empty is green for the same reason.
+      - name: Test against a live datastore, cache and object store
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo-all
         env:
+          MONGODB_URL: mongodb://127.0.0.1:27017
+          MONGODB_DB: app
           REDIS_URL: redis://127.0.0.1:6379
           S3_BUCKET: app
           S3_ENDPOINT: http://127.0.0.1:9000

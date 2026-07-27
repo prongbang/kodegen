@@ -14,10 +14,15 @@
 //!   wrote (the embedded template with the project's name substituted in), so a
 //!   file the user has touched is refused with manual instructions rather than
 //!   clobbered. Only one may be on at a time.
+//! - **mongodb** (`add_mongodb`) replaces the same adapter with one that is not
+//!   Diesel at all, so it takes the same slot as a relational backend and is
+//!   refused next to one. It writes a new file rather than rewriting
+//!   `diesel_db.rs`, and patches the three blocks of `bootstrap.rs` that name the
+//!   Diesel handle — the same verbatim-signature check, one file over.
 //! - **redis** (`add_redis`) and **s3** (`add_s3`) *add a port* the template does
 //!   not ship, together with both of its adapters and the wiring. Purely
-//!   additive, so they compose with any backend and with each other, and neither
-//!   has an existing file to refuse.
+//!   additive, so they compose with any datastore and with each other, and
+//!   neither has an existing file to refuse.
 
 use crate::scaffold::{
     edit, insert_after_line, insert_at_marker, insert_before_line, insert_pub_mod, require_files,
@@ -32,18 +37,41 @@ pub enum Capability {
     Postgres,
     Mysql,
     Mariadb,
+    Mongodb,
     Redis,
     S3,
 }
 
-/// The axis a capability sits on: relational backends replace each other, a
-/// cache and a blob store are additive. Every kind needs its own `add_*`
-/// function, its own env vars and its own feature, which is exactly what the
-/// matches on this enforce.
+/// The axis a capability sits on: datastores replace each other, a cache and a
+/// blob store are additive. Every kind needs its own `add_*` function, its own
+/// env vars and its own feature, which is exactly what the matches on this
+/// enforce.
+///
+/// MongoDB is its own kind rather than a fourth `Relational`: it shares the
+/// *slot* with them, not the driver, and everything `Relational` answers
+/// (connection type, `on_conflict` target, dialect `CREATE TABLE`, which apt
+/// packages the bundled C driver needs) has no meaning for it. Splitting them
+/// keeps both enums total — `Relational` never has to invent an answer, and a
+/// new kind is a compile error at every match below rather than a capability
+/// quietly taking the Diesel path.
 enum Kind {
     Relational(Relational),
+    Document,
     Cache,
     Blob,
+}
+
+impl Kind {
+    /// Whether this kind takes the project's one datastore slot. `Db`/`Mongo` is
+    /// built once in the composition root and `UserRepository` gets one adapter,
+    /// so postgres, mysql, mariadb and mongodb all exclude each other — while a
+    /// cache and a blob store sit alongside whichever one is on.
+    fn is_datastore(&self) -> bool {
+        match self {
+            Kind::Relational(_) | Kind::Document => true,
+            Kind::Cache | Kind::Blob => false,
+        }
+    }
 }
 
 /// The relational subset of `Capability`. Split out so that everything about a
@@ -57,9 +85,11 @@ enum Relational {
     Mariadb,
 }
 
-/// Cargo features that select a relational backend: at most one may be on,
-/// because the `Db` handle in `diesel_db.rs` is a single connection type.
-const RELATIONAL: &[&str] = &["sqlite", "postgres", "mysql"];
+/// Cargo features that select the project's datastore: at most one may be on,
+/// because `UserRepository` gets one adapter and the handle behind it is built
+/// once. `document` is in the list for exactly that reason — MongoDB is not a
+/// relational backend, but it stands in the same place.
+const DATASTORE: &[&str] = &["sqlite", "postgres", "mysql", "document"];
 
 /// Package name of the built-in template, needed to undo the rename
 /// `kodegen new` applies before comparing a project's file to its origin.
@@ -69,6 +99,19 @@ const DIESEL_DB: &str = "src/infrastructure/diesel_db.rs";
 const DIESEL_REPO: &str = "src/infrastructure/diesel_repo.rs";
 const COMPOSE: &str = "docker-compose.dev.yml";
 const APT_ANCHOR: &str = "protobuf-compiler";
+
+const BOOTSTRAP: &str = "src/bootstrap.rs";
+const INFRA_MOD: &str = "src/infrastructure/mod.rs";
+const MONGO_REPO: &str = "src/infrastructure/mongo_repo.rs";
+/// Default port, and the same `127.0.0.1` rule as every other URL here.
+/// `MONGODB_DB` has a default (`app`) in the generated builder, so it is
+/// informational — `MONGODB_URL` is the switch.
+const MONGO_URL: &str = "mongodb://127.0.0.1:27017";
+/// Appended to `infrastructure/mod.rs`. The `cfg` is the whole point: with it,
+/// undoing this capability is one line in Cargo.toml plus `bootstrap.rs`, and
+/// the adapter can stay on disk uncompiled — exactly the deal the Diesel modules
+/// get from `relational`.
+const MONGO_MOD: &str = "#[cfg(feature = \"document\")]\npub mod mongo_repo;\n";
 
 const PORTS: &str = "src/domain/ports.rs";
 const IN_MEMORY_CACHE: &str = "src/infrastructure/in_memory_cache.rs";
@@ -104,6 +147,7 @@ impl Capability {
             Capability::Postgres => "postgres",
             Capability::Mysql => "mysql",
             Capability::Mariadb => "mariadb",
+            Capability::Mongodb => "mongodb",
             Capability::Redis => "redis",
             Capability::S3 => "s3",
         }
@@ -118,6 +162,7 @@ impl Capability {
             Capability::Postgres => Kind::Relational(Relational::Postgres),
             Capability::Mysql => Kind::Relational(Relational::Mysql),
             Capability::Mariadb => Kind::Relational(Relational::Mariadb),
+            Capability::Mongodb => Kind::Document,
             Capability::Redis => Kind::Cache,
             Capability::S3 => Kind::Blob,
         }
@@ -128,6 +173,10 @@ impl Capability {
     fn feature(self) -> &'static str {
         match self.kind() {
             Kind::Relational(rel) => rel.feature(),
+            // named for the shape, not the vendor, and deliberately not
+            // "mongodb": it is the datastore slot's document option, the way
+            // `sqlite`/`postgres` are its relational ones
+            Kind::Document => "document",
             // Redis and Valkey speak the same protocol, so one feature covers
             // both: the capability is the cache, not the vendor
             Kind::Cache => "cache",
@@ -144,6 +193,9 @@ impl Capability {
     pub fn env(self) -> &'static [(&'static str, &'static str)] {
         match self.kind() {
             Kind::Relational(rel) => rel.database_env(),
+            // `MONGODB_DB` only to say what the default is: the builder falls
+            // back to `app`, so the URL alone is enough to switch adapters
+            Kind::Document => &[("MONGODB_URL", MONGO_URL), ("MONGODB_DB", "app")],
             Kind::Cache => &[("REDIS_URL", REDIS_URL)],
             Kind::Blob => S3_ENV,
         }
@@ -270,10 +322,14 @@ pub fn list(project: &Path) -> Result<()> {
     println!("  postgres   relational — Diesel + PostgreSQL");
     println!("  mysql      relational — Diesel + MySQL");
     println!("  mariadb    relational — Diesel + MariaDB (MySQL protocol: same driver, same adapter)");
+    println!("  mongodb    document — MongoDB behind the same `UserRepository`, in place of Diesel");
     println!("  redis      cache — the `Cache` port + a Redis adapter (Valkey speaks the same protocol)");
     println!("  s3         object storage — the `BlobStore` port + an S3 adapter (RustFS, MinIO, AWS)");
     println!();
-    println!("Only one relational backend can be on at a time; redis and s3 sit alongside it.");
+    println!(
+        "Only one datastore (postgres, mysql, mariadb, mongodb) can be on at a time; redis and s3 \
+         sit alongside it."
+    );
     match fs::read_to_string(project.join("Cargo.toml")).ok().as_deref().and_then(default_line) {
         // `default = [...]` is the only state there is — the features it lists
         // are exactly the dependencies that get compiled
@@ -301,16 +357,14 @@ pub fn check_combination(with: &[Capability]) -> Result<()> {
             .into());
         }
     }
-    let relational: Vec<&str> = with
-        .iter()
-        .filter(|c| matches!(c.kind(), Kind::Relational(_)))
-        .map(|c| c.name())
-        .collect();
-    if relational.len() > 1 {
+    let datastores: Vec<&str> =
+        with.iter().filter(|c| c.kind().is_datastore()).map(|c| c.name()).collect();
+    if datastores.len() > 1 {
         return Err(format!(
-            "--with takes at most one relational backend: {} are all relational, and a project can \
-             only have one (the `Db` handle is a single connection type)",
-            relational.join(", ")
+            "--with takes at most one datastore: {} are all datastores, and a project can only have \
+             one (they are adapters of the same `UserRepository`, and the handle behind it is built \
+             once)",
+            datastores.join(", ")
         )
         .into());
     }
@@ -325,11 +379,55 @@ pub fn add(project: &Path, cap: Capability, dry_run: bool) -> Result<(Vec<String
     if enabled.iter().any(|f| f == cap.feature()) {
         return Err(format!("capability '{}' already added", cap.name()).into());
     }
+    // one datastore per project, checked before any file is read: `add mongodb`
+    // on a Postgres project and `add postgres` on a Mongo one are the same
+    // mistake, so they get the same answer
+    if cap.kind().is_datastore()
+        && let Some(other) =
+            enabled.iter().find(|f| DATASTORE.contains(&f.as_str()) && *f != "sqlite")
+    {
+        return Err(datastore_conflict(other, cap).into());
+    }
     match cap.kind() {
-        Kind::Relational(rel) => add_relational(project, rel, &enabled, dry_run),
+        Kind::Relational(rel) => add_relational(project, rel, dry_run),
+        Kind::Document => add_mongodb(project, dry_run),
         Kind::Cache => add_redis(project, dry_run),
         Kind::Blob => add_s3(project, dry_run),
     }
+}
+
+/// A project already has a datastore and is being given a second one. Refused
+/// rather than half-applied: `Db`/`Mongo` is built once in the composition root
+/// and `UserRepository` gets one adapter, so a second would need a second handle,
+/// a second repository and a rule for which one wins — out of scope (see the
+/// plan's "not doing" list), and the undo path is three steps the user can run.
+fn datastore_conflict(other: &str, cap: Capability) -> String {
+    let restore = if other == "document" {
+        // mongo_repo.rs is behind `#[cfg(feature = "document")]`, so step 1
+        // already stops it compiling — deleting it is optional housekeeping.
+        // The blocks are named individually because a project with scaffolded
+        // features cannot take a wholesale copy of a fresh bootstrap.rs: that
+        // would drop their wiring.
+        "src/bootstrap.rs: put the three Diesel blocks back from a fresh `kodegen new` (the \
+         infrastructure import list, the DATABASE_URL block, and fn build_user_service), and change \
+         any `_db: Option<&Mongo>` in a scaffolded builder back to `Option<&Db>`. \
+         src/infrastructure/mongo_repo.rs can stay — it is gated on the `document` feature step 1 \
+         just turned off"
+    } else {
+        "src/infrastructure/diesel_db.rs + diesel_repo.rs: restore the versions from a fresh \
+         `kodegen new`"
+    };
+    format!(
+        "capability '{other}' is already this project's datastore, and there can only be one (the \
+         `UserRepository` has a single adapter, and the handle behind it is built once in \
+         bootstrap.rs).\n\
+         To switch to '{}', undo '{other}' first:\n  \
+         1. Cargo.toml: put `default = [\"sqlite\"]` back\n  \
+         2. {restore}\n  \
+         3. rerun `kodegen add {}`",
+        cap.name(),
+        cap.name()
+    )
 }
 
 /// Switches the project onto `rel`. Not additive: `diesel_db.rs` is written
@@ -337,30 +435,11 @@ pub fn add(project: &Path, cap: Capability, dry_run: bool) -> Result<(Vec<String
 fn add_relational(
     project: &Path,
     cap: Relational,
-    enabled: &[String],
     dry_run: bool,
 ) -> Result<(Vec<String>, Vec<String>)> {
     require_files(project, &["Dockerfile", DIESEL_DB, DIESEL_REPO])?;
     let pkg = crate::package_name(project)
         .ok_or("Cargo.toml with a package name not found — run inside a generated project")?;
-
-    // one relational backend per project: `Db` wraps a single connection type,
-    // so a second one would need a second pool, a second handle and a second
-    // set of repositories — out of scope, and better refused than half-applied
-    if let Some(other) = enabled.iter().find(|f| RELATIONAL.contains(&f.as_str()) && *f != "sqlite") {
-        return Err(format!(
-            "capability '{other}' is already this project's relational backend, and there can only be one \
-             (the `Db` handle in diesel_db.rs is a single connection type).\n\
-             To switch to '{}', undo '{other}' first:\n  \
-             1. Cargo.toml: put `default = [\"sqlite\"]` back\n  \
-             2. src/infrastructure/diesel_db.rs + diesel_repo.rs: restore the versions from a fresh \
-             `kodegen new`\n  \
-             3. rerun `kodegen add {}`",
-            cap.name(),
-            cap.name()
-        )
-        .into());
-    }
 
     let mut creates: Vec<(String, String)> = Vec::new();
     let mut edits = vec![
@@ -425,6 +504,125 @@ fn add_relational(
         write_plan(project, &creates, &edits)?;
     }
     Ok((paths(&creates), paths(&edits)))
+}
+
+/// `kodegen add mongodb` — the datastore slot again, with a driver that is not
+/// Diesel.
+///
+/// No new port and no new `Services` field: MongoDB is a second adapter of the
+/// `UserRepository` the template already has, so `tests/api.rs`, the application
+/// service and every route above it are unchanged, and the port's contract
+/// (`save` is an upsert, `get` on a miss is `NotFound`) is what the adapter has
+/// to honor. That is the whole reason this capability is cheap.
+///
+/// Two consequences of taking the slot rather than adding one:
+/// - `default` loses its relational feature, which is what gates the Diesel
+///   modules *and their dependencies* — a Mongo project does not build the ORM
+///   at all. The adapter written here is gated the same way (on `document`), so
+///   the slot is symmetric: whichever side is off is simply not compiled, and
+///   neither side's files ever have to be deleted — undoing this is putting
+///   `default = ["sqlite"]` back plus the three blocks in the next bullet.
+/// - `bootstrap.rs` has three blocks that name the Diesel handle, and they are
+///   patched (verbatim match, else refuse) rather than the file being replaced:
+///   the wiring `kodegen feature` and `add redis`/`add s3` put there has to
+///   survive.
+fn add_mongodb(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(project, &[INFRA_MOD, BOOTSTRAP])?;
+
+    let mut creates = vec![(MONGO_REPO.to_string(), MONGO_REPO_TPL.to_string())];
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(format!("{rel} already exists — remove it first, or keep the one you have").into());
+    }
+
+    let mut edits = vec![
+        // `document` replaces the relational feature rather than joining it:
+        // still one list of feature names, still never [dependencies]
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "document", true))?,
+        // gated, symmetrically with the Diesel modules the template already ships
+        // behind `relational`, and appended rather than sorted into the plain
+        // block for the same reason those are: an unconditional `pub mod
+        // mongo_repo;` would make undo (`default = ["sqlite"]`) fail to compile
+        // until the file was also deleted, which is not what this prints or what
+        // the README promises.
+        edit(project, INFRA_MOD, |c| Ok(format!("{c}\n{MONGO_MOD}")))?,
+        edit(project, BOOTSTRAP, |c| rewrite_bootstrap(&c))?,
+    ];
+
+    // whichever `add` runs first creates the compose file, the next one appends.
+    // The service is `mongo` (the image's name), the capability is `mongodb`.
+    if project.join(COMPOSE).is_file() {
+        edits.push(edit(project, COMPOSE, |c| add_compose_service(&c, "mongo", MONGO_COMPOSE))?);
+    } else {
+        creates.push((COMPOSE.to_string(), format!("{COMPOSE_HEADER}{MONGO_COMPOSE}")));
+    }
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    // everything above is pure, so this is the only side effect
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
+/// Swaps the three blocks of `bootstrap.rs` that name the Diesel handle for the
+/// Mongo one, and leaves everything else — including whatever `kodegen feature`
+/// and the additive capabilities wired in — exactly where it is.
+///
+/// Each block is matched verbatim against what `kodegen new` wrote. None of them
+/// contains the project name (the same property `diesel_db.rs` has), so a
+/// project nobody edited always matches however long its crate name is, and one
+/// that was edited is refused rather than silently half-rewritten.
+///
+/// The Mongo handle keeps the binding name `db`, which is why the two
+/// `api::Services` literals need no edit at all: the slot is the same slot.
+fn rewrite_bootstrap(content: &str) -> Result<String> {
+    let mut out = content.to_string();
+    for (what, from, to) in [
+        ("the generated `infrastructure::{ ... }` import list", BOOTSTRAP_USE, BOOTSTRAP_USE_MONGO),
+        (
+            "the generated `DATABASE_URL` block in build_services_from_env()",
+            BOOTSTRAP_DB,
+            BOOTSTRAP_DB_MONGO,
+        ),
+        ("the generated `fn build_user_service`", BOOTSTRAP_BUILD_USER, BOOTSTRAP_BUILD_USER_MONGO),
+    ] {
+        if !out.contains(from) {
+            return Err(mongo_refusal(what).into());
+        }
+        out = out.replacen(from, to, 1);
+    }
+    // every builder `kodegen feature` scaffolded takes the handle it does not use
+    // yet, typed as the datastore's — `Db` is about to stop existing, so they
+    // move with it. `_db` (not `db`) is what makes this the scaffolded shape and
+    // not somebody's real adapter.
+    out = out.replace(FEATURE_BUILDER_DB, FEATURE_BUILDER_MONGO);
+    // and anything else naming the Diesel handle is code kodegen did not write.
+    // The type is gone once `relational` is off, so this project would not
+    // compile after the swap — refusing beats handing back a broken tree.
+    if out.contains("Db") {
+        return Err(mongo_refusal(
+            "no mention of the Diesel `Db` handle outside the blocks kodegen generated (yours is \
+             still there, and `Db` stops existing when the relational feature goes off)",
+        )
+        .into());
+    }
+    Ok(out)
+}
+
+fn mongo_refusal(what: &str) -> String {
+    format!(
+        "no longer matches what kodegen generated (expected {what}) — refusing to overwrite your \
+         changes.\nSwitch to MongoDB by hand instead:\n  \
+         1. Cargo.toml: `default = [\"document\"]` — dropping the relational feature is what stops \
+         the Diesel modules compiling\n  \
+         2. src/infrastructure/mongo_repo.rs: the adapter, plus `#[cfg(feature = \"document\")] pub \
+         mod mongo_repo;` in infrastructure/mod.rs (generate a throwaway `kodegen new tmp --with \
+         mongodb` and copy the file across)\n  \
+         3. src/bootstrap.rs: build a `Mongo` from MONGODB_URL/MONGODB_DB where the `Db` is built, \
+         and hand it to build_user_service instead\n  \
+         4. run with MONGODB_URL={MONGO_URL}"
+    )
 }
 
 /// `kodegen add redis` (Valkey included — same protocol, same client).
@@ -694,15 +892,15 @@ fn default_anchor_err(manifest: &str) -> String {
         .to_string()
 }
 
-/// Turns `feature` on in `default = [...]`. A relational backend *replaces*
-/// whichever one is listed (`Db` is a single connection type); everything else
-/// is additive and joins the list.
-fn enable_feature(manifest: &str, feature: &str, replaces_relational: bool) -> Result<String> {
+/// Turns `feature` on in `default = [...]`. A datastore *replaces* whichever one
+/// is listed (there is one `UserRepository` adapter, whether it is Diesel or
+/// Mongo); everything else is additive and joins the list.
+fn enable_feature(manifest: &str, feature: &str, replaces_datastore: bool) -> Result<String> {
     let (offset, line) = default_span(manifest).ok_or_else(|| default_anchor_err(manifest))?;
     let indent = &line[..line.len() - line.trim_start().len()];
     let mut kept: Vec<String> = parse_features(line)
         .into_iter()
-        .filter(|f| !(replaces_relational && RELATIONAL.contains(&f.as_str())))
+        .filter(|f| !(replaces_datastore && DATASTORE.contains(&f.as_str())))
         .collect();
     // `add` refuses a second run long before this, but the rewrite itself has no
     // business producing `["cache", "cache"]` for anyone who calls it otherwise
@@ -950,6 +1148,249 @@ mod tests {
 }
 "##;
 
+/// The three blocks of the generated `bootstrap.rs` that name the Diesel handle,
+/// and what `add mongodb` puts in their place. Matched verbatim — see
+/// `rewrite_bootstrap`.
+const BOOTSTRAP_USE: &str = r##"        diesel_db::{build_pool, Db},
+        diesel_repo::DieselUserRepository,
+        grpc_greeter::GrpcGreeter,
+        in_memory_repo::InMemoryUserRepository,
+"##;
+
+/// `mongo_repo` last: the list is sorted, and `cargo fmt --check` runs in the
+/// generated project's CI.
+const BOOTSTRAP_USE_MONGO: &str = r##"        grpc_greeter::GrpcGreeter,
+        in_memory_repo::InMemoryUserRepository,
+        mongo_repo::{Mongo, MongoUserRepository},
+"##;
+
+/// What `kodegen feature` writes for a feature that has no adapter of its own
+/// yet: the handle is passed in and unused, so only its type has to move.
+///
+/// No parentheses in the pattern. `kodegen feature` runs `cargo fmt`, and a long
+/// enough feature name pushes the signature over the width limit — rustfmt then
+/// puts the parameter on its own line, so `(_db:` and `)` are no longer next to
+/// it. The parameter itself is what identifies the scaffolded builder, and `_db`
+/// rather than `db` is what keeps it from matching a real adapter's.
+const FEATURE_BUILDER_DB: &str = "_db: Option<&Db>";
+const FEATURE_BUILDER_MONGO: &str = "_db: Option<&Mongo>";
+
+const BOOTSTRAP_DB: &str = r##"    let db = std::env::var("DATABASE_URL")
+        .ok()
+        .map(|url| Db::new(build_pool(&url).expect("diesel pool init failed")));"##;
+
+/// Still called `db`, and still resolved in the same place: the datastore slot
+/// is one slot, so both `api::Services` literals keep working untouched.
+const BOOTSTRAP_DB_MONGO: &str = r##"    // no pool to build and no migrations to run: the client is created on first
+    // use (see mongo_repo.rs), so a database that is not up yet cannot stop the
+    // service booting — the same property the lazy Redis connection has
+    let db = std::env::var("MONGODB_URL").ok().map(|uri| {
+        Mongo::new(
+            uri,
+            std::env::var("MONGODB_DB").unwrap_or_else(|_| "app".into()),
+        )
+    });"##;
+
+const BOOTSTRAP_BUILD_USER: &str = r##"fn build_user_service(db: Option<&Db>) -> Arc<dyn UserService> {
+    let repo: Arc<dyn UserRepository> = match db {
+        Some(db) => Arc::new(DieselUserRepository::new(db.clone())),
+        None => Arc::new(InMemoryUserRepository::new()),
+    };
+    Arc::new(UserServiceImpl::new(repo))
+}"##;
+
+const BOOTSTRAP_BUILD_USER_MONGO: &str = r##"fn build_user_service(db: Option<&Mongo>) -> Arc<dyn UserService> {
+    let repo: Arc<dyn UserRepository> = match db {
+        Some(db) => Arc::new(MongoUserRepository::new(db.clone())),
+        None => Arc::new(InMemoryUserRepository::new()),
+    };
+    Arc::new(UserServiceImpl::new(repo))
+}"##;
+
+const MONGO_REPO_TPL: &str = r##"//! `UserRepository` adapter over MongoDB. Written by `kodegen add mongodb`.
+//!
+//! No new port: this is the second adapter of the port the template already
+//! ships, which is why the application service, the routes and `tests/api.rs`
+//! are untouched by `add mongodb` — and why the port's contract is what this
+//! file has to honor rather than reinterpret. `save` is an **upsert** (an
+//! existing id is overwritten, never `NotFound`), `get` on a missing id is
+//! `NotFound`.
+//!
+//! The handle is owned by the composition root (`bootstrap.rs`) and handed in,
+//! exactly like the Diesel `Db`: a repository never reads `MONGODB_URL` itself.
+
+use crate::domain::{DomainError, User, UserRepository};
+use async_trait::async_trait;
+use mongodb::bson::doc;
+use mongodb::{Client, Collection};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::OnceCell;
+
+/// The stored document. `_id` *is* the user's id rather than a generated
+/// ObjectId: it is already unique and is what the port looks users up by, so a
+/// separate key would only be a second thing to keep in sync — and it is what
+/// makes the upsert below a single matched write.
+#[derive(Serialize, Deserialize)]
+struct UserDoc {
+    #[serde(rename = "_id")]
+    id: String,
+    name: String,
+}
+
+/// Cheap-to-clone handle every Mongo repository shares — this backend's `Db`.
+///
+/// The client is built on **first use**, not at startup: every constructor the
+/// driver offers is async (`mongodb+srv://` URIs are resolved through DNS) and
+/// `build_services_from_env()` is a plain `fn`. Deferring it costs one
+/// `OnceCell` and avoids blocking a runtime thread to open a connection nobody
+/// has asked to use yet.
+#[derive(Clone)]
+pub struct Mongo(Arc<MongoInner>);
+
+struct MongoInner {
+    uri: String,
+    database: String,
+    client: OnceCell<Client>,
+}
+
+impl Mongo {
+    pub fn new(uri: impl Into<String>, database: impl Into<String>) -> Self {
+        Self(Arc::new(MongoInner {
+            uri: uri.into(),
+            database: database.into(),
+            client: OnceCell::new(),
+        }))
+    }
+
+    /// The shared client, dialing on the first call. `Client` owns its own
+    /// connection pool, so every caller must get the *same* one — that is what
+    /// the `OnceCell` behind the `Arc` is for, rather than a client per clone.
+    ///
+    /// A failure here is not cached: `get_or_try_init` leaves the cell empty, so
+    /// a server that was down when the first request arrived is retried on the
+    /// next one instead of poisoning the process.
+    async fn database(&self) -> Result<mongodb::Database, DomainError> {
+        let client = self
+            .0
+            .client
+            .get_or_try_init(|| Client::with_uri_str(&self.0.uri))
+            .await
+            .map_err(infra)?;
+        Ok(client.database(&self.0.database))
+    }
+}
+
+/// A server that cannot be reached is `Unavailable`, which `api::to_http_err`
+/// turns into a 503 — the same treatment `GrpcGreeter` gives a dead upstream.
+/// Anything the server itself answered (a command or write error) is a real
+/// `Other`: the dependency is up, the request was wrong.
+pub fn infra(e: mongodb::error::Error) -> DomainError {
+    use mongodb::error::ErrorKind;
+    match *e.kind {
+        ErrorKind::Io(_)
+        | ErrorKind::ServerSelection { .. }
+        | ErrorKind::ConnectionPoolCleared { .. }
+        | ErrorKind::DnsResolve { .. } => DomainError::Unavailable,
+        _ => DomainError::Other(Box::new(e)),
+    }
+}
+
+pub struct MongoUserRepository {
+    mongo: Mongo,
+}
+
+impl MongoUserRepository {
+    pub fn new(mongo: Mongo) -> Self {
+        Self { mongo }
+    }
+
+    async fn users(&self) -> Result<Collection<UserDoc>, DomainError> {
+        Ok(self.mongo.database().await?.collection("users"))
+    }
+}
+
+#[async_trait]
+impl UserRepository for MongoUserRepository {
+    async fn save(&self, user: User) -> Result<(), DomainError> {
+        let doc = UserDoc {
+            id: user.id,
+            name: user.name,
+        };
+        // replace_one + upsert, not insert_one: the port documents `save` as an
+        // upsert, so an id that is already there is overwritten rather than
+        // answered with a duplicate-key error. There is no `migrations/` step to
+        // go with it — the collection appears with the first write.
+        self.users()
+            .await?
+            .replace_one(doc! { "_id": &doc.id }, &doc)
+            .upsert(true)
+            .await
+            .map(|_| ())
+            .map_err(infra)
+    }
+
+    async fn get(&self, id: &str) -> Result<User, DomainError> {
+        self.users()
+            .await?
+            .find_one(doc! { "_id": id })
+            .await
+            .map_err(infra)?
+            .map(|d| User {
+                id: d.id,
+                name: d.name,
+            })
+            .ok_or(DomainError::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MongoDB needs a server, so these are gated on `MONGODB_URL` rather than
+    /// `#[ignore]`: `docker compose -f docker-compose.dev.yml up -d` plus the env
+    /// var is all it takes to run them, and CI stays green without one (the
+    /// in-memory adapter is what runs when `MONGODB_URL` is unset — exactly how
+    /// the app itself picks its adapter).
+    fn repo() -> Option<MongoUserRepository> {
+        let uri = std::env::var("MONGODB_URL").ok()?;
+        let database = std::env::var("MONGODB_DB").unwrap_or_else(|_| "app".into());
+        Some(MongoUserRepository::new(Mongo::new(uri, database)))
+    }
+
+    #[tokio::test]
+    async fn save_then_get_roundtrips() {
+        let Some(repo) = repo() else {
+            eprintln!("MONGODB_URL unset — skipping the MongoDB roundtrip test");
+            return;
+        };
+
+        let user = User::new("u1", "Alice").expect("valid user");
+        repo.save(user).await.expect("save");
+        assert_eq!(repo.get("u1").await.expect("get").name, "Alice");
+
+        // save is an upsert on every adapter, which against a real server is two
+        // things at once: the same id twice must update rather than fail, and
+        // re-running this test must not trip over the document the last run left
+        repo.save(User::new("u1", "Alicia").expect("valid user"))
+            .await
+            .expect("saving an existing id must update it");
+        assert_eq!(repo.get("u1").await.expect("get").name, "Alicia");
+    }
+
+    #[tokio::test]
+    async fn get_missing_is_not_found() {
+        let Some(repo) = repo() else {
+            return;
+        };
+
+        let err = repo.get("no-such-user").await.unwrap_err();
+        assert!(matches!(err, DomainError::NotFound));
+    }
+}
+"##;
+
 const COMPOSE_HEADER: &str = r##"# Dev-only services, written by `kodegen add`. Not the production deployment —
 # that is the Dockerfile. Boots what the env-gated integration tests need:
 #
@@ -1001,6 +1442,26 @@ const MARIADB_COMPOSE: &str = r##"  mariadb:
       - "3306:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+"##;
+
+const MONGO_COMPOSE: &str = r##"  mongo:
+    # No MONGO_INITDB_ROOT_USERNAME/PASSWORD: an authenticated server would need
+    # credentials in MONGODB_URL, and this file is the dev one. A deployment that
+    # needs them changes the URL, not the adapter.
+    #
+    # If this service is not up, the app still boots (the client is dialed on
+    # first use) but the first request spends the driver's server-selection
+    # timeout — 30s by default — before answering 503. Append
+    # `?serverSelectionTimeoutMS=2000` to MONGODB_URL to find out sooner.
+    image: mongo:8
+    ports:
+      - "27017:27017"
+    healthcheck:
+      # mongosh ships in the image; `--quiet` keeps a passing check silent
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -2123,6 +2584,7 @@ mod tests {
     fn every_capability_leads_with_the_variable_that_selects_it() {
         for (cap, first) in [
             (Capability::Postgres, "DATABASE_URL"),
+            (Capability::Mongodb, "MONGODB_URL"),
             (Capability::Redis, "REDIS_URL"),
             (Capability::S3, "S3_BUCKET"),
         ] {
@@ -2146,25 +2608,288 @@ mod tests {
         let root = fixture("second");
         add(&root, Capability::Postgres, false).unwrap();
         let err = add(&root, Capability::Mysql, true).unwrap_err().to_string();
-        assert!(err.contains("already this project's relational backend"), "{err}");
+        assert!(err.contains("already this project's datastore"), "{err}");
         assert!(err.contains("default = [\"sqlite\"]"), "must say how to undo it: {err}");
+        assert!(err.contains("diesel_db.rs"), "must name the files to restore: {err}");
         fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn with_more_than_one_relational_backend_is_refused() {
         let err = check_combination(&[Capability::Postgres, Capability::Mysql]).unwrap_err().to_string();
-        assert!(err.contains("at most one relational backend"), "{err}");
+        assert!(err.contains("at most one datastore"), "{err}");
         // deduped by cargo feature, not by variant: these are one capability
         let err = check_combination(&[Capability::Mysql, Capability::Mariadb]).unwrap_err().to_string();
         assert!(err.contains("the same capability"), "{err}");
         assert!(err.contains("`mysql` cargo feature"), "{err}");
         let err = check_combination(&[Capability::Redis, Capability::Redis]).unwrap_err().to_string();
         assert!(err.contains("the same capability"), "{err}");
+        // mongodb is not relational, but it is the same slot: `Db` or `Mongo`,
+        // one adapter behind one `UserRepository`
+        let err =
+            check_combination(&[Capability::Postgres, Capability::Mongodb]).unwrap_err().to_string();
+        assert!(err.contains("at most one datastore"), "{err}");
+        assert!(err.contains("postgres, mongodb"), "must name both: {err}");
         assert!(check_combination(&[Capability::Postgres]).is_ok());
         // redis is not a backend, so it rides along with one
         assert!(check_combination(&[Capability::Postgres, Capability::Redis]).is_ok());
+        assert!(
+            check_combination(&[Capability::Mongodb, Capability::Redis, Capability::S3]).is_ok(),
+            "the additive capabilities must ride along with mongodb too"
+        );
         assert!(check_combination(&[]).is_ok());
+    }
+
+    /// The Phase 4 path: a second adapter of a port the template already has, so
+    /// the whole capability is one new file plus three swapped blocks — no new
+    /// port, no new `Services` field, and `tests/api.rs` still covers the routes.
+    #[test]
+    fn mongodb_takes_the_datastore_slot_and_leaves_diesel_on_disk() {
+        let root = fixture("mongodb");
+        add(&root, Capability::Mongodb, false).unwrap();
+
+        // the slot, not a second entry beside it: sqlite is gone
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"document\"]"), "{toml}");
+
+        let repo = fs::read_to_string(root.join(MONGO_REPO)).unwrap();
+        assert!(repo.contains("impl UserRepository for MongoUserRepository"), "{repo}");
+        // the port documents save as an upsert, and this is the line that keeps
+        // that true on a server that would otherwise answer with a duplicate key
+        assert!(repo.contains(".upsert(true)"), "{repo}");
+        assert!(repo.contains("MONGODB_URL"), "the adapter test must be env-gated: {repo}");
+
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("MONGODB_URL"), "{bootstrap}");
+        assert!(bootstrap.contains("fn build_user_service(db: Option<&Mongo>)"), "{bootstrap}");
+        assert!(!bootstrap.contains("DieselUserRepository"), "the Diesel wiring survived: {bootstrap}");
+        assert!(!bootstrap.contains("DATABASE_URL"), "the Diesel wiring survived: {bootstrap}");
+        // the `Services` literals are untouched — the slot is the same slot, so
+        // the binding keeps its name and both call sites keep working
+        assert!(bootstrap.contains("user: build_user_service(db.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("user: build_user_service(None),"), "{bootstrap}");
+        for marker in [RESOURCES_MARKER, "// kodegen:services:env", "// kodegen:services:default"] {
+            assert!(bootstrap.contains(marker), "marker '{marker}' was consumed: {bootstrap}");
+        }
+
+        // undo has to be possible: the Diesel files are gated, never deleted
+        assert!(root.join(DIESEL_DB).is_file() && root.join(DIESEL_REPO).is_file());
+        let infra = fs::read_to_string(root.join(INFRA_MOD)).unwrap();
+        // gated both ways, which is what makes undo one line in Cargo.toml: with
+        // `document` off, mongo_repo.rs stops compiling instead of failing to
+        assert!(infra.contains(MONGO_MOD), "mongo_repo must be cfg-gated: {infra}");
+        assert!(
+            infra.matches("#[cfg(feature = \"relational\")]").count() == 2,
+            "both diesel modules must stay behind the relational gate: {infra}"
+        );
+
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        assert!(compose.contains("image: mongo:8"), "{compose}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Both directions of the slot rule, because a user can arrive at it from
+    /// either side and the second one is the path `add_relational` no longer
+    /// checks for itself.
+    #[test]
+    fn a_relational_backend_on_top_of_mongodb_fails_with_instructions() {
+        let root = fixture("mongo-then-pg");
+        add(&root, Capability::Mongodb, false).unwrap();
+        let err = add(&root, Capability::Postgres, true).unwrap_err().to_string();
+        assert!(err.contains("'document' is already this project's datastore"), "{err}");
+        assert!(err.contains("mongo_repo.rs"), "must name the file to remove: {err}");
+        // and the other direction
+        let root2 = fixture("pg-then-mongo");
+        add(&root2, Capability::Postgres, false).unwrap();
+        let err = add(&root2, Capability::Mongodb, true).unwrap_err().to_string();
+        assert!(err.contains("'postgres' is already this project's datastore"), "{err}");
+        assert!(err.contains("rerun `kodegen add mongodb`"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root2).unwrap();
+    }
+
+    #[test]
+    fn adding_mongodb_twice_fails() {
+        let root = fixture("mongo-twice");
+        add(&root, Capability::Mongodb, false).unwrap();
+        let err = add(&root, Capability::Mongodb, true).unwrap_err().to_string();
+        assert!(err.contains("capability 'mongodb' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A document store is a datastore, a cache and a blob store are not — so
+    /// all three coexist, and neither of the additive `add`s may undo the
+    /// `document` feature the way a relational one would.
+    #[test]
+    fn mongodb_coexists_with_a_cache_and_a_blob_store() {
+        let root = fixture("mongo-and-friends");
+        add(&root, Capability::Mongodb, false).unwrap();
+        add(&root, Capability::Redis, false).unwrap();
+        add(&root, Capability::S3, false).unwrap();
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"document\", \"cache\", \"blob\"]"), "{toml}");
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        for service in ["  mongo:", "  redis:", "  s3:"] {
+            assert!(compose.contains(service), "{service} missing: {compose}");
+        }
+        // the additive capabilities wire into the same file `add mongodb`
+        // rewrote, and must not have lost the rewrite
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("MONGODB_URL") && bootstrap.contains("REDIS_URL"), "{bootstrap}");
+        assert!(bootstrap.contains("cache: build_cache(redis.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("blobs: build_blob_store(s3.as_ref()),"), "{bootstrap}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The other order, because `add redis` writes into `bootstrap.rs` first and
+    /// `add mongodb` then has to find its three generated blocks in a file that
+    /// already grew a cache builder.
+    #[test]
+    fn a_cache_added_before_mongodb_survives_the_rewrite() {
+        let root = fixture("redis-then-mongo");
+        add(&root, Capability::Redis, false).unwrap();
+        add(&root, Capability::Mongodb, false).unwrap();
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"cache\", \"document\"]"), "{toml}");
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("MONGODB_URL") && bootstrap.contains("REDIS_URL"), "{bootstrap}");
+        assert!(bootstrap.contains("cache: build_cache(redis.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("fn build_user_service(db: Option<&Mongo>)"), "{bootstrap}");
+        assert!(!bootstrap.contains("Db"), "the Diesel handle survived: {bootstrap}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `add mongodb` deletes the `Db` type, so a feature scaffolded *after* it
+    /// must ask for the handle the project actually has. The name is long on
+    /// purpose: it pushes the generated signature past rustfmt's width, which is
+    /// the shape the reverse order has to cope with too.
+    #[test]
+    fn a_feature_scaffolded_after_mongodb_takes_the_mongo_handle() {
+        let root = fixture("mongo-then-feature");
+        add(&root, Capability::Mongodb, false).unwrap();
+        crate::scaffold::add_feature(&root, "notification", crate::scaffold::Transport::Rest, false)
+            .unwrap();
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("_db: Option<&Mongo>"), "{bootstrap}");
+        assert!(!bootstrap.contains("Db"), "a builder asked for a type that is gone: {bootstrap}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// And the reverse order, where the sweep is what has to work: `cargo fmt`
+    /// has already broken the generated signature across lines by the time
+    /// `add mongodb` goes looking for it.
+    #[test]
+    fn the_sweep_finds_a_builder_rustfmt_wrapped() {
+        let root = fixture("feature-then-mongo");
+        crate::scaffold::add_feature(&root, "notification", crate::scaffold::Transport::Rest, false)
+            .unwrap();
+        let before = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        // the precondition this test exists for — if rustfmt stops wrapping here,
+        // the case is no longer covered and this says so rather than passing
+        assert!(
+            !before.contains("(_db: Option<&Db>)"),
+            "expected rustfmt to wrap the long signature: {before}"
+        );
+        add(&root, Capability::Mongodb, false).unwrap();
+        let after = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(after.contains("_db: Option<&Mongo>"), "the wrapped builder was missed: {after}");
+        assert!(!after.contains("Db"), "{after}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `DATASTORE` is a list of feature names that has to stay in step with
+    /// `Kind::is_datastore()`: the exhaustive match is what makes a new kind a
+    /// compile error, but nothing makes a new *feature name* show up here.
+    #[test]
+    fn the_datastore_list_covers_every_datastore_capability() {
+        use clap::ValueEnum;
+        for cap in Capability::value_variants() {
+            assert_eq!(
+                cap.kind().is_datastore(),
+                DATASTORE.contains(&cap.feature()),
+                "'{}' (feature `{}`) disagrees with DATASTORE",
+                cap.name(),
+                cap.feature()
+            );
+        }
+        // not reachable through any capability — it is what the template ships
+        // with, and the one entry `add` skips when it looks for a rival
+        assert!(DATASTORE.contains(&"sqlite"), "the default backend must be in the list: {DATASTORE:?}");
+    }
+
+    #[test]
+    fn mongodb_dry_run_writes_nothing_but_plans_the_same_change() {
+        let root = fixture("mongo-dry");
+        let before = snapshot(&root);
+        let planned = add(&root, Capability::Mongodb, true).unwrap();
+        assert_eq!(before, snapshot(&root), "dry run touched the tree");
+        assert_eq!(planned, add(&root, Capability::Mongodb, false).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `bootstrap.rs` is patched in place, so each of the three blocks is a
+    /// signature: a project that no longer has one is refused rather than
+    /// half-rewritten into something that will not compile.
+    #[test]
+    fn refuses_a_hand_edited_bootstrap() {
+        for (tag, spike) in [
+            ("mongo-edited-use", "diesel_repo::DieselUserRepository,"),
+            ("mongo-edited-db", "expect(\"diesel pool init failed\")"),
+            ("mongo-edited-builder", "fn build_user_service(db: Option<&Db>)"),
+        ] {
+            let root = fixture(tag);
+            let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+            let spiked = bootstrap.replace(spike, "// mine now");
+            fs::write(root.join(BOOTSTRAP), &spiked).unwrap();
+
+            let err = add(&root, Capability::Mongodb, false).unwrap_err().to_string();
+            assert!(err.contains("refusing to overwrite"), "{tag}: {err}");
+            assert!(err.contains("MONGODB_URL"), "{tag}: must list the manual steps: {err}");
+            assert_eq!(
+                fs::read_to_string(root.join(BOOTSTRAP)).unwrap(),
+                spiked,
+                "{tag}: a refusal must not write"
+            );
+            assert!(!root.join(MONGO_REPO).exists(), "{tag}: a refusal must not write");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// The interaction only a real `kodegen feature` run shows: every scaffolded
+    /// builder takes the datastore handle, unused, and would name a type that no
+    /// longer exists.
+    #[test]
+    fn scaffolded_feature_builders_move_to_the_mongo_handle() {
+        let root = fixture("mongo-after-feature");
+        crate::scaffold::add_feature(&root, "order", crate::scaffold::Transport::Rest, false).unwrap();
+        add(&root, Capability::Mongodb, false).unwrap();
+
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("fn build_order_service(_db: Option<&Mongo>)"), "{bootstrap}");
+        assert!(!bootstrap.contains("Db"), "the Diesel handle is gone, so nothing may name it: {bootstrap}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A `Db` reference kodegen did not write is a hand-written adapter: the type
+    /// disappears with the relational feature, so the project is refused rather
+    /// than rewritten into something that will not compile.
+    #[test]
+    fn refuses_a_bootstrap_that_uses_the_db_handle_elsewhere() {
+        let root = fixture("mongo-custom-db");
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        fs::write(root.join(BOOTSTRAP), format!("{bootstrap}\nfn mine(db: &Db) -> &Db {{ db }}\n")).unwrap();
+        let err = add(&root, Capability::Mongodb, true).unwrap_err().to_string();
+        assert!(err.contains("Diesel `Db` handle"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mongodb_refuses_to_overwrite_an_existing_adapter() {
+        let root = fixture("mongo-existing-adapter");
+        fs::write(root.join(MONGO_REPO), "// mine now\n").unwrap();
+        let err = add(&root, Capability::Mongodb, true).unwrap_err().to_string();
+        assert!(err.contains(MONGO_REPO) && err.contains("already exists"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -2296,6 +3021,30 @@ mod tests {
         assert!(repo.contains(SAVE_REPLACE_INTO), "template lost the replace_into save() block");
         assert!(repo.contains("#[cfg(test)]"), "template lost the diesel_repo.rs test module");
         assert!(file("hexagonal/Dockerfile").contains(APT_ANCHOR), "Dockerfile lost the apt anchor");
+        // the three blocks `add mongodb` swaps, and the gate that lets it turn
+        // the relational feature off without deleting the Diesel files
+        let bootstrap = file("hexagonal/src/bootstrap.rs");
+        for (what, block) in [
+            ("the infrastructure import list", BOOTSTRAP_USE),
+            ("the DATABASE_URL block", BOOTSTRAP_DB),
+            ("fn build_user_service", BOOTSTRAP_BUILD_USER),
+        ] {
+            assert!(bootstrap.contains(block), "template's bootstrap.rs no longer has {what}");
+        }
+        let infra = file("hexagonal/src/infrastructure/mod.rs");
+        assert_eq!(
+            infra.matches("#[cfg(feature = \"relational\")]").count(),
+            2,
+            "the Diesel modules are no longer gated — `add mongodb` would leave a project that \
+             cannot compile"
+        );
+        let toml = file("hexagonal/Cargo.toml");
+        // `relational` carries the Diesel deps themselves, so turning it off is
+        // what keeps them out of a Mongo project's build, not just out of its
+        // module tree
+        for feature in ["relational = [\"dep:diesel\", \"dep:diesel_migrations\"]", "document = [\"dep:mongodb\""] {
+            assert!(toml.contains(feature), "template's [features] lost `{feature}`");
+        }
         assert!(
             crate::TEMPLATES
                 .get_dir("hexagonal/migrations")

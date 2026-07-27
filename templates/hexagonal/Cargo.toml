@@ -36,8 +36,13 @@ tonic = "0.14.6"
 prost = "0.14.4"
 tonic-prost = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
-diesel = { version = "2.3.11", features = ["r2d2"] }
-diesel_migrations = "2.3.2"
+# Optional like every other datastore driver, and for the same reason: with
+# `document` selected there is no Diesel code left to compile (see
+# `infrastructure/mod.rs`), so nothing should pull the ORM or its migration
+# harness into the build. `relational` is what turns them on, and every SQL
+# backend turns that on.
+diesel = { version = "2.3.11", features = ["r2d2"], optional = true }
+diesel_migrations = { version = "2.3.2", optional = true }
 # The backend C libraries are declared here (not left to diesel) so that
 # `bundled` is on: the runtime image is distroless/cc and has no libpq /
 # libmysqlclient to link against dynamically. Versions must stay inside
@@ -70,6 +75,18 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
     "http-1x",
     "default-https-client",
 ], optional = true }
+# Pure Rust as well, so it costs the runtime image nothing. The default features
+# pull in bson 2 alongside bson 3 for source compatibility with older 3.x
+# releases (`compat-3-0-0`); `bson-3` + `compat-3-3-0` is the same driver on the
+# current bson and one whole dependency tree fewer. `dns-resolver` is what makes
+# a `mongodb+srv://` URI (Atlas, and every managed deployment) resolvable, and
+# `rustls-tls` is what lets it connect once it has.
+mongodb = { version = "3.8.0", default-features = false, features = [
+    "bson-3",
+    "compat-3-3-0",
+    "rustls-tls",
+    "dns-resolver",
+], optional = true }
 
 # Which backend C driver gets compiled and linked. Optional dependencies are all
 # pinned in Cargo.lock whether or not their feature is on, so flipping `default`
@@ -81,9 +98,20 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 # <db>`'s job — it rewrites that file and flips `default` together.
 [features]
 default = ["sqlite"]
-sqlite = ["diesel/sqlite", "dep:libsqlite3-sys"]
-postgres = ["diesel/postgres", "dep:pq-sys", "dep:openssl-sys"]
-mysql = ["diesel/mysql", "dep:mysqlclient-sys", "dep:openssl-sys"]
+# Every relational backend turns this on, and nothing else does: it is what
+# `infrastructure/mod.rs` gates the Diesel plumbing on. `kodegen add mongodb`
+# takes the same datastore slot with a driver that is not Diesel at all, and
+# `diesel_db.rs` would not compile with no backend selected.
+relational = ["dep:diesel", "dep:diesel_migrations"]
+sqlite = ["diesel/sqlite", "dep:libsqlite3-sys", "relational"]
+postgres = ["diesel/postgres", "dep:pq-sys", "dep:openssl-sys", "relational"]
+mysql = ["diesel/mysql", "dep:mysqlclient-sys", "dep:openssl-sys", "relational"]
+# A datastore too, and it occupies the same slot as the three above rather than
+# sitting alongside them: MongoDB is a second adapter of the same
+# `UserRepository`, not a second database. `tokio/sync` is for the `OnceCell` the
+# adapter dials its client through — the driver's constructors are all async and
+# the composition root is a plain `fn`.
+document = ["dep:mongodb", "tokio/sync"]
 # Not a backend: `cache` sits alongside whichever relational feature is on.
 # Redis and Valkey speak the same protocol, so this one feature covers both.
 cache = ["dep:redis"]

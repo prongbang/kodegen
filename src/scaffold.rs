@@ -101,6 +101,11 @@ pub fn add_feature(
             )
         })?,
         edit(project, "src/bootstrap.rs", |c| {
+            // The datastore handle is `Db` in a fresh project and `Mongo` after
+            // `kodegen add mongodb`, which deletes `Db` outright — so the builder
+            // scaffolded here has to name whichever one this project actually has,
+            // read off the composition root rather than assumed.
+            let db_ty = if c.contains("Option<&Mongo>") { "Mongo" } else { "Db" };
             let c = insert_at_marker(
                 &c,
                 "// kodegen:services:env",
@@ -124,7 +129,7 @@ pub fn add_feature(
                     ),
                 )?;
             }
-            Ok(format!("{c}\n{}", render(BOOTSTRAP_TPL)))
+            Ok(format!("{c}\n{}", render(BOOTSTRAP_TPL).replace("{{db_ty}}", db_ty)))
         })?,
     ];
 
@@ -602,8 +607,8 @@ async fn create_then_get_{{feature}}_over_grpc() {
 }
 "##;
 
-const BOOTSTRAP_TPL: &str = r##"fn build_{{feature}}_service(_db: Option<&Db>) -> Arc<dyn crate::application::{{Feature}}Service> {
-    // in-memory for now — mirror build_user_service to add a Diesel adapter
+const BOOTSTRAP_TPL: &str = r##"fn build_{{feature}}_service(_db: Option<&{{db_ty}}>) -> Arc<dyn crate::application::{{Feature}}Service> {
+    // in-memory for now — mirror build_user_service to add a real adapter
     Arc::new(crate::application::{{Feature}}ServiceImpl::new(Arc::new(
         crate::infrastructure::{{feature}}_repo::InMemory{{Feature}}Repository::new(),
     )))
