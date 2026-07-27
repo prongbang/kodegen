@@ -1,0 +1,30 @@
+[package]
+name = "hexagonal-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8.4", features = ["tokio", "http1"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+recloser = "1.4.0"
+tonic = "0.14.6"
+prost = "0.14.4"
+tonic-prost = "0.14.6"
+tower = { version = "0.5.3", features = ["util"] }
+diesel = { version = "2.3.11", features = ["sqlite", "r2d2"] }
+diesel_migrations = "2.3.2"
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"
