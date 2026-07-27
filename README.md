@@ -4,6 +4,14 @@ CLI for generating Rust starter projects and scaffolding features into them.
 
 ## Install
 
+From GitHub:
+
+```bash
+cargo install --git https://github.com/prongbang/kodegen
+```
+
+From source:
+
 ```bash
 cargo install --path .
 ```
