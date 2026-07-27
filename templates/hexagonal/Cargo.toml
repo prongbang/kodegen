@@ -2,10 +2,21 @@
 name = "hexagonal-rs"
 version = "0.1.0"
 edition = "2021"
+# The highest MSRV in the locked graph (tonic 0.14 and redis 1.4 both want it).
+# Declared rather than left implicit so an older toolchain fails with "requires
+# rustc 1.88" instead of an unrelated error deep in a dependency. Keep the
+# Dockerfile's build stage at or above this.
+rust-version = "1.88"
 
 [dependencies]
 axum = { version = "0.8.4", features = ["tokio", "http1"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "time",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
@@ -31,6 +42,13 @@ mysqlclient-sys = { version = "0.5", features = ["bundled"], optional = true }
 # default — distroless/cc has none. `vendored` statically links it instead
 # (costs perl in the build stage).
 openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
+# Pure Rust, so it costs the runtime image nothing. `connection-manager` is what
+# makes one multiplexed connection reconnect on its own; the default features
+# (acl/streams/geospatial/script) are commands this template does not use.
+redis = { version = "1.4.1", default-features = false, features = [
+    "tokio-comp",
+    "connection-manager",
+], optional = true }
 
 # Which backend C driver gets compiled and linked. Optional dependencies are all
 # pinned in Cargo.lock whether or not their feature is on, so flipping `default`
@@ -45,6 +63,9 @@ default = ["sqlite"]
 sqlite = ["diesel/sqlite", "dep:libsqlite3-sys"]
 postgres = ["diesel/postgres", "dep:pq-sys", "dep:openssl-sys"]
 mysql = ["diesel/mysql", "dep:mysqlclient-sys", "dep:openssl-sys"]
+# Not a backend: `cache` sits alongside whichever relational feature is on.
+# Redis and Valkey speak the same protocol, so this one feature covers both.
+cache = ["dep:redis"]
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

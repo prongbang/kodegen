@@ -24,13 +24,15 @@ jobs:
   # `cargo test` never compiles a line of it — it only compares strings. This is
   # the only job that puts a rustc in front of the output, which makes it the
   # only thing standing between a typo in a template constant and every user who
-  # runs `kodegen add`. One job per backend: they generate different code.
+  # runs `kodegen add`. One job per capability that generates distinct code —
+  # mariadb is skipped because it is byte-for-byte identical to mysql (same
+  # feature, same connection type, same migration; only the image differs).
   generated:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        capability: [postgres, mysql]
+        capability: [postgres, mysql, redis]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -71,9 +73,63 @@ jobs:
         run: cargo check --locked
         working-directory: ${{ runner.temp }}/demo
 
-      # no DATABASE_URL, so the adapter tests skip themselves and the in-memory
-      # adapter is what runs — the promise that a generated project is green
-      # without a server
+      # no DATABASE_URL and no REDIS_URL, so the adapter tests skip themselves
+      # and the in-memory adapters are what run — the promise that a generated
+      # project is green without a server
       - name: Test
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo
+
+  # One job with every capability on at once. Two things only exist here: cargo
+  # feature unification across the whole optional-dependency set, and two
+  # independent `add`s writing into the same `Services` literal and the same
+  # compose file. Neither is visible from a per-capability job.
+  #
+  # It is also the only job that puts a real server behind an adapter — the
+  # matrix above proves a generated project is green *without* one, which is a
+  # different promise and would be satisfied by an adapter that never works.
+  generated-all:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Generate with every capability on
+        run: cargo run --locked -- new demo-all --with postgres,redis --output "$RUNNER_TEMP"
+
+      - name: Format check
+        run: cargo fmt --check
+        working-directory: ${{ runner.temp }}/demo-all
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: ${{ runner.temp }}/demo-all
+
+      - name: Check
+        run: cargo check --locked
+        working-directory: ${{ runner.temp }}/demo-all
+
+      # REDIS_URL set, DATABASE_URL not: the cache adapter is exercised against
+      # the service container above, and the Diesel tests skip as they do
+      # everywhere else (Postgres is proven at compile time here, not at runtime)
+      - name: Test against a live cache
+        run: cargo test --locked
+        working-directory: ${{ runner.temp }}/demo-all
+        env:
+          REDIS_URL: redis://127.0.0.1:6379

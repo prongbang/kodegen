@@ -7,7 +7,7 @@ switching their infrastructure capabilities.
 |---|---|
 | `kodegen new <name>` | Generate a project from a template |
 | `kodegen feature <name>` | Scaffold one feature across every layer and wire it up |
-| `kodegen add <capability>` | Switch the project's relational backend (postgres/mysql/mariadb) |
+| `kodegen add <capability>` | Add infrastructure: a relational backend (postgres/mysql/mariadb) or a cache (redis) |
 | `kodegen list` | List built-in and cached templates |
 | `kodegen update <template>` | Re-clone a cached remote template |
 
@@ -103,15 +103,23 @@ later, not only on day one:
 kodegen add postgres                     # Diesel + PostgreSQL
 kodegen add mysql                        # Diesel + MySQL
 kodegen add mariadb                      # same driver as mysql, MariaDB image + docs
+kodegen add redis                        # a Cache port + a Redis adapter (Valkey too)
 kodegen add postgres --path ~/svc        # run from outside the project
 kodegen add postgres --dry-run           # show the plan, write nothing
 kodegen add --list                       # what's supported + what this project has on
-kodegen new svc --with postgres          # generate, then add, in one command
+kodegen new svc --with postgres,redis    # generate, then add, in one command
 ```
 
-`--with` takes a single capability today: every capability is a relational
-backend and a project can only have one, so a longer list is rejected before
-`new` writes anything.
+| Capability | Kind | Port | Default adapter (no server) | Env |
+|---|---|---|---|---|
+| `postgres` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
+| `mysql` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
+| `mariadb` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
+| `redis` | cache | **`Cache`** (new) | in-memory cache | `REDIS_URL` |
+
+`--with` takes at most one **relational** backend — a project can only have one,
+so a second is rejected before `new` writes anything — but capabilities on
+different axes combine freely (`--with postgres,redis`).
 
 `add postgres` rewrites the six things that actually differ between dialects:
 
@@ -139,7 +147,8 @@ Two rules the command enforces:
 
 - **One relational backend per project.** The `Db` handle wraps a single
   connection type, so `add mysql` on top of `postgres` is refused with the
-  steps to undo the first one, not applied halfway.
+  steps to undo the first one, not applied halfway. `add redis` is not a
+  backend and is never caught by this rule.
 - **Adding the same capability twice** is an error, not a no-op rewrite.
 
 Two of those are replacements, not edits, so both are guarded: `diesel_db.rs`
@@ -160,7 +169,31 @@ exactly as it would without the flag.
 
 MariaDB is not a separate adapter. It speaks the MySQL wire protocol, so it is
 the same driver, the same cargo feature and the same generated code — only the
-compose image and the wording differ.
+compose image and the wording differ. Valkey stands in the same relation to
+`redis`: same RESP protocol, same client, same generated Rust — swap the image
+in `docker-compose.dev.yml` and nothing else changes.
+
+#### `add redis`
+
+Purely additive, and the reason the wiring markers exist: it introduces a port
+the template does not ship, rather than swapping an adapter behind one it does.
+
+```
+Cargo.toml                              default = [...] gains "cache"
+src/domain/ports.rs                     the Cache port, appended (get/set/delete + TTL)
+src/domain/mod.rs                       pub use ports::Cache;
+src/infrastructure/in_memory_cache.rs   default adapter — no server needed
+src/infrastructure/redis_cache.rs       Redis/Valkey adapter
+src/api/mod.rs                          one `cache` field on Services
+src/bootstrap.rs                        REDIS_URL resolved once + a build_cache builder
+tests/cache.rs                          the port's contract, run against both adapters
+docker-compose.dev.yml                  a redis service with a healthcheck
+```
+
+Both adapters are held to one set of assertions in `tests/cache.rs` — the Redis
+half gated on `REDIS_URL`, the in-memory half always. A cache miss is `Ok(None)`
+on both, expiry is honored on both; that is what makes them substitutable rather
+than merely similar.
 
 #### Why the dependency tree looks bigger than the build
 

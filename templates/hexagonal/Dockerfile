@@ -1,5 +1,5 @@
 # ---------- Build stage ----------
-FROM rust:1.86-slim-bookworm AS builder
+FROM rust:1.88-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates pkg-config protobuf-compiler \

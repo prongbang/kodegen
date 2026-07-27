@@ -196,7 +196,7 @@ fn anchor_err(anchor: &str) -> String {
 /// Insert above a `// kodegen:*` marker, keeping the marker in place for the
 /// next feature. Projects generated before the markers existed fall back to the
 /// line the wiring used to hang off, so `kodegen feature` keeps working on them.
-fn insert_at_marker(
+pub(crate) fn insert_at_marker(
     content: &str,
     marker: &str,
     func: &str,
@@ -220,13 +220,13 @@ fn marker_err(marker: &str, func: &str, legacy: &str) -> String {
     )
 }
 
-fn insert_after_line(content: &str, anchor: &str, new_line: &str) -> Result<String> {
+pub(crate) fn insert_after_line(content: &str, anchor: &str, new_line: &str) -> Result<String> {
     let pos = content.find(anchor).ok_or_else(|| anchor_err(anchor))?;
     let end = content[pos..].find('\n').map(|i| pos + i + 1).unwrap_or(content.len());
     Ok(format!("{}{new_line}\n{}", &content[..end], &content[end..]))
 }
 
-fn insert_before_line(content: &str, anchor: &str, new_line: &str) -> Result<String> {
+pub(crate) fn insert_before_line(content: &str, anchor: &str, new_line: &str) -> Result<String> {
     let pos = content.find(anchor).ok_or_else(|| anchor_err(anchor))?;
     let start = content[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
     Ok(format!("{}{new_line}\n{}", &content[..start], &content[start..]))
@@ -234,7 +234,7 @@ fn insert_before_line(content: &str, anchor: &str, new_line: &str) -> Result<Str
 
 /// Insert `pub mod <name>;` into the leading `pub mod` block, keeping it
 /// sorted so rustfmt's module reordering stays a no-op.
-fn insert_pub_mod(content: &str, name: &str) -> Result<String> {
+pub(crate) fn insert_pub_mod(content: &str, name: &str) -> Result<String> {
     let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
     let start = lines
         .iter()

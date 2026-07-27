@@ -43,6 +43,12 @@ jobs:
       - name: Check mysql backend
         run: cargo check --locked --features mysql
 
+      # Not a backend — `cache` sits alongside one. Turning it on with no cache
+      # adapter generated is still the check that matters: it is what proves the
+      # lock already pins `redis` before `kodegen add redis` needs it.
+      - name: Check cache feature
+        run: cargo check --locked --features cache
+
   # Separate job: an advisory landing in RustSec is not a reason to hold up the
   # fmt/clippy/test signal, and vice versa. cargo-audit is run directly rather
   # than via rustsec/audit-check, which needs a write-scoped token to publish a

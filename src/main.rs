@@ -38,7 +38,7 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         with: Vec<capability::Capability>,
     },
-    /// Add an infrastructure capability (relational backend) to a generated project
+    /// Add an infrastructure capability (relational backend, cache) to a generated project
     Add {
         /// Capability to add
         capability: Option<capability::Capability>,
@@ -119,9 +119,10 @@ fn run() -> Result<()> {
             // there is nothing here for `kodegen add` to drift away from
             for cap in with {
                 let (created, edited) = capability::add(&dest, cap, false)?;
+                let (var, value) = cap.env();
                 println!("Added capability '{}':", cap.name());
                 print_plan(&created, &edited);
-                println!("  DATABASE_URL={}", cap.database_url());
+                println!("  {var}={value}");
             }
             println!("  cd {name} && cargo run");
         }
@@ -140,10 +141,11 @@ fn run() -> Result<()> {
             if dry_run {
                 return Ok(());
             }
+            let (var, value) = cap.env();
             println!("Start it and point the app at it:");
             println!("  docker compose -f docker-compose.dev.yml up -d");
-            println!("  DATABASE_URL={} cargo run", cap.database_url());
-            println!("Leave DATABASE_URL unset for the in-memory adapter, as before.");
+            println!("  {var}={value} cargo run");
+            println!("Leave {var} unset for the in-memory adapter, as before.");
         }
         Cmd::Update { template } => {
             let (_, cached) = remote_target(&template)?;
@@ -204,8 +206,21 @@ fn cache_root() -> Result<PathBuf> {
 /// (owner/repo shorthand or full git URL).
 fn resolve_template(template: &str) -> Result<PathBuf> {
     if let Some(embedded) = TEMPLATES.get_dir(template) {
-        let staged = std::env::temp_dir().join("kodegen").join(template);
-        let _ = fs::remove_dir_all(&staged);
+        // A fresh directory per call. The staging tree is written and then read,
+        // so a fixed path means one caller deleting or re-extracting what another
+        // is still reading — two `kodegen new`s in a script, or this binary's own
+        // parallel tests. pid + counter also makes the path unguessable, so
+        // nothing in a world-writable /tmp can pre-create it as a symlink.
+        // ponytail: one directory per call is left in /tmp for the OS to reap;
+        // reach for a tempdir crate with a Drop guard only if that ever matters.
+        static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let staged = std::env::temp_dir()
+            .join(format!(
+                "kodegen-{}-{}",
+                std::process::id(),
+                NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+            .join(template);
         fs::create_dir_all(&staged)?;
         // include_dir extracts relative to its root, so extract from the parent
         embedded.extract(staged.parent().unwrap())?;

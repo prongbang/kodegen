@@ -38,7 +38,7 @@ GRPC_PORT=50052 cargo run       # + inbound gRPC features on 0.0.0.0:50052
 cargo test
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`).
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `cache`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
 
 ### Examples
 
@@ -83,6 +83,7 @@ curl localhost:8080/hello/world
 | `GRPC_PORT` | unset | Optional. When set, inbound gRPC features (`bootstrap::grpc_routes`) are served on this port alongside HTTP. |
 | `RUST_LOG` | `info` | Tracing log filter (`EnvFilter`) |
 | `DATABASE_URL` | unset (in-memory repo) | Optional. Connection string for the Diesel-backed `UserRepository`; the format depends on which backend is enabled (see [Capabilities](#capabilities)). Unset falls back to the in-memory adapter. |
+| `REDIS_URL` | unset (in-memory cache) | Optional, and only meaningful after `kodegen add redis`. Redis/Valkey connection string for the `Cache` port, e.g. `redis://127.0.0.1:6379`. Unset falls back to the in-memory adapter. |
 
 `DATABASE_URL` per backend — the one that applies is whichever feature is in
 `default = [...]` in `Cargo.toml`:
@@ -107,8 +108,14 @@ an **optional** dependency. Switching is one command — from
 kodegen add postgres      # Diesel + PostgreSQL
 kodegen add mysql         # Diesel + MySQL
 kodegen add mariadb       # same driver as mysql; MariaDB image
+kodegen add redis         # the Cache port + a Redis adapter (Valkey too)
 kodegen add --list        # what's supported + what this project has on
 ```
+
+The first three are **relational backends** and replace each other; `redis` is a
+different axis and sits alongside whichever one is on.
+
+### Relational backend
 
 It touches six files:
 
@@ -141,6 +148,32 @@ in particular **cannot** use `TEXT PRIMARY KEY` — indexing a `TEXT` column nee
 a prefix length, so the users table uses `VARCHAR(64)` there. That one fails at
 migration time, not compile time.
 
+### Cache (`kodegen add redis`)
+
+Purely additive — it adds a port instead of swapping an adapter:
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | `default = [...]` gains `cache` (the relational feature is left alone) |
+| `src/domain/ports.rs` | the `Cache` port is **appended**: `get`/`set`/`delete`, with an optional TTL |
+| `src/domain/mod.rs` | `pub use ports::Cache;` |
+| `src/infrastructure/in_memory_cache.rs` | default adapter — a `HashMap` with lazy expiry, no server needed |
+| `src/infrastructure/redis_cache.rs` | Redis/Valkey adapter over one lazy, multiplexed, self-reconnecting connection |
+| `src/api/mod.rs` | one `cache: Arc<dyn Cache>` field on `Services` |
+| `src/bootstrap.rs` | resolves `REDIS_URL` once, plus a `build_cache` builder in both composition roots |
+| `tests/cache.rs` | the port's contract, run against **both** adapters (the Redis half is `REDIS_URL`-gated) |
+| `docker-compose.dev.yml` | a `redis` service with a healthcheck (created if missing) |
+
+To reach it from a handler, add a newtype wrapper plus `FromRef<Services>` the
+way `api/user.rs` does for `UserSvc` — `add redis` writes the port, the adapters
+and the `Services` field, not that wrapper, because nothing is using the cache
+yet. Nothing in `domain` or `application` knows which adapter is behind it.
+
+**Valkey is not a separate adapter.** It speaks the same RESP protocol on the
+same port and is driven by the same client, so switching is an image swap in
+`docker-compose.dev.yml` (`valkey/valkey:8-alpine`, and `valkey-cli` in the
+healthcheck) — the generated Rust is unchanged. Verified against both.
+
 ### Running a backend locally
 
 `docker-compose.dev.yml` (written by `kodegen add`, dev-only — the production
@@ -159,6 +192,7 @@ is around and skip quietly otherwise:
 ```bash
 cargo test                                                   # in-memory, no server needed
 DATABASE_URL=postgres://app:app@127.0.0.1:5432/app cargo test # + the real adapter
+REDIS_URL=redis://127.0.0.1:6379 cargo test                  # + the real cache
 ```
 
 ## Outbound gRPC + Circuit Breaker
@@ -215,12 +249,14 @@ Allocations per request (`alloc_bench`):
 ### `domain/` — Core
 - Entities, value objects, domain services, and domain errors.
 - **Ports (traits)** such as `UserRepository` are defined here, each documenting a behavioral contract — e.g. `UserRepository::save` is an upsert and never returns `NotFound`; `get` returns `NotFound` when the id is absent, not an empty/default value. Adapters must honor the documented contract so they stay substitutable.
+- `kodegen add redis` appends a `Cache` port on the same terms, and its contract deliberately differs where the semantics do: a cache miss is `Ok(None)`, never `NotFound`, and `delete` on an absent key is `Ok(())`. `tests/cache.rs` runs those assertions against every adapter, which is what keeps "substitutable" a fact rather than a claim.
 - Pure business rules; framework‑agnostic; minimal dependencies.
 
 ### `infrastructure/` — Adapters
 - Implements domain ports: DB repositories, caches, MQ, external clients (gRPC), logging, config, migrations.
 - Swappable without touching `domain`/`application` code.
 - `UserRepository` ships two adapters: `in_memory_repo::InMemoryUserRepository` (default) and `diesel_repo::DieselUserRepository`, selected at startup by setting `DATABASE_URL` (see `bootstrap::build_router`).
+- After `kodegen add redis` the `Cache` port has the same pair: `in_memory_cache::InMemoryCache` (default) and `redis_cache::RedisCache`, selected by `REDIS_URL`. The Redis connection is created lazily by the composition root, so an unreachable cache delays nothing at startup and reconnects on its own — but a command issued while it is down returns `DomainError::Other`, it is not silently swallowed.
 - Diesel/SQLite plumbing shared by every repository lives in `diesel_db.rs`, not in the repository itself: `build_pool(url)` runs the embedded migrations and, on a single setup connection, switches the database file to `WAL` mode once; the resulting r2d2 pool is wrapped in a cheap-to-clone `Db` handle whose `run(closure)` does the `spawn_blocking` + connection checkout + error mapping every repository needs. `DieselUserRepository::new(db: Db)` just takes that handle, so a future repository shares the same pool by cloning `Db` rather than re-deriving pool/pragma logic.
 - Every pooled connection also sets `PRAGMA busy_timeout` and `PRAGMA synchronous = NORMAL` on acquire: SQLite allows only one writer at a time, so without WAL + `busy_timeout` concurrent writers fail immediately with `SQLITE_BUSY` instead of waiting their turn. **This paragraph and the one above describe the default SQLite backend** — on PostgreSQL or MySQL (see [Capabilities](#capabilities)) `diesel_db.rs` has no pragma customizer at all, because neither has SQLite's single-writer problem; `Db`, `Db::run` and every repository stay exactly the same.
 - The composition root (`bootstrap.rs`) is the only place that builds the pool and constructs `DieselUserRepository`; repositories never see `DATABASE_URL` or the pool directly.
