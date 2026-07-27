@@ -29,20 +29,16 @@ pub fn add_feature(
     let crate_name = crate::package_name(project)
         .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
         .replace('-', "_");
-    for required in [
-        "src/api/mod.rs",
-        "src/application/mod.rs",
-        "src/domain/mod.rs",
-        "src/infrastructure/mod.rs",
-        "src/bootstrap.rs",
-    ] {
-        if !project.join(required).is_file() {
-            return Err(format!(
-                "{required} not found — this doesn't look like a project generated from the hexagonal template"
-            )
-            .into());
-        }
-    }
+    require_files(
+        project,
+        &[
+            "src/api/mod.rs",
+            "src/application/mod.rs",
+            "src/domain/mod.rs",
+            "src/infrastructure/mod.rs",
+            "src/bootstrap.rs",
+        ],
+    )?;
     let pascal = pascal_case(name);
     let render = |tpl: &str| {
         tpl.replace("{{feature}}", name)
@@ -137,29 +133,54 @@ pub fn add_feature(
     // everything above is pure, so this is the only side effect — dry-run skips it
     // wholesale and reports the very same plan
     if !dry_run {
-        for (rel, content) in creates.iter().chain(&edits) {
-            let path = project.join(rel);
-            fs::create_dir_all(path.parent().unwrap())?;
-            fs::write(path, content)?;
-        }
-
-        // scaffolded line widths vary with the feature name; let rustfmt settle them
-        let fmt_ok = Command::new("cargo")
-            .arg("fmt")
-            .current_dir(project)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !fmt_ok {
-            eprintln!("warning: `cargo fmt` failed — run it manually before committing");
-        }
+        write_plan(project, &creates, &edits)?;
     }
     Ok((paths(&creates), paths(&edits)))
 }
 
+/// Bails out before computing anything if the project is not one of ours.
+pub(crate) fn require_files(project: &Path, required: &[&str]) -> Result<()> {
+    for rel in required {
+        if !project.join(rel).is_file() {
+            return Err(format!(
+                "{rel} not found — this doesn't look like a project generated from the hexagonal template"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// The write phase shared by `feature` and `add`: the plan is already complete
+/// and validated by the time this runs, so this is the only side effect either
+/// command has (and the one thing `--dry-run` skips).
+pub(crate) fn write_plan(project: &Path, creates: &[(String, String)], edits: &[(String, String)]) -> Result<()> {
+    for (rel, content) in creates.iter().chain(edits) {
+        let path = project.join(rel);
+        // no rollback: a failure here is a broken disk or a permissions problem,
+        // and git already does this job better than we would
+        let wrote = fs::create_dir_all(path.parent().unwrap()).and_then(|()| fs::write(&path, content));
+        wrote.map_err(|e| {
+            format!("{rel}: {e} — the change was applied only in part; `git checkout .` to get back to a clean tree")
+        })?;
+    }
+
+    // scaffolded line widths vary with the feature/dialect name; let rustfmt settle them
+    let fmt_ok = Command::new("cargo")
+        .arg("fmt")
+        .current_dir(project)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !fmt_ok {
+        eprintln!("warning: `cargo fmt` failed — run it manually before committing");
+    }
+    Ok(())
+}
+
 /// Applies `f` to `rel`'s current content in memory (this is where anchors are
 /// checked) and returns the pending write.
-fn edit(project: &Path, rel: &str, f: impl FnOnce(String) -> Result<String>) -> Result<(String, String)> {
+pub(crate) fn edit(project: &Path, rel: &str, f: impl FnOnce(String) -> Result<String>) -> Result<(String, String)> {
     let content = fs::read_to_string(project.join(rel)).map_err(|e| format!("{rel}: {e}"))?;
     Ok((rel.to_string(), f(content).map_err(|e| format!("{rel}: {e}"))?))
 }

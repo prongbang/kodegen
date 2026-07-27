@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+
+  # The dialect-specific code `kodegen add` writes lives in string constants, so
+  # `cargo test` never compiles a line of it — it only compares strings. This is
+  # the only job that puts a rustc in front of the output, which makes it the
+  # only thing standing between a typo in a template constant and every user who
+  # runs `kodegen add`. One job per backend: they generate different code.
+  generated:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        capability: [postgres, mysql]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # the generated project's build.rs compiles its .proto files
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # --locked throughout: flipping a cargo feature must never need a lock
+      # update, and this is what proves it. Both bundled C drivers build from
+      # source (pq-src / mysqlclient-src + vendored openssl); ubuntu-latest
+      # already ships the perl, make and cmake they need.
+      # deliberately new -> feature -> add, not `new --with`: `kodegen feature`
+      # runs `cargo fmt` over the project, and `add` compares the files it
+      # replaces against the template verbatim. Only this order catches a
+      # template file whose formatting is not already what rustfmt wants.
+      - name: Generate, scaffold a feature, then switch backend
+        run: |
+          cargo run --locked -- new demo --output "$RUNNER_TEMP"
+          cargo run --locked -- feature order --path "$RUNNER_TEMP/demo"
+          cargo run --locked -- add ${{ matrix.capability }} --path "$RUNNER_TEMP/demo"
+
+      - name: new --with is the same thing in one command
+        run: cargo run --locked -- new demo-with --with ${{ matrix.capability }} --output "$RUNNER_TEMP"
+
+      - name: Format check
+        run: cargo fmt --check
+        working-directory: ${{ runner.temp }}/demo
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: ${{ runner.temp }}/demo
+
+      - name: Check
+        run: cargo check --locked
+        working-directory: ${{ runner.temp }}/demo
+
+      # no DATABASE_URL, so the adapter tests skip themselves and the in-memory
+      # adapter is what runs — the promise that a generated project is green
+      # without a server
+      - name: Test
+        run: cargo test --locked
+        working-directory: ${{ runner.temp }}/demo

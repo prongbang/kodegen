@@ -23,6 +23,7 @@ proto/                 # protobuf definitions — every file here is compiled by
 - `protoc` — required for local builds because `build.rs` compiles every `.proto` in `proto/` via `tonic-prost-build`.
   - macOS: `brew install protobuf`
   - Debian/Ubuntu: `apt-get install protobuf-compiler`
+- Docker — only if you switch off the default SQLite backend and want to run the real database locally (see [Capabilities](#capabilities)).
 
 ### Run
 
@@ -81,7 +82,84 @@ curl localhost:8080/hello/world
 | `GREETER_ADDR` | `http://localhost:50051` | gRPC address of the upstream Greeter service |
 | `GRPC_PORT` | unset | Optional. When set, inbound gRPC features (`bootstrap::grpc_routes`) are served on this port alongside HTTP. |
 | `RUST_LOG` | `info` | Tracing log filter (`EnvFilter`) |
-| `DATABASE_URL` | unset (in-memory repo) | Optional. SQLite file path (e.g. `app.db` or `/data/app.db`) for the Diesel-backed `UserRepository`. Unset falls back to the in-memory adapter. |
+| `DATABASE_URL` | unset (in-memory repo) | Optional. Connection string for the Diesel-backed `UserRepository`; the format depends on which backend is enabled (see [Capabilities](#capabilities)). Unset falls back to the in-memory adapter. |
+
+`DATABASE_URL` per backend — the one that applies is whichever feature is in
+`default = [...]` in `Cargo.toml`:
+
+| Backend | `DATABASE_URL` |
+|---|---|
+| SQLite (default) | `app.db` or `/data/app.db` — a file path, not a URL |
+| PostgreSQL | `postgres://app:app@127.0.0.1:5432/app` |
+| MySQL / MariaDB | `mysql://app:app@127.0.0.1:3306/app` |
+
+Use `127.0.0.1`, not `localhost`, for MySQL/MariaDB: libmysqlclient reads
+`localhost` as "connect over the unix socket" and ignores the port, which fails
+against a container published on 3306.
+
+## Capabilities
+
+This project ships with SQLite on, and every other backend already declared as
+an **optional** dependency. Switching is one command — from
+[kodegen](https://github.com/prongbang/kodegen):
+
+```bash
+kodegen add postgres      # Diesel + PostgreSQL
+kodegen add mysql         # Diesel + MySQL
+kodegen add mariadb       # same driver as mysql; MariaDB image
+kodegen add --list        # what's supported + what this project has on
+```
+
+It touches six files:
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | `default = [...]` gains the new backend feature and loses the old one |
+| `src/infrastructure/diesel_db.rs` | **replaced** — `SqliteConnection` becomes `PgConnection`/`MysqlConnection`, and the SQLite WAL/pragma setup goes away |
+| `src/infrastructure/diesel_repo.rs` | `save()` becomes the dialect's upsert, and the **test module is replaced** with a `DATABASE_URL`-gated one (a throwaway file is no longer a database) |
+| `migrations/*_create_users/up.sql` | the dialect's `CREATE TABLE` |
+| `docker-compose.dev.yml` | a dev service with a healthcheck (created if missing) |
+| `Dockerfile` | `perl`/`make`/`cmake` on the `apt-get install` line, for building the backend's C driver from source |
+
+Everything else — the ports, `Db::run`, the repositories, `bootstrap.rs`, the
+API — is untouched, which is the point of keeping the pool in one file.
+
+Only **one** relational backend at a time: `Db` wraps a single connection type,
+so a second `add` is refused rather than half-applied. `add` also refuses if
+`diesel_db.rs` or the generated test module no longer match what
+`kodegen new` wrote — your edits are never overwritten silently. Queries you
+added to `diesel_repo.rs` above the test module are kept.
+
+Because the backends are optional dependencies, `Cargo.lock` already pins all of
+them and nothing is compiled until its feature is on — `cargo build --locked`
+keeps working across the switch, offline included.
+
+Doing it by hand instead: set the feature in `[features] default`, swap
+`SqliteConnection` for `PgConnection`/`MysqlConnection` throughout
+`diesel_db.rs`, and check the migration's SQL is valid for the dialect. MySQL
+in particular **cannot** use `TEXT PRIMARY KEY` — indexing a `TEXT` column needs
+a prefix length, so the users table uses `VARCHAR(64)` there. That one fails at
+migration time, not compile time.
+
+### Running a backend locally
+
+`docker-compose.dev.yml` (written by `kodegen add`, dev-only — the production
+image is the `Dockerfile`) boots the server with a healthcheck:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+DATABASE_URL=postgres://app:app@127.0.0.1:5432/app cargo run
+docker compose -f docker-compose.dev.yml down -v     # -v also drops the data
+```
+
+The same file is what the adapter's integration tests expect. They are gated on
+`DATABASE_URL` rather than `#[ignore]`, so they run deeper the moment a server
+is around and skip quietly otherwise:
+
+```bash
+cargo test                                                   # in-memory, no server needed
+DATABASE_URL=postgres://app:app@127.0.0.1:5432/app cargo test # + the real adapter
+```
 
 ## Outbound gRPC + Circuit Breaker
 
@@ -144,9 +222,9 @@ Allocations per request (`alloc_bench`):
 - Swappable without touching `domain`/`application` code.
 - `UserRepository` ships two adapters: `in_memory_repo::InMemoryUserRepository` (default) and `diesel_repo::DieselUserRepository`, selected at startup by setting `DATABASE_URL` (see `bootstrap::build_router`).
 - Diesel/SQLite plumbing shared by every repository lives in `diesel_db.rs`, not in the repository itself: `build_pool(url)` runs the embedded migrations and, on a single setup connection, switches the database file to `WAL` mode once; the resulting r2d2 pool is wrapped in a cheap-to-clone `Db` handle whose `run(closure)` does the `spawn_blocking` + connection checkout + error mapping every repository needs. `DieselUserRepository::new(db: Db)` just takes that handle, so a future repository shares the same pool by cloning `Db` rather than re-deriving pool/pragma logic.
-- Every pooled connection also sets `PRAGMA busy_timeout` and `PRAGMA synchronous = NORMAL` on acquire: SQLite allows only one writer at a time, so without WAL + `busy_timeout` concurrent writers fail immediately with `SQLITE_BUSY` instead of waiting their turn.
+- Every pooled connection also sets `PRAGMA busy_timeout` and `PRAGMA synchronous = NORMAL` on acquire: SQLite allows only one writer at a time, so without WAL + `busy_timeout` concurrent writers fail immediately with `SQLITE_BUSY` instead of waiting their turn. **This paragraph and the one above describe the default SQLite backend** — on PostgreSQL or MySQL (see [Capabilities](#capabilities)) `diesel_db.rs` has no pragma customizer at all, because neither has SQLite's single-writer problem; `Db`, `Db::run` and every repository stay exactly the same.
 - The composition root (`bootstrap.rs`) is the only place that builds the pool and constructs `DieselUserRepository`; repositories never see `DATABASE_URL` or the pool directly.
-- Moving to Postgres later means swapping the `diesel` `sqlite` feature for `postgres` and pointing `DATABASE_URL` at a Postgres connection string — the port and call sites don't change.
+- Moving to Postgres/MySQL later swaps the `diesel` backend feature and the connection type inside `diesel_db.rs` — the port, the repositories and every call site stay as they are. `kodegen add postgres` does it for you; see [Capabilities](#capabilities).
 
 ## Dependency Direction
 

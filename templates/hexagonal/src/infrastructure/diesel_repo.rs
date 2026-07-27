@@ -69,10 +69,11 @@ mod tests {
     use crate::infrastructure::diesel_db::build_pool;
 
     fn temp_repo(tag: &str) -> (DieselUserRepository, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "hexagonal-rs-diesel-test-{tag}-{}.db",
-            std::process::id()
-        ));
+        // tag + pid is already unique per test and per run; keeping the crate
+        // name out of it also keeps this file free of any project-specific
+        // text, so `kodegen add` can compare it against the template verbatim
+        let path =
+            std::env::temp_dir().join(format!("diesel-test-{tag}-{}.db", std::process::id()));
         let pool = build_pool(path.to_str().unwrap()).expect("pool init");
         (DieselUserRepository::new(Db::new(pool)), path)
     }

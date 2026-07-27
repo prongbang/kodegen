@@ -1,6 +1,15 @@
 # kodegen
 
-CLI for generating Rust starter projects and scaffolding features into them.
+CLI for generating Rust starter projects, scaffolding features into them, and
+switching their infrastructure capabilities.
+
+| Command | What it does |
+|---|---|
+| `kodegen new <name>` | Generate a project from a template |
+| `kodegen feature <name>` | Scaffold one feature across every layer and wire it up |
+| `kodegen add <capability>` | Switch the project's relational backend (postgres/mysql/mariadb) |
+| `kodegen list` | List built-in and cached templates |
+| `kodegen update <template>` | Re-clone a cached remote template |
 
 ## Install
 
@@ -84,6 +93,97 @@ that would be edited (`~`), then stops before writing anything (`cargo fmt`
 included). It is the same code path as a real run — the whole change is
 computed in memory first — so every anchor is still checked and a diverged
 project fails exactly as it would without the flag.
+
+### Add a capability
+
+A generated project starts on SQLite. `kodegen add` moves it to a real server —
+later, not only on day one:
+
+```bash
+kodegen add postgres                     # Diesel + PostgreSQL
+kodegen add mysql                        # Diesel + MySQL
+kodegen add mariadb                      # same driver as mysql, MariaDB image + docs
+kodegen add postgres --path ~/svc        # run from outside the project
+kodegen add postgres --dry-run           # show the plan, write nothing
+kodegen add --list                       # what's supported + what this project has on
+kodegen new svc --with postgres          # generate, then add, in one command
+```
+
+`--with` takes a single capability today: every capability is a relational
+backend and a project can only have one, so a longer list is rejected before
+`new` writes anything.
+
+`add postgres` rewrites the six things that actually differ between dialects:
+
+```
+Cargo.toml                              default = ["sqlite"] -> ["postgres"]
+src/infrastructure/diesel_db.rs         SqliteConnection -> PgConnection (whole file replaced)
+src/infrastructure/diesel_repo.rs       save() -> the dialect's upsert; test module replaced
+migrations/*_create_users/up.sql        the dialect's CREATE TABLE
+docker-compose.dev.yml                  a dev service with a healthcheck (created if absent)
+Dockerfile                              perl/make/cmake for the bundled C driver
+```
+
+Then:
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+DATABASE_URL=postgres://app:app@127.0.0.1:5432/app cargo run
+```
+
+Leaving `DATABASE_URL` unset still selects the in-memory adapter, so `cargo
+test` passes with no server running — the adapter tests skip themselves rather
+than fail.
+
+Two rules the command enforces:
+
+- **One relational backend per project.** The `Db` handle wraps a single
+  connection type, so `add mysql` on top of `postgres` is refused with the
+  steps to undo the first one, not applied halfway.
+- **Adding the same capability twice** is an error, not a no-op rewrite.
+
+Two of those are replacements, not edits, so both are guarded: `diesel_db.rs`
+must still be byte-for-byte what `kodegen new` wrote, and `diesel_repo.rs` must
+still end with the generated `#[cfg(test)] mod tests` block. Queries you added
+above that block are kept; if either check fails the command refuses and prints
+the manual steps instead of clobbering your work. Same for the seed migration —
+a `up.sql` you wrote yourself is left alone with a warning, never rewritten.
+
+Both dialects get a real upsert. On MySQL that means `ON DUPLICATE KEY UPDATE`
+rather than `REPLACE INTO`: `REPLACE` is a delete followed by an insert, so it
+would fire `ON DELETE CASCADE` on everything referencing the row on what
+`UserRepository::save` documents as an update.
+
+`--dry-run` is the same code path minus the writes: the whole change is computed
+in memory, so every signature is still checked and a diverged project fails
+exactly as it would without the flag.
+
+MariaDB is not a separate adapter. It speaks the MySQL wire protocol, so it is
+the same driver, the same cargo feature and the same generated code — only the
+compose image and the wording differ.
+
+#### Why the dependency tree looks bigger than the build
+
+Every backend is declared as an **optional** dependency, and `add` only flips
+`default = [...]`. Cargo pins optional dependencies in `Cargo.lock` whether or
+not their feature is on, so:
+
+- `Cargo.lock` lists `pq-sys`, `mysqlclient-sys` and friends even in a
+  SQLite-only project — **they are not compiled** until a feature turns them on.
+- `cargo build --locked` keeps working through every `kodegen add`, offline
+  included, because no dependency is ever *added* — only selected.
+- `cargo audit` reads the lock, not the binary, so an advisory can fire for a
+  crate the project never builds. Check what actually pulls it in before
+  treating it as exploitable:
+
+  ```bash
+  cargo tree -e normal -i <crate>                     # in the current feature set
+  cargo tree -e normal --features postgres -i <crate> # ...and with one turned on
+  ```
+
+  Generated projects ship `.cargo/audit.toml` for the cases where the answer is
+  "nothing here compiles it" — add the advisory id to `ignore` with a comment
+  saying why, and a date to revisit.
 
 ### Update a cached template
 

@@ -1,3 +1,4 @@
+mod capability;
 mod scaffold;
 
 use clap::{Parser, Subcommand};
@@ -33,6 +34,23 @@ enum Cmd {
         /// Directory to create the project in
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
+        /// Capability to add right after generating (e.g. --with postgres)
+        #[arg(long, value_delimiter = ',')]
+        with: Vec<capability::Capability>,
+    },
+    /// Add an infrastructure capability (relational backend) to a generated project
+    Add {
+        /// Capability to add
+        capability: Option<capability::Capability>,
+        /// Project root
+        #[arg(short, long, default_value = ".")]
+        path: PathBuf,
+        /// Print what would change, without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// List supported capabilities and the ones this project has on
+        #[arg(long, conflicts_with_all = ["capability", "dry_run"])]
+        list: bool,
     },
     /// Scaffold a feature (domain/application/infrastructure/api + wiring) into a generated project
     Feature {
@@ -59,7 +77,20 @@ enum Cmd {
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-fn main() -> Result<()> {
+/// Errors are printed with Display, not the Debug that `fn main() -> Result`
+/// would use: the marker/refusal messages are multi-line manual instructions,
+/// and escaped `\n`s make them unreadable exactly when they matter.
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::List => {
             for dir in TEMPLATES.dirs() {
@@ -71,8 +102,11 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::New { name, template, output } => {
+        Cmd::New { name, template, output, with } => {
             validate_name(&name)?;
+            // checked before rendering: failing halfway through `--with` would
+            // leave a project on disk that the user did not ask for
+            capability::check_combination(&with)?;
             let dest = output.join(&name);
             if dest.exists() {
                 return Err(format!("{} already exists", dest.display()).into());
@@ -81,7 +115,35 @@ fn main() -> Result<()> {
             let subs = substitutions(&tpl_dir, &name);
             render_tree(&tpl_dir, &dest, &subs)?;
             println!("Created {} from template '{template}'", dest.display());
+            // --with is a loop over the same `add`, not a second code path, so
+            // there is nothing here for `kodegen add` to drift away from
+            for cap in with {
+                let (created, edited) = capability::add(&dest, cap, false)?;
+                println!("Added capability '{}':", cap.name());
+                print_plan(&created, &edited);
+                println!("  DATABASE_URL={}", cap.database_url());
+            }
             println!("  cd {name} && cargo run");
+        }
+        Cmd::Add { capability: cap, path, dry_run, list } => {
+            if list {
+                return capability::list(&path);
+            }
+            let cap = cap.ok_or("missing <CAPABILITY> — try `kodegen add --list`")?;
+            let (created, edited) = capability::add(&path, cap, dry_run)?;
+            if dry_run {
+                println!("Dry run — capability '{}' would be added, nothing written:", cap.name());
+            } else {
+                println!("Added capability '{}':", cap.name());
+            }
+            print_plan(&created, &edited);
+            if dry_run {
+                return Ok(());
+            }
+            println!("Start it and point the app at it:");
+            println!("  docker compose -f docker-compose.dev.yml up -d");
+            println!("  DATABASE_URL={} cargo run", cap.database_url());
+            println!("Leave DATABASE_URL unset for the in-memory adapter, as before.");
         }
         Cmd::Update { template } => {
             let (_, cached) = remote_target(&template)?;
@@ -104,12 +166,7 @@ fn main() -> Result<()> {
             } else {
                 println!("Added feature '{name}':");
             }
-            for f in created {
-                println!("  + {f}");
-            }
-            for f in edited {
-                println!("  ~ {f}");
-            }
+            print_plan(&created, &edited);
             if dry_run {
                 return Ok(());
             }
@@ -125,6 +182,16 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `+` created, `~` edited — the plan exactly as the scaffolder computed it.
+fn print_plan(created: &[String], edited: &[String]) {
+    for f in created {
+        println!("  + {f}");
+    }
+    for f in edited {
+        println!("  ~ {f}");
+    }
 }
 
 fn cache_root() -> Result<PathBuf> {
