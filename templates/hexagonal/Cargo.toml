@@ -17,9 +17,34 @@ tonic = "0.14.6"
 prost = "0.14.4"
 tonic-prost = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
-diesel = { version = "2.3.11", features = ["sqlite", "r2d2"] }
+diesel = { version = "2.3.11", features = ["r2d2"] }
 diesel_migrations = "2.3.2"
-libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+# The backend C libraries are declared here (not left to diesel) so that
+# `bundled` is on: the runtime image is distroless/cc and has no libpq /
+# libmysqlclient to link against dynamically. Versions must stay inside
+# diesel's own ranges (pq-sys <0.8, mysqlclient-sys <0.6) or cargo ends up
+# with two copies of a `links` crate.
+libsqlite3-sys = { version = "0.37", features = ["bundled"], optional = true }
+pq-sys = { version = "0.7", features = ["bundled"], optional = true }
+mysqlclient-sys = { version = "0.5", features = ["bundled"], optional = true }
+# Both bundled backends pull in openssl-sys, which links the *system* libssl by
+# default — distroless/cc has none. `vendored` statically links it instead
+# (costs perl in the build stage).
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
+
+# Which backend C driver gets compiled and linked. Optional dependencies are all
+# pinned in Cargo.lock whether or not their feature is on, so flipping `default`
+# never invalidates `cargo build --locked`.
+#
+# Flipping a feature on its own changes nothing about how the app behaves:
+# `infrastructure/diesel_db.rs` is written against `SqliteConnection`. Switching
+# the connection type (and the migrations that go with it) is `kodegen add
+# <db>`'s job — it rewrites that file and flips `default` together.
+[features]
+default = ["sqlite"]
+sqlite = ["diesel/sqlite", "dep:libsqlite3-sys"]
+postgres = ["diesel/postgres", "dep:pq-sys", "dep:openssl-sys"]
+mysql = ["diesel/mysql", "dep:mysqlclient-sys", "dep:openssl-sys"]
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

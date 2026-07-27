@@ -21,10 +21,12 @@ pub fn build_services_from_env() -> api::Services {
     let db = std::env::var("DATABASE_URL")
         .ok()
         .map(|url| Db::new(build_pool(&url).expect("diesel pool init failed")));
+    // kodegen:resources
 
     api::Services {
         user: build_user_service(db.as_ref()),
         greeter: build_greeter(),
+        // kodegen:services:env
     }
 }
 
@@ -42,6 +44,7 @@ pub fn build_services() -> api::Services {
     api::Services {
         user: build_user_service(None),
         greeter: build_greeter(),
+        // kodegen:services:default
     }
 }
 

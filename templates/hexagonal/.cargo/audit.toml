@@ -1,0 +1,12 @@
+# cargo-audit config (see the `audit` job in .github/workflows/ci.yml).
+#
+# Cargo.lock pins every optional dependency — the postgres and mysql backends
+# included — whether or not its feature is on. cargo-audit reads the lock, not
+# the compiled binary, so an advisory can fire for a crate this project never
+# compiles. Check which feature pulls it in (`cargo tree -e normal --features
+# <feature> -i <crate>`) before treating it as exploitable here.
+#
+# Add an advisory id to `ignore` only with a comment saying why, and revisit it:
+#   ignore = ["RUSTSEC-0000-0000"] # not reachable: <reason>, recheck <date>
+[advisories]
+ignore = []

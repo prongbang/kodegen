@@ -300,6 +300,27 @@ mod tests {
         assert!(toml.contains("name = \"hexagonal-rs\""));
     }
 
+    /// The scaffolder's test fixtures carry their own copy of these markers, so
+    /// only this test notices if the template loses one — which would silently
+    /// downgrade every generated project to the legacy anchor path.
+    #[test]
+    fn embedded_template_carries_the_wiring_markers() {
+        let bootstrap = TEMPLATES
+            .get_file("hexagonal/src/bootstrap.rs")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        for marker in [
+            "// kodegen:resources",
+            "// kodegen:services:env",
+            "// kodegen:services:default",
+        ] {
+            assert!(bootstrap.contains(marker), "template lost the '{marker}' marker");
+        }
+        let toml = TEMPLATES.get_file("hexagonal/Cargo.toml").unwrap().contents_utf8().unwrap();
+        assert!(toml.contains("default = ["), "template lost the [features] default anchor");
+    }
+
     #[test]
     fn name_validation() {
         assert!(validate_name("my-app").is_ok());

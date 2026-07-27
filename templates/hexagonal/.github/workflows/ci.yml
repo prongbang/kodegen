@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   ci:
     runs-on: ubuntu-latest
@@ -24,7 +27,33 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
+
+      # The point of the optional backends is that turning one on never
+      # invalidates Cargo.lock — unproven unless CI actually resolves them with
+      # --locked. Both build their C driver from source (pq-src / mysqlclient-src
+      # + vendored openssl); ubuntu-latest images already ship perl and cmake,
+      # so no extra apt packages are needed here.
+      - name: Check postgres backend
+        run: cargo check --locked --features postgres
+
+      - name: Check mysql backend
+        run: cargo check --locked --features mysql
+
+  # Separate job: an advisory landing in RustSec is not a reason to hold up the
+  # fmt/clippy/test signal, and vice versa. cargo-audit is run directly rather
+  # than via rustsec/audit-check, which needs a write-scoped token to publish a
+  # check run — pull requests from forks only get a read-only one.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit

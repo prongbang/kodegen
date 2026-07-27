@@ -105,13 +105,17 @@ pub fn add_feature(
             )
         })?,
         edit(project, "src/bootstrap.rs", |c| {
-            let c = insert_after_line(
+            let c = insert_at_marker(
                 &c,
+                "// kodegen:services:env",
+                "build_services_from_env",
                 "user: build_user_service(db.as_ref()),",
                 &format!("        {name}: build_{name}_service(db.as_ref()),"),
             )?;
-            let mut c = insert_after_line(
+            let mut c = insert_at_marker(
                 &c,
+                "// kodegen:services:default",
+                "build_services",
                 "user: build_user_service(None),",
                 &format!("        {name}: build_{name}_service(None),"),
             )?;
@@ -165,6 +169,33 @@ fn anchor_err(anchor: &str) -> String {
         "anchor '{}' not found — the project diverged from the template; \
          wire the feature manually (see README \"Adding a Feature\")",
         anchor.trim()
+    )
+}
+
+/// Insert above a `// kodegen:*` marker, keeping the marker in place for the
+/// next feature. Projects generated before the markers existed fall back to the
+/// line the wiring used to hang off, so `kodegen feature` keeps working on them.
+fn insert_at_marker(
+    content: &str,
+    marker: &str,
+    func: &str,
+    legacy: &str,
+    new_line: &str,
+) -> Result<String> {
+    if content.contains(marker) {
+        insert_before_line(content, marker, new_line)
+    } else {
+        insert_after_line(content, legacy, new_line)
+            .map_err(|_| marker_err(marker, func, legacy).into())
+    }
+}
+
+fn marker_err(marker: &str, func: &str, legacy: &str) -> String {
+    format!(
+        "marker '{marker}' is missing and so is the legacy anchor '{legacy}' — \
+         put the line `        {marker}` back as the last entry of the \
+         `api::Services {{ ... }}` literal in `{func}()`, then rerun \
+         (or wire the feature manually, see README \"Adding a Feature\")"
     )
 }
 
@@ -604,6 +635,73 @@ mod tests {
         )
         .unwrap();
         root
+    }
+
+    /// Same tree, but carrying the `// kodegen:*` markers the current template
+    /// ships — `fixture` stays marker-less on purpose so every other test here
+    /// exercises the legacy fallback.
+    fn fixture_with_markers(tag: &str) -> std::path::PathBuf {
+        let root = fixture(tag);
+        fs::write(
+            root.join("src/bootstrap.rs"),
+            "fn a() -> Services {\n    Services {\n        user: build_user_service(db.as_ref()),\n        // kodegen:services:env\n    }\n}\nfn b() -> Services {\n    Services {\n        user: build_user_service(None),\n        // kodegen:services:default\n    }\n}\nfn c() {\n    routes.routes()\n}\n",
+        )
+        .unwrap();
+        root
+    }
+
+    #[test]
+    fn markers_take_precedence_and_survive_repeat_runs() {
+        let root = fixture_with_markers("markers");
+        add_feature(&root, "order", Transport::Rest, false).unwrap();
+        add_feature(&root, "cart", Transport::Rest, false).unwrap();
+        let out = fs::read_to_string(root.join("src/bootstrap.rs")).unwrap();
+        assert!(
+            out.contains(
+                "        order: build_order_service(db.as_ref()),\n        cart: build_cart_service(db.as_ref()),\n        // kodegen:services:env"
+            ),
+            "fields did not stack above the marker: {out}"
+        );
+        assert!(
+            out.contains(
+                "        order: build_order_service(None),\n        cart: build_cart_service(None),\n        // kodegen:services:default"
+            ),
+            "{out}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_the_legacy_anchor_when_the_marker_is_absent() {
+        let out = insert_at_marker(
+            "    Services {\n        user: build_user_service(None),\n    }\n",
+            "// kodegen:services:default",
+            "build_services",
+            "user: build_user_service(None),",
+            "        order: build_order_service(None),",
+        )
+        .unwrap();
+        assert!(
+            out.contains("user: build_user_service(None),\n        order: build_order_service(None),"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn missing_marker_error_names_the_marker_and_the_line_to_restore() {
+        let err = insert_at_marker(
+            "fn nothing() {}\n",
+            "// kodegen:services:env",
+            "build_services_from_env",
+            "user: build_user_service(db.as_ref()),",
+            "        order: build_order_service(db.as_ref()),",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("// kodegen:services:env"), "{err}");
+        assert!(err.contains("put the line"), "{err}");
+        assert!(err.contains("build_services_from_env()"), "{err}");
+        assert!(err.contains("user: build_user_service(db.as_ref()),"), "{err}");
     }
 
     fn snapshot(root: &Path) -> Vec<(String, String)> {

@@ -182,7 +182,7 @@ Manually, follow the dependency direction, inside out. Example: `orders`.
 2. **`application/orders.rs`** — define `OrderService` (trait) + `OrderServiceImpl` (impl over the port). Register in `application/mod.rs`: `pub mod orders;` + re-export.
 3. **`infrastructure/`** — implement the port: `orders_repo.rs` (start in-memory; a Diesel one reuses `Db` by cloning it). Register in `infrastructure/mod.rs`.
 4. **`api/orders.rs`** — handlers + a `OrderSvc(Arc<dyn OrderService>)` wrapper with `FromRef<Services>` + its own `routes()`. Then in `api/mod.rs`: add `pub mod orders;`, one `order` field on `Services`, and one `.merge(orders::routes())` in `router()` (or `.nest("/orders", …)` for a prefix).
-5. **`bootstrap.rs`** — add a `build_order_service(db: Option<&Db>)` builder (picks the adapter, reuses the pool via `db.clone()`) and set the new field in `build_services_from_env()`/`build_services()`. For a gRPC feature, also add `.add_service(...)` in `grpc_routes()`.
+5. **`bootstrap.rs`** — add a `build_order_service(db: Option<&Db>)` builder (picks the adapter, reuses the pool via `db.clone()`) and set the new field in `build_services_from_env()`/`build_services()`. For a gRPC feature, also add `.add_service(...)` in `grpc_routes()`. Don't delete the `// kodegen:*` comments — `kodegen feature` inserts at them, and without them it falls back to matching the `user:` lines (so removing the `user` feature would break the scaffolder).
 6. **`tests/`** — hit the new routes through `bootstrap::build_services()`, swapping in a fake port impl where needed (see `FakeGreeter` in `tests/api.rs`).
 
 Each step touches one file per layer; nothing existing changes shape — `Services` gains a field, `router()` gains routes, everything else is new files.
@@ -212,10 +212,12 @@ pub fn build_services_from_env() -> api::Services {
     let db = std::env::var("DATABASE_URL")
         .ok()
         .map(|url| Db::new(build_pool(&url).expect("diesel pool init failed")));
+    // kodegen:resources
 
     api::Services {
         user: build_user_service(db.as_ref()),
         greeter: build_greeter(),
+        // kodegen:services:env
     }
 }
 
