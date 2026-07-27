@@ -13,15 +13,28 @@ use crate::{
 use std::sync::Arc;
 
 pub fn build_router() -> axum::Router {
+    api::router(build_services_from_env())
+}
+
+pub fn build_services_from_env() -> api::Services {
     // shared resources are resolved once; each feature builder picks its adapter
     let db = std::env::var("DATABASE_URL")
         .ok()
         .map(|url| Db::new(build_pool(&url).expect("diesel pool init failed")));
 
-    api::router(api::Services {
+    api::Services {
         user: build_user_service(db.as_ref()),
         greeter: build_greeter(),
-    })
+    }
+}
+
+/// Inbound gRPC services, one `.add_service(...)` line per feature
+/// (`kodegen feature <name> --transport grpc` inserts them here).
+/// Served by main.rs when `GRPC_PORT` is set.
+pub fn grpc_routes(services: &api::Services) -> tonic::service::Routes {
+    let mut routes = tonic::service::RoutesBuilder::default();
+    let _ = (&mut routes, services); // placeholder until the first gRPC feature
+    routes.routes()
 }
 
 /// In-memory defaults; tests build on this and swap in fake ports.

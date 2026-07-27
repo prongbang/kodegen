@@ -1,4 +1,4 @@
-use hexagonal_rs::bootstrap;
+use hexagonal_rs::{api, bootstrap};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -10,7 +10,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let app = bootstrap::build_router();
+    let services = bootstrap::build_services_from_env();
+    let app = api::router(services.clone());
+
+    if let Ok(grpc_port) = std::env::var("GRPC_PORT") {
+        let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{grpc_port}").parse()?;
+        let routes = bootstrap::grpc_routes(&services);
+        tracing::info!("gRPC listening on {grpc_addr}");
+        tokio::spawn(async move {
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_routes(routes)
+                .serve(grpc_addr)
+                .await
+            {
+                tracing::error!("gRPC server error: {e}");
+            }
+        });
+    }
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
     let addr = format!("0.0.0.0:{port}");

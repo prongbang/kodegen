@@ -78,6 +78,7 @@ curl localhost:8080/hello/world
 |---|---|---|
 | `PORT` | `8080` | HTTP listen port |
 | `GREETER_ADDR` | `http://localhost:50051` | gRPC address of the upstream Greeter service |
+| `GRPC_PORT` | unset | Optional. When set, inbound gRPC features (`bootstrap::grpc_routes`) are served on this port alongside HTTP. |
 | `RUST_LOG` | `info` | Tracing log filter (`EnvFilter`) |
 | `DATABASE_URL` | unset (in-memory repo) | Optional. SQLite file path (e.g. `app.db` or `/data/app.db`) for the Diesel-backed `UserRepository`. Unset falls back to the in-memory adapter. |
 
@@ -165,6 +166,10 @@ bootstrap depends on all to assemble the app
 If this project was generated with [kodegen](https://github.com/prongbang/kodegen), the whole
 checklist below is automated: `kodegen feature orders` creates every file, wires it up, and
 leaves working `POST /orders` + `GET /orders/{id}` routes plus an integration test.
+`kodegen feature orders --transport grpc` scaffolds the same domain/application/infrastructure
+layers but delivers them as a tonic service instead: a `proto/orders.proto`, an
+`api/orders_grpc.rs` adapter registered in `bootstrap::grpc_routes`, and a client-based
+integration test. Serve gRPC features with `GRPC_PORT=50052 cargo run`.
 
 Manually, follow the dependency direction, inside out. Example: `orders`.
 

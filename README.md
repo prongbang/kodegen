@@ -47,13 +47,14 @@ name across file contents, file names, and `Cargo.lock`. `{{project_name}}` /
 Inside a project generated from the `hexagonal` template:
 
 ```bash
-kodegen feature order          # or: kodegen feature order --path my-service
-cargo test                     # POST /order, GET /order/{id} work immediately
+kodegen feature order                    # REST (default): POST /order, GET /order/{id}
+kodegen feature payment --transport grpc # tonic service: payment.PaymentApi Create/Get
+cargo test                               # both come with a passing integration test
 ```
 
 Creates one file per layer plus an integration test, then wires everything up
-(mod declarations, `Services` field, route `.merge()`, bootstrap builder) and
-runs `cargo fmt`:
+(mod declarations, `Services` field, route `.merge()` or gRPC `.add_service()`,
+bootstrap builder) and runs `cargo fmt`:
 
 ```
 src/domain/order.rs               entity + validation + repository port
@@ -62,6 +63,12 @@ src/infrastructure/order_repo.rs  in-memory adapter (Diesel: mirror build_user_s
 src/api/order.rs                  routes() + handlers + FromRef wrapper
 tests/order.rs                    create → get through the real router
 ```
+
+With `--transport grpc` the domain/application/infrastructure layers are the
+same; the delivery becomes `proto/payment.proto` + `src/api/payment_grpc.rs`
+(a tonic adapter registered in `bootstrap::grpc_routes`), and the test talks
+to a real tonic server through the generated client. Serve gRPC features with
+`GRPC_PORT=50052 cargo run` — HTTP and gRPC run side by side.
 
 Feature names are snake_case (`order`, `order_item`). Wiring is anchor-based
 against the template's structure; if the project has diverged the command

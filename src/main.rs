@@ -38,6 +38,9 @@ enum Cmd {
     Feature {
         /// Feature name in snake_case (e.g. order)
         name: String,
+        /// Delivery layer for the feature
+        #[arg(short, long, value_enum, default_value = "rest")]
+        transport: scaffold::Transport,
         /// Project root
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
@@ -72,20 +75,32 @@ fn main() -> Result<()> {
             println!("Created {} from template '{template}'", dest.display());
             println!("  cd {name} && cargo run");
         }
-        Cmd::Feature { name, path } => {
-            scaffold::add_feature(&path, &name)?;
+        Cmd::Feature { name, transport, path } => {
+            scaffold::add_feature(&path, &name, transport)?;
+            let delivery = match transport {
+                scaffold::Transport::Rest => format!("src/api/{name}.rs"),
+                scaffold::Transport::Grpc => format!("proto/{name}.proto + src/api/{name}_grpc.rs"),
+            };
             println!("Added feature '{name}':");
             for f in [
                 format!("src/domain/{name}.rs"),
                 format!("src/application/{name}.rs"),
                 format!("src/infrastructure/{name}_repo.rs"),
-                format!("src/api/{name}.rs"),
+                delivery,
                 format!("tests/{name}.rs"),
             ] {
                 println!("  + {f}");
             }
             println!("  ~ wired into api/mod.rs, bootstrap.rs and layer mod files");
-            println!("Routes: POST /{name}, GET /{name}/{{id}} — run `cargo test` to verify");
+            match transport {
+                scaffold::Transport::Rest => {
+                    println!("Routes: POST /{name}, GET /{name}/{{id}} — run `cargo test` to verify")
+                }
+                scaffold::Transport::Grpc => println!(
+                    "gRPC: {name}.{}Api Create/Get — serve with GRPC_PORT=50052, run `cargo test` to verify",
+                    scaffold::pascal_case(&name)
+                ),
+            }
         }
     }
     Ok(())

@@ -21,6 +21,9 @@ diesel = { version = "2.3.11", features = ["sqlite", "r2d2"] }
 diesel_migrations = "2.3.2"
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

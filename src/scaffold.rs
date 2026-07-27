@@ -9,7 +9,13 @@ use std::{error::Error, fs, path::Path, process::Command};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-pub fn add_feature(project: &Path, name: &str) -> Result<()> {
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum Transport {
+    Rest,
+    Grpc,
+}
+
+pub fn add_feature(project: &Path, name: &str, transport: Transport) -> Result<()> {
     validate_feature_name(name)?;
     let crate_name = crate::package_name(project)
         .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
@@ -28,8 +34,10 @@ pub fn add_feature(project: &Path, name: &str) -> Result<()> {
             .into());
         }
     }
-    if project.join(format!("src/api/{name}.rs")).exists() {
-        return Err(format!("feature '{name}' already exists (src/api/{name}.rs)").into());
+    for existing in [format!("src/api/{name}.rs"), format!("src/api/{name}_grpc.rs")] {
+        if project.join(&existing).exists() {
+            return Err(format!("feature '{name}' already exists ({existing})").into());
+        }
     }
 
     let pascal = pascal_case(name);
@@ -39,13 +47,23 @@ pub fn add_feature(project: &Path, name: &str) -> Result<()> {
             .replace("{{crate_name}}", &crate_name)
     };
 
-    // new files, one per layer (+ an integration test)
+    // new files, one per layer (+ an integration test); domain, application and
+    // infrastructure are transport-agnostic — only the delivery adapter differs
     fs::write(project.join(format!("src/domain/{name}.rs")), render(DOMAIN_TPL))?;
     fs::write(project.join(format!("src/application/{name}.rs")), render(APPLICATION_TPL))?;
     fs::write(project.join(format!("src/infrastructure/{name}_repo.rs")), render(REPO_TPL))?;
-    fs::write(project.join(format!("src/api/{name}.rs")), render(API_TPL))?;
     fs::create_dir_all(project.join("tests"))?;
-    fs::write(project.join(format!("tests/{name}.rs")), render(TEST_TPL))?;
+    match transport {
+        Transport::Rest => {
+            fs::write(project.join(format!("src/api/{name}.rs")), render(API_TPL))?;
+            fs::write(project.join(format!("tests/{name}.rs")), render(TEST_TPL))?;
+        }
+        Transport::Grpc => {
+            fs::write(project.join(format!("proto/{name}.proto")), render(PROTO_TPL))?;
+            fs::write(project.join(format!("src/api/{name}_grpc.rs")), render(API_GRPC_TPL))?;
+            fs::write(project.join(format!("tests/{name}.rs")), render(TEST_GRPC_TPL))?;
+        }
+    }
 
     // registrations
     edit(project, "src/domain/mod.rs", |c| {
@@ -58,16 +76,21 @@ pub fn add_feature(project: &Path, name: &str) -> Result<()> {
         Ok(format!("{c}\npub mod {name}_repo;\n"))
     })?;
     edit(project, "src/api/mod.rs", |c| {
-        let c = insert_pub_mod(&c, name)?;
-        let c = insert_after_line(
+        let c = match transport {
+            Transport::Rest => {
+                let c = insert_pub_mod(&c, name)?;
+                insert_before_line(
+                    &c,
+                    ".with_state(services)",
+                    &format!("        .merge({name}::routes())"),
+                )?
+            }
+            Transport::Grpc => insert_pub_mod(&c, &format!("{name}_grpc"))?,
+        };
+        insert_after_line(
             &c,
             "pub struct Services {",
             &format!("    pub {name}: Arc<dyn crate::application::{pascal}Service>,"),
-        )?;
-        insert_before_line(
-            &c,
-            ".with_state(services)",
-            &format!("        .merge({name}::routes())"),
         )
     })?;
     edit(project, "src/bootstrap.rs", |c| {
@@ -76,11 +99,20 @@ pub fn add_feature(project: &Path, name: &str) -> Result<()> {
             "user: build_user_service(db.as_ref()),",
             &format!("        {name}: build_{name}_service(db.as_ref()),"),
         )?;
-        let c = insert_after_line(
+        let mut c = insert_after_line(
             &c,
             "user: build_user_service(None),",
             &format!("        {name}: build_{name}_service(None),"),
         )?;
+        if transport == Transport::Grpc {
+            c = insert_before_line(
+                &c,
+                "routes.routes()",
+                &format!(
+                    "    routes.add_service(crate::api::{name}_grpc::server(services.{name}.clone()));"
+                ),
+            )?;
+        }
         Ok(format!("{c}\n{}", render(BOOTSTRAP_TPL)))
     })?;
 
@@ -141,7 +173,7 @@ fn insert_pub_mod(content: &str, name: &str) -> Result<String> {
     Ok(lines.join("\n") + "\n")
 }
 
-fn pascal_case(s: &str) -> String {
+pub fn pascal_case(s: &str) -> String {
     s.split('_')
         .filter(|p| !p.is_empty())
         .map(|p| {
@@ -362,6 +394,132 @@ async fn create_then_get_{{feature}}() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+"##;
+
+const PROTO_TPL: &str = r##"syntax = "proto3";
+
+package {{feature}};
+
+service {{Feature}}Api {
+  rpc Create (Create{{Feature}}Request) returns ({{Feature}}Reply) {}
+  rpc Get (Get{{Feature}}Request) returns ({{Feature}}Reply) {}
+}
+
+message Create{{Feature}}Request {
+  string id = 1;
+  string name = 2;
+}
+
+message Get{{Feature}}Request {
+  string id = 1;
+}
+
+message {{Feature}}Reply {
+  string id = 1;
+  string name = 2;
+}
+"##;
+
+const API_GRPC_TPL: &str = r##"use crate::application::{{Feature}}Service;
+use crate::domain::DomainError;
+use std::sync::Arc;
+use tonic::{Request, Response, Status};
+
+pub mod proto {
+    tonic::include_proto!("{{feature}}");
+}
+
+use proto::{{feature}}_api_server::{{Feature}}ApiServer;
+use proto::{Create{{Feature}}Request, Get{{Feature}}Request, {{Feature}}Reply};
+
+pub struct {{Feature}}Grpc(pub Arc<dyn {{Feature}}Service>);
+
+pub fn server(svc: Arc<dyn {{Feature}}Service>) -> {{Feature}}ApiServer<{{Feature}}Grpc> {
+    {{Feature}}ApiServer::new({{Feature}}Grpc(svc))
+}
+
+#[tonic::async_trait]
+impl proto::{{feature}}_api_server::{{Feature}}Api for {{Feature}}Grpc {
+    async fn create(
+        &self,
+        req: Request<Create{{Feature}}Request>,
+    ) -> Result<Response<{{Feature}}Reply>, Status> {
+        let r = req.into_inner();
+        self.0
+            .create_{{feature}}(r.id.clone(), r.name.clone())
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new({{Feature}}Reply {
+            id: r.id,
+            name: r.name,
+        }))
+    }
+
+    async fn get(
+        &self,
+        req: Request<Get{{Feature}}Request>,
+    ) -> Result<Response<{{Feature}}Reply>, Status> {
+        let item = self
+            .0
+            .get_{{feature}}(req.into_inner().id)
+            .await
+            .map_err(to_status)?;
+        Ok(Response::new({{Feature}}Reply {
+            id: item.id,
+            name: item.name,
+        }))
+    }
+}
+
+fn to_status(e: DomainError) -> Status {
+    match e {
+        DomainError::NotFound => Status::not_found("not found"),
+        DomainError::Validation(m) => Status::invalid_argument(m),
+        DomainError::Unavailable => Status::unavailable("service unavailable"),
+        DomainError::Other(_) => Status::internal("internal error"),
+    }
+}
+"##;
+
+const TEST_GRPC_TPL: &str = r##"use tokio_stream::wrappers::TcpListenerStream;
+use {{crate_name}}::api::{{feature}}_grpc::proto::{{feature}}_api_client::{{Feature}}ApiClient;
+use {{crate_name}}::api::{{feature}}_grpc::proto::{Create{{Feature}}Request, Get{{Feature}}Request};
+use {{crate_name}}::bootstrap;
+
+#[tokio::test]
+async fn create_then_get_{{feature}}_over_grpc() {
+    let services = bootstrap::build_services();
+    let routes = bootstrap::grpc_routes(&services);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_routes(routes)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let mut client = {{Feature}}ApiClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect");
+
+    client
+        .create(Create{{Feature}}Request {
+            id: "x1".into(),
+            name: "First".into(),
+        })
+        .await
+        .expect("create");
+
+    let reply = client
+        .get(Get{{Feature}}Request { id: "x1".into() })
+        .await
+        .expect("get")
+        .into_inner();
+    assert_eq!(reply.name, "First");
 }
 "##;
 
