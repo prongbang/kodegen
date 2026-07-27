@@ -38,7 +38,7 @@ GRPC_PORT=50052 cargo run       # + inbound gRPC features on 0.0.0.0:50052
 cargo test
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `document`, `cache`, `blob`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `document`, `cache`, `blob`, `analytics`, `timeseries`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
 
 ### Examples
 
@@ -89,6 +89,10 @@ curl localhost:8080/hello/world
 | `S3_ENDPOINT` | unset (real AWS) | Only for a self-hosted server (RustFS, MinIO, Ceph): setting it also turns on path-style addressing, which those need. |
 | `S3_REGION` | `us-east-1` | Sent with every request. Self-hosted servers ignore it; AWS does not. |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | unset | Required when `S3_BUCKET` is set (`AWS_SESSION_TOKEN` too, if you use one). |
+| `CLICKHOUSE_URL` | unset (tracing log) | Optional, and only meaningful after `kodegen add clickhouse`. The ClickHouse HTTP endpoint the `EventSink` port writes to, e.g. `http://127.0.0.1:8123`, and the switch that selects the adapter. Unset falls back to the log adapter. |
+| `CLICKHOUSE_DB` | `default` | The database the events table lives in. `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` are optional and sent only when set — the dev service in `docker-compose.dev.yml` needs them, because the server images have required a password for `default` since 25.x. |
+| `INFLUX_URL` | unset (tracing log) | Optional, and only meaningful after `kodegen add influxdb`. The **base** address of an InfluxDB v2/v3 or GreptimeDB server (the write path is appended), and the switch that selects the adapter. Unset falls back to the log adapter. |
+| `INFLUX_BUCKET` | — | Required when `INFLUX_URL` is set: the bucket (v2) or database (v3, GreptimeDB). `INFLUX_ORG` is v2-only and sent when set; `INFLUX_TOKEN` becomes an `Authorization: Token …` header when set — on GreptimeDB with auth on, its value is `<user>:<password>`. |
 | `BLOB_DIR` | `./data/blobs` | Where the default `BlobStore` adapter keeps objects when `S3_BUCKET` is unset. The production image is `distroless/cc` with a read-only working directory, so in a container either point this at a mounted volume (`-v blobs:/data -e BLOB_DIR=/data/blobs`) or set `S3_BUCKET` and use the S3 adapter. |
 
 `DATABASE_URL` per backend — the one that applies is whichever feature is in
@@ -114,15 +118,24 @@ an **optional** dependency. Switching is one command — from
 kodegen add postgres      # Diesel + PostgreSQL
 kodegen add mysql         # Diesel + MySQL
 kodegen add mariadb       # same driver as mysql; MariaDB image
+kodegen add timescaledb   # same driver as postgres; + a hypertable migration
 kodegen add mongodb       # the same UserRepository, on the Mongo driver
 kodegen add redis         # the Cache port + a Redis adapter (Valkey too)
 kodegen add s3            # the BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
+kodegen add clickhouse    # the EventSink port + a ClickHouse adapter
+kodegen add influxdb      # the same port, over line protocol (Influx v2/v3, Greptime)
 kodegen add --list        # what's supported + what this project has on
 ```
 
-The first four are **datastores** — four adapters of the same `UserRepository` —
-and replace each other; `redis` and `s3` are different axes and sit alongside
-whichever one is on, and each other.
+Two of these are **slots**, and a slot holds one adapter:
+
+- the **datastore** — `postgres`, `mysql`, `mariadb`, `timescaledb`, `mongodb`
+  are all adapters of the same `UserRepository`, so they replace each other;
+- the **event sink** — `clickhouse` and `influxdb` are both adapters of the same
+  `EventSink`, so they replace each other.
+
+`redis` and `s3` fill no slot: they sit alongside whatever is on, and each other.
+One of each is a legal project (`--with mongodb,redis,s3,clickhouse`).
 
 ### Relational backend
 
@@ -133,7 +146,7 @@ It touches six files:
 | `Cargo.toml` | `default = [...]` gains the new backend feature and loses the old one |
 | `src/infrastructure/diesel_db.rs` | **replaced** — `SqliteConnection` becomes `PgConnection`/`MysqlConnection`, and the SQLite WAL/pragma setup goes away |
 | `src/infrastructure/diesel_repo.rs` | `save()` becomes the dialect's upsert, and the **test module is replaced** with a `DATABASE_URL`-gated one (a throwaway file is no longer a database) |
-| `migrations/*_create_users/up.sql` | the dialect's `CREATE TABLE` |
+| `migrations/*_create_users/up.sql` | the dialect's `CREATE TABLE`, when it differs from what is already there (PostgreSQL's is what the SQLite seed already says, so that one is left alone) |
 | `docker-compose.dev.yml` | a dev service with a healthcheck (created if missing) |
 | `Dockerfile` | `perl`/`make`/`cmake` on the `apt-get install` line, for building the backend's C driver from source |
 
@@ -157,6 +170,29 @@ Doing it by hand instead: set the feature in `[features] default`, swap
 in particular **cannot** use `TEXT PRIMARY KEY` — indexing a `TEXT` column needs
 a prefix length, so the users table uses `VARCHAR(64)` there. That one fails at
 migration time, not compile time.
+
+### TimescaleDB (`kodegen add timescaledb`)
+
+Not a fourth dialect: TimescaleDB **is** PostgreSQL with an extension loaded, so
+this is the PostgreSQL capability above — same `postgres` feature, same
+`PgConnection`, same upsert, same `DATABASE_URL` — plus two files:
+
+| File | Change |
+|---|---|
+| `migrations/*_create_users/up.sql` | `CREATE EXTENSION IF NOT EXISTS timescaledb;` first, then the same users table, then an example `events` hypertable |
+| `migrations/*_create_users/down.sql` | drops the example table as well as `users`, so a revert can be re-migrated |
+| `docker-compose.dev.yml` | `timescale/timescaledb` instead of `postgres` — same service name, port and credentials |
+
+`CREATE EXTENSION` is the migration's first statement because Diesel runs each
+migration inside one transaction and TimescaleDB requires it there. The `events`
+hypertable — a normal table the extension partitions by time — is an example and
+nothing in `src/` reads it; replace it with your own measurement table. Moving an
+existing PostgreSQL project across is the image plus that migration, and nothing
+in `src/` changes.
+
+An app-side event sink (`kodegen add clickhouse`/`influxdb`) is a different thing
+and can be added alongside: the hypertable is schema in *this* database, the
+event sink is a port to somebody else's.
 
 ### Document store (`kodegen add mongodb`)
 
@@ -268,6 +304,81 @@ The bucket itself is not created for you — `tests/blob.rs` creates it because 
 test may, but the app assumes it exists, the same way it assumes the database
 does.
 
+### Event sink (`kodegen add clickhouse` / `kodegen add influxdb`)
+
+Additive like the two above, but the two backends **share one slot**: the
+`EventSink` port has a single adapter, so a project has ClickHouse or a
+time-series database, never both.
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | `default = [...]` gains `analytics` (ClickHouse) or `timeseries` (line protocol) |
+| `src/domain/ports.rs` | the `EventSink` port is **appended**, with `Event` and `check_event` |
+| `src/domain/mod.rs` | `pub use ports::{check_event, Event, EventSink};` |
+| `src/infrastructure/log_events.rs` | default adapter — writes each event to the tracing subscriber, no server needed |
+| `src/infrastructure/clickhouse_events.rs` | ClickHouse adapter over the official client's HTTP interface |
+| `src/infrastructure/line_protocol_events.rs` | line-protocol adapter — one HTTP POST, on hyper (already in the graph via tonic) |
+| `src/api/mod.rs` | one `events: Arc<dyn EventSink>` field on `Services` |
+| `src/bootstrap.rs` | resolves the sink's env once, plus a `build_event_sink` builder in both composition roots |
+| `tests/events.rs` | the port's contract, run against **both** adapters (the server half is URL-gated) |
+| `docker-compose.dev.yml` | a `clickhouse` or `influxdb` service with a healthcheck (created if missing) |
+
+**Write only, and not fire-and-forget.** There is no query method: what you ask
+an analytical store is not what you ask a time-series one, so querying is done
+directly by whatever needs it, and this port is how the application *records*.
+`write` awaits the round trip and returns the failure — there is no queue, no
+retry and no backpressure behind it. Batch and `tokio::spawn` if the caller must
+not wait; `let _ = sink.write(..).await;` if it can afford to lose events.
+
+**One event is a name, a timestamp and `f64` fields** — no tags, no other field
+types. That is the intersection of what both backends take honestly: line
+protocol has tags and typed fields, ClickHouse would need a `Map` column and a
+schema decision. Put the dimension in the name (`http.requests.checkout`) until a
+real requirement says otherwise. `check_event` enforces the rules in the port, in
+every adapter including the default one, and its character rule (ASCII letters,
+digits and `_-./:`) is what lets the line-protocol adapter skip escaping — a
+comma or a space in a measurement changes what the line *means*.
+
+**The default adapter is a log, not a store.** With no URL set, events go to the
+tracing subscriber and nothing is queryable. That is the honest default for a
+port with no read path; an in-memory buffer would grow without bound while
+looking like durability.
+
+**InfluxDB v2, InfluxDB v3 and GreptimeDB are one adapter**, because they accept
+the same line protocol over the same kind of endpoint. `bootstrap.rs` appends
+`/api/v2/write?bucket=…&precision=ns` to `INFLUX_URL`, so the base address is
+what selects the product:
+
+| Server | `INFLUX_URL` | Notes |
+|---|---|---|
+| InfluxDB v2 | `http://127.0.0.1:8086` | set `INFLUX_ORG`; `INFLUX_BUCKET` is the bucket |
+| InfluxDB v3 | `http://127.0.0.1:8181` | `INFLUX_BUCKET` is the database; org is ignored |
+| GreptimeDB | `http://127.0.0.1:4000/v1/influxdb` | `INFLUX_BUCKET` is the database; if auth is on, `INFLUX_TOKEN` is `<user>:<password>`, not a bare token |
+
+Swap the image in `docker-compose.dev.yml` and nothing in the generated Rust
+changes — the same relationship Valkey has to `redis` and MinIO to `s3`.
+
+**Every write has a 5s budget**, because neither hyper nor the ClickHouse client
+has a default timeout: a sink that accepts the connection and then says nothing
+would otherwise hold the caller, and the request it is on, indefinitely. A
+timeout surfaces as `DomainError::Unavailable`, the same as a refused connection.
+The Redis adapter is deliberately not wrapped this way — its connection manager
+is unbounded too, but it owns its own reconnect loop and a cache call is not the
+thing that must not hang.
+
+**Both adapters speak plain HTTP.** For a managed endpoint on https, put it
+behind a TLS-terminating proxy, turn on the `clickhouse` crate's `rustls-tls`
+feature, or swap `build_http()` in `line_protocol_events.rs` for a `hyper-rustls`
+connector. The line-protocol adapter is written on hyper rather than a client
+crate because `tonic` already puts hyper in the dependency graph: the whole
+`timeseries` feature adds **nothing** to `Cargo.lock`.
+
+ClickHouse creates its table on the first write (`CREATE TABLE IF NOT EXISTS
+events … ENGINE = MergeTree`) — it is not this project's relational database, so
+it has no `migrations/` step. The table is one row per field, which keeps the row
+type a plain `derive(Row)`; a wide table is the right answer once you know your
+fields, and `clickhouse_events.rs` is where you would make that change.
+
 ### Running a backend locally
 
 `docker-compose.dev.yml` (written by `kodegen add`, dev-only — the production
@@ -289,6 +400,10 @@ DATABASE_URL=postgres://app:app@127.0.0.1:5432/app cargo test # + the real adapt
 REDIS_URL=redis://127.0.0.1:6379 cargo test                  # + the real cache
 S3_BUCKET=app S3_ENDPOINT=http://127.0.0.1:9000 \
   AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin cargo test  # + real object storage
+CLICKHOUSE_URL=http://127.0.0.1:8123 CLICKHOUSE_DB=app \
+  CLICKHOUSE_USER=app CLICKHOUSE_PASSWORD=app cargo test      # + the real event sink
+INFLUX_URL=http://127.0.0.1:8086 INFLUX_BUCKET=app INFLUX_ORG=app \
+  INFLUX_TOKEN=kodegen-dev-token cargo test                   # ...or the other one
 ```
 
 ## Outbound gRPC + Circuit Breaker
@@ -347,6 +462,7 @@ Allocations per request (`alloc_bench`):
 - **Ports (traits)** such as `UserRepository` are defined here, each documenting a behavioral contract — e.g. `UserRepository::save` is an upsert and never returns `NotFound`; `get` returns `NotFound` when the id is absent, not an empty/default value. Adapters must honor the documented contract so they stay substitutable.
 - `kodegen add redis` appends a `Cache` port on the same terms, and its contract deliberately differs where the semantics do: a cache miss is `Ok(None)`, never `NotFound`, and `delete` on an absent key is `Ok(())`. `tests/cache.rs` runs those assertions against every adapter, which is what keeps "substitutable" a fact rather than a claim.
 - `kodegen add s3` appends a `BlobStore` port the same way: `get` on a missing key is `Ok(None)` (a blob store has no `NotFound`), `put` overwrites, `delete` is idempotent, and `check_blob_key` lives beside the trait so every adapter refuses the same keys instead of each one deciding for itself. `tests/blob.rs` runs one contract against both adapters.
+- `kodegen add clickhouse` / `influxdb` append an `EventSink` port, which is the one that is deliberately **write-only**: an analytical query and a time-series query are not the same interface, so querying stays outside the port and this is how the application records. `write` is not fire-and-forget either — it awaits the round trip and returns the failure, because a queue that silently drops is a decision for the caller, not for the port. `check_event` sits beside the trait for the same reason `check_blob_key` does, and `tests/events.rs` runs one contract against both adapters.
 - Pure business rules; framework‑agnostic; minimal dependencies.
 
 ### `infrastructure/` — Adapters
@@ -355,6 +471,7 @@ Allocations per request (`alloc_bench`):
 - `UserRepository` ships two adapters: `in_memory_repo::InMemoryUserRepository` (default) and `diesel_repo::DieselUserRepository`, selected at startup by setting `DATABASE_URL` (see `bootstrap::build_router`).
 - After `kodegen add redis` the `Cache` port has the same pair: `in_memory_cache::InMemoryCache` (default) and `redis_cache::RedisCache`, selected by `REDIS_URL`. The Redis connection is created lazily by the composition root, so an unreachable cache delays nothing at startup and reconnects on its own — but a command issued while it is down returns `DomainError::Other`, it is not silently swallowed.
 - After `kodegen add s3` the `BlobStore` port has its own pair: `fs_blobs::FsBlobStore` (default — one file per key under `BLOB_DIR`) and `s3_blobs::S3BlobStore`, selected by `S3_BUCKET`. The S3 client is built once by the composition root, so the adapter never reads `S3_ENDPOINT` itself; an unreachable server surfaces as `DomainError::Unavailable` (a 503), while anything the server actually answered — no such bucket, access denied — stays `Other`.
+- After `kodegen add clickhouse` or `influxdb` the `EventSink` port has the same pair: `log_events::LogEventSink` (default — the tracing subscriber, so nothing is queryable and nothing survives the process) and one of `clickhouse_events::ClickhouseEventSink` / `line_protocol_events::LineProtocolEventSink`, selected by `CLICKHOUSE_URL` / `INFLUX_URL`. Same error split as the others: a sink that cannot be reached is `Unavailable` (a 503), a sink that answered — a bad token, an unknown bucket, a rejected point — is `Other`.
 - Diesel/SQLite plumbing shared by every repository lives in `diesel_db.rs`, not in the repository itself: `build_pool(url)` runs the embedded migrations and, on a single setup connection, switches the database file to `WAL` mode once; the resulting r2d2 pool is wrapped in a cheap-to-clone `Db` handle whose `run(closure)` does the `spawn_blocking` + connection checkout + error mapping every repository needs. `DieselUserRepository::new(db: Db)` just takes that handle, so a future repository shares the same pool by cloning `Db` rather than re-deriving pool/pragma logic.
 - Every pooled connection also sets `PRAGMA busy_timeout` and `PRAGMA synchronous = NORMAL` on acquire: SQLite allows only one writer at a time, so without WAL + `busy_timeout` concurrent writers fail immediately with `SQLITE_BUSY` instead of waiting their turn. **This paragraph and the one above describe the default SQLite backend** — on PostgreSQL or MySQL (see [Capabilities](#capabilities)) `diesel_db.rs` has no pragma customizer at all, because neither has SQLite's single-writer problem; `Db`, `Db::run` and every repository stay exactly the same.
 - The composition root (`bootstrap.rs`) is the only place that builds the pool and constructs `DieselUserRepository`; repositories never see `DATABASE_URL` or the pool directly.

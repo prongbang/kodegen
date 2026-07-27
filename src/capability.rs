@@ -23,6 +23,15 @@
 //!   not ship, together with both of its adapters and the wiring. Purely
 //!   additive, so they compose with any datastore and with each other, and
 //!   neither has an existing file to refuse.
+//! - **clickhouse** and **influxdb** (`add_event_sink`) add the `EventSink` port
+//!   the same way — but the two of them share one *slot*, the way the datastores
+//!   do: one port, one adapter, so a project has an event sink or the other, never
+//!   both. Everything else about them is additive, so either sits next to any
+//!   datastore, the cache and the blob store.
+//!
+//! `Slot` is what makes "these exclude each other" one rule rather than one per
+//! pair: a capability names the slot it fills, the slot names the cargo features
+//! that fill it, and `add` refuses a second occupant before it reads a file.
 
 use crate::scaffold::{
     edit, insert_after_line, insert_at_marker, insert_before_line, insert_pub_mod, require_files,
@@ -37,15 +46,18 @@ pub enum Capability {
     Postgres,
     Mysql,
     Mariadb,
+    Timescaledb,
     Mongodb,
     Redis,
     S3,
+    Clickhouse,
+    Influxdb,
 }
 
-/// The axis a capability sits on: datastores replace each other, a cache and a
-/// blob store are additive. Every kind needs its own `add_*` function, its own
-/// env vars and its own feature, which is exactly what the matches on this
-/// enforce.
+/// The axis a capability sits on: datastores replace each other, event sinks
+/// replace each other, a cache and a blob store are additive. Every kind needs
+/// its own `add_*` function, its own env vars and its own feature, which is
+/// exactly what the matches on this enforce.
 ///
 /// MongoDB is its own kind rather than a fourth `Relational`: it shares the
 /// *slot* with them, not the driver, and everything `Relational` answers
@@ -59,17 +71,65 @@ enum Kind {
     Document,
     Cache,
     Blob,
+    Events(EventBackend),
 }
 
 impl Kind {
-    /// Whether this kind takes the project's one datastore slot. `Db`/`Mongo` is
-    /// built once in the composition root and `UserRepository` gets one adapter,
-    /// so postgres, mysql, mariadb and mongodb all exclude each other — while a
-    /// cache and a blob store sit alongside whichever one is on.
-    fn is_datastore(&self) -> bool {
+    /// The slot this kind fills, if it is exclusive. `Db`/`Mongo` is built once
+    /// in the composition root and `UserRepository` gets one adapter, so postgres,
+    /// mysql, mariadb, timescaledb and mongodb all exclude each other; the
+    /// `EventSink` port has exactly one adapter for the same reason, so clickhouse
+    /// and influxdb exclude each other. A cache and a blob store fill no slot and
+    /// sit alongside whatever is on.
+    fn slot(&self) -> Option<Slot> {
         match self {
-            Kind::Relational(_) | Kind::Document => true,
-            Kind::Cache | Kind::Blob => false,
+            Kind::Relational(_) | Kind::Document => Some(Slot::Datastore),
+            Kind::Events(_) => Some(Slot::Events),
+            Kind::Cache | Kind::Blob => None,
+        }
+    }
+}
+
+/// A place in a generated project that holds exactly one adapter. Two
+/// capabilities in the same slot are alternatives, not additions — which is one
+/// rule with one error message rather than a rule per pair.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Datastore,
+    Events,
+}
+
+impl Slot {
+    /// Every slot, for the test that pins these lists to `Kind::slot()`. A new
+    /// variant is a compile error in the two matches below; this is the only line
+    /// that has to be remembered.
+    const ALL: [Slot; 2] = [Slot::Datastore, Slot::Events];
+
+    /// The cargo features that fill this slot. `default = [...]` is the only
+    /// state there is, so "is the slot taken?" is answered by looking for one of
+    /// these names in it — which is also why they have to stay in step with
+    /// `Capability::feature()` (see the test at the bottom).
+    fn features(self) -> &'static [&'static str] {
+        match self {
+            Slot::Datastore => &["sqlite", "postgres", "mysql", "document"],
+            Slot::Events => &["analytics", "timeseries"],
+        }
+    }
+
+    /// The occupant the template ships with, which `add` replaces silently
+    /// instead of refusing. The event sink has none: a fresh project has no
+    /// `EventSink` port at all, so the first `add` is always the only one.
+    fn shipped(self) -> Option<&'static str> {
+        match self {
+            Slot::Datastore => Some("sqlite"),
+            Slot::Events => None,
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Slot::Datastore => "datastore",
+            Slot::Events => "event sink",
         }
     }
 }
@@ -83,13 +143,20 @@ enum Relational {
     Postgres,
     Mysql,
     Mariadb,
+    Timescaledb,
 }
 
-/// Cargo features that select the project's datastore: at most one may be on,
-/// because `UserRepository` gets one adapter and the handle behind it is built
-/// once. `document` is in the list for exactly that reason — MongoDB is not a
-/// relational backend, but it stands in the same place.
-const DATASTORE: &[&str] = &["sqlite", "postgres", "mysql", "document"];
+/// The two backends behind the one `EventSink` port. Split out for the same
+/// reason `Relational` is: they share every line of the port, the default
+/// adapter and the wiring, and differ only in the adapter file, the resource the
+/// composition root builds, the env that selects it and the compose service.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventBackend {
+    Clickhouse,
+    /// InfluxDB v2, InfluxDB v3 and GreptimeDB — one adapter, because the write
+    /// path is one HTTP POST of line protocol on all three.
+    LineProtocol,
+}
 
 /// Package name of the built-in template, needed to undo the rename
 /// `kodegen new` applies before comparing a project's file to its origin.
@@ -130,6 +197,37 @@ const FS_BLOBS: &str = "src/infrastructure/fs_blobs.rs";
 const S3_BLOBS: &str = "src/infrastructure/s3_blobs.rs";
 const BLOB_TEST: &str = "tests/blob.rs";
 
+const LOG_EVENTS: &str = "src/infrastructure/log_events.rs";
+const CLICKHOUSE_EVENTS: &str = "src/infrastructure/clickhouse_events.rs";
+const LINE_PROTOCOL_EVENTS: &str = "src/infrastructure/line_protocol_events.rs";
+const EVENTS_TEST: &str = "tests/events.rs";
+
+/// ClickHouse's HTTP port, and `127.0.0.1` for the same reason as everywhere
+/// else here. `CLICKHOUSE_DB` has a default (`default`, the server's own) in the
+/// generated builder, so the URL is the switch — the other three are what the
+/// generated `docker-compose.dev.yml` boots with.
+const CLICKHOUSE_ENV: &[(&str, &str)] = &[
+    // first, and the one the composition root gates on: no URL, no sink
+    ("CLICKHOUSE_URL", "http://127.0.0.1:8123"),
+    ("CLICKHOUSE_DB", "app"),
+    // the server images have required a password for the `default` user since
+    // 25.x, so the dev service creates a user instead of running open
+    ("CLICKHOUSE_USER", "app"),
+    ("CLICKHOUSE_PASSWORD", "app"),
+];
+
+/// What the generated `docker-compose.dev.yml` boots. `INFLUX_URL` is the base
+/// address, not the write endpoint — the composition root appends
+/// `/api/v2/write`, which is what lets the same three variables address InfluxDB
+/// v2, InfluxDB v3 and GreptimeDB (see the README).
+const INFLUX_ENV: &[(&str, &str)] = &[
+    // first, and the one the composition root gates on: no URL, no sink
+    ("INFLUX_URL", "http://127.0.0.1:8086"),
+    ("INFLUX_BUCKET", "app"),
+    ("INFLUX_ORG", "app"),
+    ("INFLUX_TOKEN", "kodegen-dev-token"),
+];
+
 /// What the generated `docker-compose.dev.yml` boots, and the credentials it
 /// boots it with — dev-only defaults, printed together because an S3 client with
 /// three of the four is not a client.
@@ -147,9 +245,12 @@ impl Capability {
             Capability::Postgres => "postgres",
             Capability::Mysql => "mysql",
             Capability::Mariadb => "mariadb",
+            Capability::Timescaledb => "timescaledb",
             Capability::Mongodb => "mongodb",
             Capability::Redis => "redis",
             Capability::S3 => "s3",
+            Capability::Clickhouse => "clickhouse",
+            Capability::Influxdb => "influxdb",
         }
     }
 
@@ -162,9 +263,15 @@ impl Capability {
             Capability::Postgres => Kind::Relational(Relational::Postgres),
             Capability::Mysql => Kind::Relational(Relational::Mysql),
             Capability::Mariadb => Kind::Relational(Relational::Mariadb),
+            // a PostgreSQL extension, so it is the same driver, the same
+            // connection type and the same cargo feature — what differs is the
+            // image and one migration
+            Capability::Timescaledb => Kind::Relational(Relational::Timescaledb),
             Capability::Mongodb => Kind::Document,
             Capability::Redis => Kind::Cache,
             Capability::S3 => Kind::Blob,
+            Capability::Clickhouse => Kind::Events(EventBackend::Clickhouse),
+            Capability::Influxdb => Kind::Events(EventBackend::LineProtocol),
         }
     }
 
@@ -183,6 +290,7 @@ impl Capability {
             // RustFS, MinIO, Ceph and AWS are one adapter over one API: the
             // capability is object storage, not the vendor
             Kind::Blob => "blob",
+            Kind::Events(backend) => backend.feature(),
         }
     }
 
@@ -198,6 +306,86 @@ impl Capability {
             Kind::Document => &[("MONGODB_URL", MONGO_URL), ("MONGODB_DB", "app")],
             Kind::Cache => &[("REDIS_URL", REDIS_URL)],
             Kind::Blob => S3_ENV,
+            Kind::Events(backend) => backend.env(),
+        }
+    }
+}
+
+impl EventBackend {
+    /// Named for the shape rather than the vendor, like `cache` and `blob`:
+    /// `timeseries` is InfluxDB v2, InfluxDB v3 and GreptimeDB, which are one
+    /// adapter because they take the same line protocol on the same kind of
+    /// endpoint.
+    fn feature(self) -> &'static str {
+        match self {
+            EventBackend::Clickhouse => "analytics",
+            EventBackend::LineProtocol => "timeseries",
+        }
+    }
+
+    fn env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            EventBackend::Clickhouse => CLICKHOUSE_ENV,
+            EventBackend::LineProtocol => INFLUX_ENV,
+        }
+    }
+
+    /// The adapter this backend writes, next to the log sink both of them share.
+    fn adapter(self) -> (&'static str, &'static str) {
+        match self {
+            EventBackend::Clickhouse => (CLICKHOUSE_EVENTS, CLICKHOUSE_EVENTS_TPL),
+            EventBackend::LineProtocol => (LINE_PROTOCOL_EVENTS, LINE_PROTOCOL_EVENTS_TPL),
+        }
+    }
+
+    fn module(self) -> &'static str {
+        match self {
+            EventBackend::Clickhouse => "clickhouse_events",
+            EventBackend::LineProtocol => "line_protocol_events",
+        }
+    }
+
+    /// The name of the resource the composition root resolves — the binding the
+    /// two `api::Services` literals hand to `build_event_sink`.
+    fn resource_name(self) -> &'static str {
+        match self {
+            EventBackend::Clickhouse => "clickhouse",
+            EventBackend::LineProtocol => "influx",
+        }
+    }
+
+    /// Inserted above `// kodegen:resources`: reads this backend's env once, and
+    /// hands the adapter something already built — an adapter never reads env.
+    fn resource(self) -> &'static str {
+        match self {
+            EventBackend::Clickhouse => CLICKHOUSE_RESOURCE,
+            EventBackend::LineProtocol => INFLUX_RESOURCE,
+        }
+    }
+
+    /// Appended to `bootstrap.rs`: the same env-picks-the-adapter shape as
+    /// `build_cache`, with the log sink as the default.
+    fn builder(self) -> &'static str {
+        match self {
+            EventBackend::Clickhouse => BUILD_EVENT_SINK_CLICKHOUSE,
+            EventBackend::LineProtocol => BUILD_EVENT_SINK_INFLUX,
+        }
+    }
+
+    /// The `tests/events.rs` half that needs a server, filled into the shared
+    /// contract test.
+    fn server_test(self) -> &'static str {
+        match self {
+            EventBackend::Clickhouse => CLICKHOUSE_TEST,
+            EventBackend::LineProtocol => INFLUX_TEST,
+        }
+    }
+
+    /// The compose service name (the image's own name) and its block.
+    fn compose_service(self) -> (&'static str, &'static str) {
+        match self {
+            EventBackend::Clickhouse => ("clickhouse", CLICKHOUSE_COMPOSE),
+            EventBackend::LineProtocol => ("influxdb", INFLUX_COMPOSE),
         }
     }
 }
@@ -208,15 +396,18 @@ impl Relational {
             Relational::Postgres => "postgres",
             Relational::Mysql => "mysql",
             Relational::Mariadb => "mariadb",
+            Relational::Timescaledb => "timescaledb",
         }
     }
 
     /// MariaDB speaks the MySQL wire protocol, so it is the same driver, the
     /// same adapter and the same cargo feature — only the image and the docs
-    /// differ.
+    /// differ. TimescaleDB is a PostgreSQL *extension*, so the same is true of it
+    /// one column over: same driver, same connection type, same feature, and one
+    /// extra migration.
     fn feature(self) -> &'static str {
         match self {
-            Relational::Postgres => "postgres",
+            Relational::Postgres | Relational::Timescaledb => "postgres",
             Relational::Mysql | Relational::Mariadb => "mysql",
         }
     }
@@ -226,12 +417,13 @@ impl Relational {
             Relational::Postgres => "PostgreSQL",
             Relational::Mysql => "MySQL",
             Relational::Mariadb => "MariaDB",
+            Relational::Timescaledb => "TimescaleDB",
         }
     }
 
     fn connection(self) -> &'static str {
         match self {
-            Relational::Postgres => "PgConnection",
+            Relational::Postgres | Relational::Timescaledb => "PgConnection",
             Relational::Mysql | Relational::Mariadb => "MysqlConnection",
         }
     }
@@ -242,14 +434,14 @@ impl Relational {
     /// configured. The literal address forces TCP on every backend.
     fn database_url(self) -> &'static str {
         match self {
-            Relational::Postgres => PG_URL,
+            Relational::Postgres | Relational::Timescaledb => PG_URL,
             Relational::Mysql | Relational::Mariadb => MYSQL_URL,
         }
     }
 
     fn database_env(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Relational::Postgres => &[("DATABASE_URL", PG_URL)],
+            Relational::Postgres | Relational::Timescaledb => &[("DATABASE_URL", PG_URL)],
             Relational::Mysql | Relational::Mariadb => &[("DATABASE_URL", MYSQL_URL)],
         }
     }
@@ -263,6 +455,17 @@ impl Relational {
             Relational::Mysql | Relational::Mariadb => {
                 "CREATE TABLE users (id VARCHAR(64) PRIMARY KEY NOT NULL, name TEXT NOT NULL);\n"
             }
+            Relational::Timescaledb => TIMESCALE_UP_SQL,
+        }
+    }
+
+    /// Only TimescaleDB has one of its own: it is the one backend whose `up.sql`
+    /// creates a second table, and a `down.sql` that does not drop it leaves a
+    /// revert-then-migrate loop failing on `CREATE TABLE events`.
+    fn down_sql(self) -> &'static str {
+        match self {
+            Relational::Postgres | Relational::Mysql | Relational::Mariadb => USERS_DOWN_SQL,
+            Relational::Timescaledb => TIMESCALE_DOWN_SQL,
         }
     }
 
@@ -271,14 +474,14 @@ impl Relational {
     /// thing whichever backend is on.
     fn conflict_target(self) -> &'static str {
         match self {
-            Relational::Postgres => "users::id",
+            Relational::Postgres | Relational::Timescaledb => "users::id",
             Relational::Mysql | Relational::Mariadb => "diesel::dsl::DuplicatedKeys",
         }
     }
 
     fn upsert_note(self) -> &'static str {
         match self {
-            Relational::Postgres => "// upsert: `save` is documented as one, so an existing id is updated",
+            Relational::Postgres | Relational::Timescaledb => "// upsert: `save` is documented as one, so an existing id is updated",
             // the trapdoor this avoids stays invisible until something
             // references users(id) — exactly when it is expensive to discover
             Relational::Mysql | Relational::Mariadb => {
@@ -293,7 +496,7 @@ impl Relational {
     /// their C driver from source, and `openssl-sys{vendored}` needs perl.
     fn apt_packages(self) -> &'static str {
         match self {
-            Relational::Postgres => "perl make",
+            Relational::Postgres | Relational::Timescaledb => "perl make",
             // mysqlclient-src drives its build with cmake
             Relational::Mysql | Relational::Mariadb => "perl make cmake",
         }
@@ -304,6 +507,7 @@ impl Relational {
             Relational::Postgres => POSTGRES_COMPOSE,
             Relational::Mysql => MYSQL_COMPOSE,
             Relational::Mariadb => MARIADB_COMPOSE,
+            Relational::Timescaledb => TIMESCALE_COMPOSE,
         }
     }
 
@@ -319,16 +523,19 @@ impl Relational {
 /// `kodegen add --list`: what is supported, and what this project already has on.
 pub fn list(project: &Path) -> Result<()> {
     println!("Supported capabilities:");
-    println!("  postgres   relational — Diesel + PostgreSQL");
-    println!("  mysql      relational — Diesel + MySQL");
-    println!("  mariadb    relational — Diesel + MariaDB (MySQL protocol: same driver, same adapter)");
-    println!("  mongodb    document — MongoDB behind the same `UserRepository`, in place of Diesel");
-    println!("  redis      cache — the `Cache` port + a Redis adapter (Valkey speaks the same protocol)");
-    println!("  s3         object storage — the `BlobStore` port + an S3 adapter (RustFS, MinIO, AWS)");
+    println!("  postgres     relational — Diesel + PostgreSQL");
+    println!("  mysql        relational — Diesel + MySQL");
+    println!("  mariadb      relational — Diesel + MariaDB (MySQL protocol: same driver, same adapter)");
+    println!("  timescaledb  relational — Diesel + TimescaleDB (a PostgreSQL extension: same driver, plus a hypertable migration)");
+    println!("  mongodb      document — MongoDB behind the same `UserRepository`, in place of Diesel");
+    println!("  redis        cache — the `Cache` port + a Redis adapter (Valkey speaks the same protocol)");
+    println!("  s3           object storage — the `BlobStore` port + an S3 adapter (RustFS, MinIO, AWS)");
+    println!("  clickhouse   event sink — the `EventSink` port + a ClickHouse adapter");
+    println!("  influxdb     event sink — the `EventSink` port + a line-protocol adapter (InfluxDB v2/v3, GreptimeDB)");
     println!();
     println!(
-        "Only one datastore (postgres, mysql, mariadb, mongodb) can be on at a time; redis and s3 \
-         sit alongside it."
+        "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb) and one event sink \
+         (clickhouse, influxdb) can be on at a time; redis and s3 sit alongside them."
     );
     match fs::read_to_string(project.join("Cargo.toml")).ok().as_deref().and_then(default_line) {
         // `default = [...]` is the only state there is — the features it lists
@@ -357,16 +564,18 @@ pub fn check_combination(with: &[Capability]) -> Result<()> {
             .into());
         }
     }
-    let datastores: Vec<&str> =
-        with.iter().filter(|c| c.kind().is_datastore()).map(|c| c.name()).collect();
-    if datastores.len() > 1 {
-        return Err(format!(
-            "--with takes at most one datastore: {} are all datastores, and a project can only have \
-             one (they are adapters of the same `UserRepository`, and the handle behind it is built \
-             once)",
-            datastores.join(", ")
-        )
-        .into());
+    for slot in Slot::ALL {
+        let taken: Vec<&str> =
+            with.iter().filter(|c| c.kind().slot() == Some(slot)).map(|c| c.name()).collect();
+        if taken.len() > 1 {
+            return Err(format!(
+                "--with takes at most one {}: {} all fill that slot, and a project can only have one \
+                 (they are adapters of the same port, and the handle behind it is built once)",
+                slot.what(),
+                taken.join(", ")
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -379,28 +588,66 @@ pub fn add(project: &Path, cap: Capability, dry_run: bool) -> Result<(Vec<String
     if enabled.iter().any(|f| f == cap.feature()) {
         return Err(format!("capability '{}' already added", cap.name()).into());
     }
-    // one datastore per project, checked before any file is read: `add mongodb`
-    // on a Postgres project and `add postgres` on a Mongo one are the same
-    // mistake, so they get the same answer
-    if cap.kind().is_datastore()
-        && let Some(other) =
-            enabled.iter().find(|f| DATASTORE.contains(&f.as_str()) && *f != "sqlite")
+    // one occupant per slot, checked before any file is read: `add mongodb` on a
+    // Postgres project and `add postgres` on a Mongo one are the same mistake, so
+    // they get the same answer — and so do `add influxdb` on a ClickHouse project
+    // and the reverse
+    if let Some(slot) = cap.kind().slot()
+        && let Some(other) = enabled
+            .iter()
+            .find(|f| slot.features().contains(&f.as_str()) && Some(f.as_str()) != slot.shipped())
     {
-        return Err(datastore_conflict(other, cap).into());
+        return Err(slot_conflict(slot, other, cap).into());
     }
     match cap.kind() {
         Kind::Relational(rel) => add_relational(project, rel, dry_run),
         Kind::Document => add_mongodb(project, dry_run),
         Kind::Cache => add_redis(project, dry_run),
         Kind::Blob => add_s3(project, dry_run),
+        Kind::Events(backend) => add_event_sink(project, backend, dry_run),
     }
 }
 
-/// A project already has a datastore and is being given a second one. Refused
-/// rather than half-applied: `Db`/`Mongo` is built once in the composition root
-/// and `UserRepository` gets one adapter, so a second would need a second handle,
-/// a second repository and a rule for which one wins — out of scope (see the
-/// plan's "not doing" list), and the undo path is three steps the user can run.
+/// A slot is taken and is being given a second occupant. Refused rather than
+/// half-applied: the handle behind the port is built once in the composition root
+/// and the port gets one adapter, so a second would need a second handle, a
+/// second adapter and a rule for which one wins — out of scope (see the plan's
+/// "not doing" list), and the undo path is three steps the user can run.
+///
+/// Only the middle step differs by slot, so only it is matched on: what to put
+/// back is a property of what the first `add` wrote.
+fn slot_conflict(slot: Slot, other: &str, cap: Capability) -> String {
+    match slot {
+        Slot::Datastore => datastore_conflict(other, cap),
+        // an event sink is additive, so switching backends is undoing the whole
+        // capability rather than swapping a file: the second `add` writes the port
+        // and the wiring too, and would refuse every one of them as already there
+        Slot::Events => format!(
+            "capability '{other}' already provides this project's event sink, and there can only be \
+             one (the `EventSink` port has a single adapter, and the client behind it is built once \
+             in bootstrap.rs).\n\
+             To switch to '{}', undo '{other}' first — every file below was written by that one \
+             command, so `git revert` of its commit does all of it:\n  \
+             1. Cargo.toml: drop `\"{other}\"` from `default = [...]`\n  \
+             2. delete src/infrastructure/{}.rs, src/infrastructure/log_events.rs and \
+             tests/events.rs, and their two `pub mod` lines in src/infrastructure/mod.rs\n  \
+             3. drop the `EventSink`/`Event`/`check_event` block from src/domain/ports.rs and its \
+             `pub use` from src/domain/mod.rs, `pub events:` from src/api/mod.rs, and — in \
+             src/bootstrap.rs — the resource block above `// kodegen:resources`, both \
+             `events: build_event_sink(...)` lines and `fn build_event_sink`\n  \
+             4. rerun `kodegen add {}`",
+            cap.name(),
+            match other {
+                "analytics" => EventBackend::Clickhouse.module(),
+                _ => EventBackend::LineProtocol.module(),
+            },
+            cap.name()
+        ),
+    }
+}
+
+/// The datastore slot's version of the above: `Db`/`Mongo` is built once and
+/// `UserRepository` gets one adapter.
 fn datastore_conflict(other: &str, cap: Capability) -> String {
     let restore = if other == "document" {
         // mongo_repo.rs is behind `#[cfg(feature = "document")]`, so step 1
@@ -446,7 +693,7 @@ fn add_relational(
         // the whole point of the optional-dependency layout: `add` flips one
         // list of feature names and never touches [dependencies], so Cargo.lock
         // stays valid and `--locked` keeps working
-        edit(project, "Cargo.toml", |c| enable_feature(&c, cap.feature(), true))?,
+        edit(project, "Cargo.toml", |c| enable_feature(&c, cap.feature(), Some(Slot::Datastore)))?,
         // whole-file comparison rather than a marker line: once the project name
         // is substituted back this file has no project-specific content, so
         // "identical to what `kodegen new` wrote" is both the strictest check
@@ -475,15 +722,7 @@ fn add_relational(
         })?,
     ];
 
-    let seeds = migrations(project, cap);
-    if seeds.is_empty() {
-        eprintln!(
-            "warning: no kodegen-generated migration found under migrations/ — \
-             create the users table for {} yourself",
-            cap.dialect()
-        );
-    }
-    edits.extend(seeds);
+    edits.extend(migrations(project, cap));
 
     // dev-only services, separate from the production Dockerfile: the same file
     // boots the DB for a local run, for the env-gated adapter tests, and for CI
@@ -537,7 +776,7 @@ fn add_mongodb(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String
     let mut edits = vec![
         // `document` replaces the relational feature rather than joining it:
         // still one list of feature names, still never [dependencies]
-        edit(project, "Cargo.toml", |c| enable_feature(&c, "document", true))?,
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "document", Some(Slot::Datastore)))?,
         // gated, symmetrically with the Diesel modules the template already ships
         // behind `relational`, and appended rather than sorted into the plain
         // block for the same reason those are: an unconditional `pub mod
@@ -652,7 +891,7 @@ fn add_redis(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)
     let mut edits = vec![
         // one list of feature names, never [dependencies] — that is what keeps
         // Cargo.lock valid and `--locked` working across an `add`
-        edit(project, "Cargo.toml", |c| enable_feature(&c, "cache", false))?,
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "cache", None))?,
         // ports.rs and the two mod.rs files are append-only, so no anchor can go
         // missing and nothing the user wrote above can be disturbed — but
         // "append" still has two ways to produce a file that will not compile
@@ -752,7 +991,7 @@ fn add_s3(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
     let mut edits = vec![
         // one list of feature names, never [dependencies] — that is what keeps
         // Cargo.lock valid and `--locked` working across an `add`
-        edit(project, "Cargo.toml", |c| enable_feature(&c, "blob", false))?,
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "blob", None))?,
         // append-only, so no anchor can go missing — but appending still has
         // three ways to produce a file that will not compile
         edit(project, PORTS, |c| {
@@ -828,6 +1067,132 @@ fn add_s3(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
     Ok((paths(&creates), paths(&edits)))
 }
 
+/// `kodegen add clickhouse` and `kodegen add influxdb` — the `EventSink` port,
+/// its log-only default adapter, and one of the two backends behind it.
+///
+/// Additive like `add redis`/`add s3`, with one difference that is the reason
+/// `Slot` exists: the two backends are alternatives, so the second one is refused
+/// in `add` before this function runs. Everything below is therefore written
+/// exactly once per project, and the only thing that varies is `backend`.
+///
+/// Write path only, by design: ClickHouse and a time-series database are both
+/// append-only from the application's side, and an analytical *query* port would
+/// have a different shape for each of them (see the plan's "not doing" list).
+fn add_event_sink(
+    project: &Path,
+    backend: EventBackend,
+    dry_run: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(
+        project,
+        &[PORTS, "src/domain/mod.rs", "src/infrastructure/mod.rs", "src/api/mod.rs", "src/bootstrap.rs"],
+    )?;
+    let crate_name = crate::package_name(project)
+        .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
+        .replace('-', "_");
+    let (adapter_rel, adapter_tpl) = backend.adapter();
+    let resource = backend.resource_name();
+
+    let mut creates = vec![
+        (LOG_EVENTS.to_string(), LOG_EVENTS_TPL.to_string()),
+        (adapter_rel.to_string(), adapter_tpl.to_string()),
+        (
+            EVENTS_TEST.to_string(),
+            EVENTS_TEST_TPL
+                .replace("{{server_test}}", backend.server_test())
+                .replace("{{adapter_module}}", backend.module())
+                .replace("{{crate_name}}", &crate_name),
+        ),
+    ];
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(format!("{rel} already exists — remove it first, or keep the one you have").into());
+    }
+
+    let mut edits = vec![
+        // one list of feature names, never [dependencies] — that is what keeps
+        // Cargo.lock valid and `--locked` working across an `add`
+        edit(project, "Cargo.toml", |c| enable_feature(&c, backend.feature(), Some(Slot::Events)))?,
+        // append-only, so no anchor can go missing — but appending still has
+        // four ways to produce a file that will not compile
+        edit(project, PORTS, |c| {
+            for (item, what) in [
+                ("trait EventSink", "an `EventSink` trait"),
+                ("struct Event", "an `Event` type"),
+                ("fn check_event", "`check_event`"),
+            ] {
+                if c.contains(item) {
+                    return Err(format!(
+                        "already declares {what} — appending a second one would not compile. \
+                         Remove yours, or keep it and skip `kodegen add {}`.",
+                        backend.module()
+                    )
+                    .into());
+                }
+            }
+            if !c.contains(ASYNC_TRAIT_USE) {
+                return Err(format!(
+                    "has no `{ASYNC_TRAIT_USE}` — the appended `EventSink` port is `#[async_trait]`, \
+                     so restore that line at the top of the file and rerun"
+                )
+                .into());
+            }
+            Ok(format!("{c}\n{EVENT_PORT_TPL}"))
+        })?,
+        edit(project, "src/domain/mod.rs", |c| {
+            Ok(format!("{c}pub use ports::{{check_event, Event, EventSink}};\n"))
+        })?,
+        edit(project, "src/infrastructure/mod.rs", |c| {
+            let c = insert_pub_mod(&c, "log_events")?;
+            insert_pub_mod(&c, backend.module())
+        })?,
+        edit(project, "src/api/mod.rs", |c| {
+            insert_after_line(&c, "pub struct Services {", "    pub events: Arc<dyn crate::domain::EventSink>,")
+        })?,
+        edit(project, "src/bootstrap.rs", |c| {
+            let c = insert_before_line(&c, RESOURCES_MARKER, backend.resource()).map_err(|_| {
+                format!(
+                    "marker '{RESOURCES_MARKER}' is missing — put the line `    {RESOURCES_MARKER}` \
+                     back just above the `api::Services {{ ... }}` literal in \
+                     `build_services_from_env()`, then rerun (or wire the event sink manually: \
+                     resolve {} there and pass it to a `build_event_sink` builder)",
+                    backend.env()[0].0
+                )
+            })?;
+            let c = insert_at_marker(
+                &c,
+                "// kodegen:services:env",
+                "build_services_from_env",
+                "user: build_user_service(db.as_ref()),",
+                &format!("        events: build_event_sink({resource}.as_ref()),"),
+            )?;
+            let c = insert_at_marker(
+                &c,
+                "// kodegen:services:default",
+                "build_services",
+                "user: build_user_service(None),",
+                "        events: build_event_sink(None),",
+            )?;
+            Ok(format!("{c}\n{}", backend.builder()))
+        })?,
+    ];
+
+    // whichever `add` runs first creates the compose file, the next one appends
+    let (service, block) = backend.compose_service();
+    if project.join(COMPOSE).is_file() {
+        edits.push(edit(project, COMPOSE, |c| add_compose_service(&c, service, block))?);
+    } else {
+        creates.push((COMPOSE.to_string(), format!("{COMPOSE_HEADER}{block}")));
+    }
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    // everything above is pure, so this is the only side effect
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
 /// The file as `kodegen new` would have written it into a project called `pkg`
 /// — the embedded template with the rename applied, in the same order
 /// `substitutions()` applies it (snake before kebab).
@@ -892,15 +1257,16 @@ fn default_anchor_err(manifest: &str) -> String {
         .to_string()
 }
 
-/// Turns `feature` on in `default = [...]`. A datastore *replaces* whichever one
-/// is listed (there is one `UserRepository` adapter, whether it is Diesel or
-/// Mongo); everything else is additive and joins the list.
-fn enable_feature(manifest: &str, feature: &str, replaces_datastore: bool) -> Result<String> {
+/// Turns `feature` on in `default = [...]`. A feature that fills a slot
+/// *replaces* whichever one is listed there (there is one `UserRepository`
+/// adapter, whether it is Diesel or Mongo); everything else is additive and joins
+/// the list.
+fn enable_feature(manifest: &str, feature: &str, slot: Option<Slot>) -> Result<String> {
     let (offset, line) = default_span(manifest).ok_or_else(|| default_anchor_err(manifest))?;
     let indent = &line[..line.len() - line.trim_start().len()];
     let mut kept: Vec<String> = parse_features(line)
         .into_iter()
-        .filter(|f| !(replaces_datastore && DATASTORE.contains(&f.as_str())))
+        .filter(|f| !slot.is_some_and(|s| s.features().contains(&f.as_str())))
         .collect();
     // `add` refuses a second run long before this, but the rewrite itself has no
     // business producing `["cache", "cache"]` for anyone who calls it otherwise
@@ -939,9 +1305,20 @@ fn rewrite_repo(content: &str, cap: Relational, pkg: &str) -> Result<String> {
 /// Rewrites every seed migration kodegen owns, and leaves anything else alone.
 fn migrations(project: &Path, cap: Relational) -> Vec<(String, String)> {
     let Ok(entries) = fs::read_dir(project.join("migrations")) else {
+        warn_no_seed(cap);
         return Vec::new();
     };
+    let mut found = false;
     let mut seeds = Vec::new();
+    // a rewrite to the bytes that are already there is not a change: `add
+    // postgres` leaves the SQLite seed's `up.sql` exactly as it found it, and
+    // both dialects leave `down.sql` alone. Reporting them would make `--dry-run`
+    // name files it is not going to touch.
+    let mut rewrite = |rel: String, current: &str, wanted: &str| {
+        if current.trim() != wanted.trim() {
+            seeds.push((rel, wanted.to_string()));
+        }
+    };
     for e in entries.flatten().filter(|e| e.path().is_dir()) {
         let name = e.file_name().to_string_lossy().into_owned();
         let rel = format!("migrations/{name}/up.sql");
@@ -950,8 +1327,20 @@ fn migrations(project: &Path, cap: Relational) -> Vec<(String, String)> {
         let Ok(content) = fs::read_to_string(project.join(&rel)) else {
             continue;
         };
-        if KNOWN_SEEDS.contains(&content.trim()) {
-            seeds.push((rel, cap.up_sql().to_string()));
+        if is_known(KNOWN_SEEDS, &content) {
+            found = true;
+            rewrite(rel, &content, cap.up_sql());
+            // the hypertable variant's `up.sql` creates a second table, so a
+            // `down.sql` that still only drops `users` would leave the revert
+            // half-done and the next migrate failing on `CREATE TABLE events`.
+            // Rewritten only while it is still one kodegen wrote — a revert the
+            // user has edited is theirs.
+            let down = format!("migrations/{name}/down.sql");
+            if let Ok(current) = fs::read_to_string(project.join(&down))
+                && is_known(KNOWN_DOWNS, &current)
+            {
+                rewrite(down, &current, cap.down_sql());
+            }
         } else {
             eprintln!(
                 "warning: migrations/{name} was not generated by kodegen — check its SQL is valid \
@@ -960,9 +1349,22 @@ fn migrations(project: &Path, cap: Relational) -> Vec<(String, String)> {
             );
         }
     }
+    // "nothing to rewrite" and "nothing of ours to rewrite" are different: the
+    // first is what `add postgres` does to a SQLite seed that already matches
+    if !found {
+        warn_no_seed(cap);
+    }
     // read_dir order is not defined; the plan `--dry-run` prints must be stable
     seeds.sort();
     seeds
+}
+
+fn warn_no_seed(cap: Relational) {
+    eprintln!(
+        "warning: no kodegen-generated migration found under migrations/ — \
+         create the users table for {} yourself",
+        cap.dialect()
+    );
 }
 
 /// Line-anchored, so a `services:` in a comment or nested under another key
@@ -1005,12 +1407,58 @@ fn refusal(rel: &str, signature: &str, cap: Relational) -> String {
     )
 }
 
+/// Whether a migration file is still one kodegen wrote. Trimmed on both sides:
+/// the bodies below are written as they appear in a file, and an editor that adds
+/// or drops a trailing newline has not made the SQL somebody else's.
+fn is_known(bodies: &[&str], content: &str) -> bool {
+    bodies.iter().any(|body| body.trim() == content.trim())
+}
+
 /// Seed `up.sql` bodies kodegen has generated — used to tell "still ours" from
 /// "the user wrote their own schema".
 const KNOWN_SEEDS: &[&str] = &[
     "CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);",
     "CREATE TABLE users (id VARCHAR(64) PRIMARY KEY NOT NULL, name TEXT NOT NULL);",
+    TIMESCALE_UP_SQL,
 ];
+
+/// The same, for the revert half. Only TimescaleDB writes a `down.sql` of its
+/// own, but both bodies are listed so that undoing it by hand and re-running
+/// `add postgres` still recognises the file as kodegen's.
+const KNOWN_DOWNS: &[&str] = &[USERS_DOWN_SQL, TIMESCALE_DOWN_SQL];
+
+const USERS_DOWN_SQL: &str = "DROP TABLE users;\n";
+
+/// TimescaleDB is PostgreSQL plus an extension, so the users half is the
+/// PostgreSQL migration verbatim — same driver, same types, same upsert. What
+/// the capability actually adds is below it: the extension, and one example
+/// hypertable to show what it is for.
+///
+/// `CREATE EXTENSION` comes first because Diesel runs each migration inside one
+/// transaction and TimescaleDB requires its extension to be created before
+/// anything else in that transaction.
+const TIMESCALE_UP_SQL: &str = r##"CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);
+
+-- An example, and the only thing here that is not plain PostgreSQL: a
+-- hypertable is a normal table that the extension partitions by time for you.
+-- Nothing in the generated Rust reads it — replace it with your own measurement
+-- table (`kodegen add clickhouse`/`influxdb` write the app-side `EventSink` port
+-- instead, which is a different thing and can be added alongside).
+CREATE TABLE events (
+    recorded_at TIMESTAMPTZ NOT NULL,
+    name TEXT NOT NULL,
+    value DOUBLE PRECISION NOT NULL
+);
+SELECT create_hypertable('events', by_range('recorded_at'));
+"##;
+
+/// Drops the example table too: a `down.sql` that only dropped `users` would
+/// leave `events` behind, and the next `migration run` would fail on
+/// `CREATE TABLE events`. The extension is left alone on purpose — dropping it
+/// would take every other hypertable in the database with it.
+const TIMESCALE_DOWN_SQL: &str = "DROP TABLE events;\nDROP TABLE users;\n";
 
 const SAVE_REPLACE_INTO: &str = r##"                diesel::replace_into(users::table)
                     .values(UserRow {
@@ -1442,6 +1890,79 @@ const MARIADB_COMPOSE: &str = r##"  mariadb:
       - "3306:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+"##;
+
+/// The same PostgreSQL, with the extension preloaded — which is why the service
+/// keeps the `postgres` name, the port and the credentials: `DATABASE_URL` does
+/// not change when you move a project from one to the other.
+const TIMESCALE_COMPOSE: &str = r##"  postgres:
+    # TimescaleDB is a PostgreSQL extension, not a different server: same wire
+    # protocol, same driver, same DATABASE_URL. The image is what differs, and it
+    # ships the extension preloaded (`shared_preload_libraries`), which is what
+    # lets the migration's `CREATE EXTENSION` succeed.
+    image: timescale/timescaledb:latest-pg17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+"##;
+
+const CLICKHOUSE_COMPOSE: &str = r##"  clickhouse:
+    # The HTTP interface (8123) is what the driver speaks; 9000 is the native
+    # protocol this adapter does not use. The credentials are dev-only, like
+    # every other service in this file — but unlike them they are not optional:
+    # since 25.x the image refuses to leave its `default` user without a
+    # password, so a user is created here and CLICKHOUSE_USER/CLICKHOUSE_PASSWORD
+    # are what the app connects as.
+    image: clickhouse/clickhouse-server:25.3-alpine
+    environment:
+      CLICKHOUSE_DB: app
+      CLICKHOUSE_USER: app
+      CLICKHOUSE_PASSWORD: app
+    ports:
+      - "8123:8123"
+    # the server needs these to start without warnings on some kernels
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+"##;
+
+/// InfluxDB v2 because it is the one that sets itself up from environment
+/// variables. The adapter is not v2-specific — see the README for the v3 and
+/// GreptimeDB URLs, which are the same POST against a different path.
+const INFLUX_COMPOSE: &str = r##"  influxdb:
+    # `setup` mode creates the org, the bucket and the token on first boot, so
+    # INFLUX_TOKEN below is usable without a UI visit. InfluxDB 3 Core
+    # (`image: influxdb:3-core`) and GreptimeDB (`image: greptime/greptimedb`)
+    # take the same line protocol — only INFLUX_URL's path changes (see README).
+    image: influxdb:2
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: app
+      DOCKER_INFLUXDB_INIT_PASSWORD: kodegen-dev-password
+      DOCKER_INFLUXDB_INIT_ORG: app
+      DOCKER_INFLUXDB_INIT_BUCKET: app
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: kodegen-dev-token
+    ports:
+      - "8086:8086"
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -2227,6 +2748,700 @@ async fn s3_blob_store_honors_the_contract() {
 }
 "##;
 
+/// Appended to `domain/ports.rs`, next to the `Cache` and `BlobStore` ports.
+/// `std::time::SystemTime` is spelled out rather than imported for the same
+/// reason `Cache` spells out `Duration`: appending is what makes this edit
+/// anchor-free, and adding a `use` at the top of the file would not be.
+const EVENT_PORT_TPL: &str = r##"/// Outbound port: append-only measurements. Written by `kodegen add clickhouse`
+/// (ClickHouse) or `kodegen add influxdb` (InfluxDB v2/v3, GreptimeDB) — one port
+/// for both, because the write path of an analytical store and of a time-series
+/// database is the same shape.
+///
+/// **Write only.** There is no read method and no query method: what you ask an
+/// analytical store is not what you ask a time-series one, and a port that tried
+/// to be both would be an interface nobody could implement twice. Query the
+/// store directly from whatever needs to (a report, a dashboard, a job); this
+/// port is how the application *records*.
+///
+/// Both adapters must honor this contract — the log-only one is what runs when
+/// the sink's URL is unset, so a behavioral difference between them shows up as
+/// a bug that only reproduces in production. `tests/events.rs` runs one set of
+/// assertions against both.
+#[async_trait]
+pub trait EventSink: Send + Sync {
+    /// Records every event in `events`.
+    ///
+    /// **Not fire-and-forget:** this awaits the round trip and returns the
+    /// failure rather than swallowing it. There is no queue, no retry and no
+    /// backpressure anywhere behind this port — one call is one request — so a
+    /// caller that must not wait on the sink should batch and `tokio::spawn`,
+    /// and one that can afford to lose events should decide that for itself
+    /// (`let _ = sink.write(..).await;`) rather than have the port decide.
+    ///
+    /// Validation is all-or-nothing: `check_event` runs over the whole batch
+    /// before anything is sent, so an invalid event means nothing was written.
+    /// Once the batch is on the wire, an error says nothing about how much of it
+    /// landed — the sinks behind this are append-only, not transactional.
+    ///
+    /// An empty batch is `Ok(())` and sends nothing.
+    async fn write(&self, events: Vec<Event>) -> Result<(), DomainError>;
+}
+
+/// One measurement at one instant: a name, when it happened, and its numbers.
+///
+/// The shape is the intersection of what both backends take, deliberately: it
+/// maps to one line of InfluxDB line protocol and to one row per field in a
+/// ClickHouse `MergeTree` table.
+///
+/// What it does **not** have, so that neither adapter has to fake it:
+/// - **no tags/dimensions.** Line protocol has them (indexed); ClickHouse would
+///   need a `Map` column and a schema decision. Put the dimension in `name`
+///   (`http.requests.checkout`) until a real requirement says otherwise.
+/// - **no field types other than `f64`.** Line protocol also has integers,
+///   booleans and strings; ClickHouse has all of them and more. One numeric type
+///   is what keeps the two adapters honestly interchangeable.
+pub struct Event {
+    /// The measurement (line protocol) / the `name` column (ClickHouse).
+    pub name: String,
+    /// Stored at the backend's own resolution: ClickHouse keeps `DateTime64(3)`
+    /// (milliseconds) and line protocol is sent in nanoseconds, so the same event
+    /// can land up to 1ms apart on the two of them.
+    ///
+    /// ponytail: a timestamp past ~year 2554 saturates rather than wrapping (the
+    /// nanosecond count stops fitting in `u64`) — not guarded, because an event
+    /// recorded half a millennium out is a bug in the caller's clock
+    pub at: std::time::SystemTime,
+    /// At least one — a point with no fields is not a point line protocol will
+    /// accept.
+    pub fields: Vec<(String, f64)>,
+}
+
+impl Event {
+    /// The common case: something just happened.
+    pub fn now(name: impl Into<String>, fields: Vec<(String, f64)>) -> Self {
+        Self {
+            name: name.into(),
+            at: std::time::SystemTime::now(),
+            fields,
+        }
+    }
+}
+
+/// The rules every `EventSink` adapter enforces before touching its backend.
+///
+/// The character rule is what lets the line-protocol adapter skip escaping
+/// entirely: a comma, a space or an `=` in a measurement or field key changes
+/// what the line *means*, and an adapter that escaped while another did not
+/// would put the same event in two different places. Checking in one place keeps
+/// the two adapters substitutable and keeps the escaping question closed.
+pub fn check_event(event: &Event) -> Result<(), DomainError> {
+    let invalid = |why: String| Err(DomainError::Validation(format!("event {:?}: {why}", event.name)));
+    // a name that is legal in one backend and not the other is exactly what this
+    // exists to stop, so the rule is the intersection: ASCII, and nothing line
+    // protocol or SQL would read as syntax
+    //
+    // A leading `_` is refused because it is Flux's own namespace: `_time`,
+    // `_value`, `_field` and `_measurement` are the columns a query is made of,
+    // so a point named into it is written (InfluxDB 2 answers 204 — measured)
+    // and then collides with the query engine's own columns on the way back out.
+    // Refusing it here is what keeps "it stored" and "it can be read" the same
+    // answer on both adapters. `_` *inside* a name is fine, which is why this is
+    // not a character-class rule.
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 128
+            && !s.starts_with('_')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':'))
+    };
+    if !plain(&event.name) {
+        return invalid(
+            "name must be 1-128 characters of ASCII letters, digits or _-./: — no spaces, commas or \
+             equals signs (line protocol reads those as syntax) and no leading underscore (InfluxDB \
+             reserves it)"
+                .into(),
+        );
+    }
+    if event.fields.is_empty() {
+        return invalid("must have at least one field — line protocol rejects a point without one".into());
+    }
+    for (key, value) in &event.fields {
+        if !plain(key) {
+            return invalid(format!("field key {key:?} must follow the same rule as the name"));
+        }
+        // `time` is the timestamp's own column in InfluxDB, which answers a
+        // point carrying it with `422 invalid field name` (measured) — so this
+        // is refused here, where every adapter refuses it the same way, rather
+        // than only in production
+        if key == "time" {
+            return invalid("field key \"time\" is reserved — InfluxDB uses it for the timestamp".into());
+        }
+        // NaN and the infinities have no line-protocol spelling, and would land
+        // in ClickHouse as values no aggregate can use
+        if !value.is_finite() {
+            return invalid(format!("field {key:?} is {value}, which is not a finite number"));
+        }
+    }
+    if event.at < std::time::UNIX_EPOCH {
+        return invalid("timestamp is before the Unix epoch".into());
+    }
+    Ok(())
+}
+"##;
+
+const LOG_EVENTS_TPL: &str = r##"//! Default `EventSink` adapter: writes each event to the tracing subscriber the
+//! service already installs, so `cargo run` and `cargo test` work with no server
+//! — the same rule `in_memory_repo` follows for `DATABASE_URL`.
+//!
+//! Written by `kodegen add clickhouse` / `kodegen add influxdb`.
+//!
+//! It is a **log**, not a store: nothing here can be queried, aggregated or read
+//! back, and events disappear with the process. That is the honest default for
+//! this port — the port has no read path to pretend to implement, and an
+//! in-memory buffer would grow without bound while looking like durability.
+
+use crate::domain::{check_event, DomainError, Event, EventSink};
+use async_trait::async_trait;
+
+#[derive(Default)]
+pub struct LogEventSink;
+
+impl LogEventSink {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl EventSink for LogEventSink {
+    async fn write(&self, events: Vec<Event>) -> Result<(), DomainError> {
+        // the same all-or-nothing validation the remote adapters do, and for the
+        // reason the port documents: a project developed against this adapter
+        // must not discover the rules the day it points at a real server
+        for event in &events {
+            check_event(event)?;
+        }
+        for event in &events {
+            tracing::info!(
+                target: "events",
+                name = %event.name,
+                at = ?event.at,
+                fields = ?event.fields,
+                "event"
+            );
+        }
+        Ok(())
+    }
+}
+"##;
+
+const CLICKHOUSE_EVENTS_TPL: &str = r##"//! `EventSink` adapter over ClickHouse, using the official client over its HTTP
+//! interface.
+//!
+//! Written by `kodegen add clickhouse`. The client is owned by the composition
+//! root (`bootstrap.rs`) and handed in, exactly like the Diesel `Db` handle: an
+//! adapter never reads `CLICKHOUSE_URL` itself.
+
+use crate::domain::{check_event, DomainError, Event, EventSink};
+use async_trait::async_trait;
+use clickhouse::{Client, Row};
+use serde::Serialize;
+use tokio::sync::OnceCell;
+
+/// One row per field ("long" format) rather than one row per event with a
+/// `Map(String, Float64)` column: every column here is a scalar, which is what
+/// keeps the row type plain `derive(Row)` and the table something you can
+/// `GROUP BY name, field` without unpacking anything. A wide table is the right
+/// answer once you know your fields — that is a schema decision, and this file
+/// is where you would make it.
+#[derive(Row, Serialize)]
+struct EventRow {
+    name: String,
+    field: String,
+    value: f64,
+    /// `DateTime64(3)` is milliseconds since the epoch, which is what the driver
+    /// maps `i64` to.
+    at: i64,
+}
+
+/// One budget for a whole `write`, table creation included. Neither the client
+/// nor hyper underneath it has a default timeout, so without this a server that
+/// accepts a connection and then says nothing holds the caller's task — and, on
+/// a request path, the request — for as long as it likes.
+///
+/// ponytail: one flat 5s for the batch, not per row; make it a field on the sink
+/// if a deployment needs it configurable. The `Cache` port's Redis adapter is
+/// deliberately *not* wrapped this way — its `ConnectionManager` is unbounded
+/// too, but it owns its own reconnect loop and a cache call is not the thing
+/// that must not hang.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Created on first write rather than by a migration: ClickHouse is not the
+/// project's relational database, so it has no `migrations/` directory and
+/// `diesel_migrations` never sees it. `IF NOT EXISTS` makes every process safe
+/// to start in any order.
+const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS events (
+        name String,
+        field String,
+        value Float64,
+        at DateTime64(3)
+    ) ENGINE = MergeTree
+    ORDER BY (name, at)";
+
+pub struct ClickhouseEventSink {
+    client: Client,
+    /// A failure is not cached: `get_or_try_init` leaves the cell empty, so a
+    /// server that was down for the first write is retried on the next one
+    /// instead of poisoning the process.
+    table: OnceCell<()>,
+}
+
+impl ClickhouseEventSink {
+    pub fn new(client: Client) -> Self {
+        Self {
+            client,
+            table: OnceCell::new(),
+        }
+    }
+
+    async fn ensure_table(&self) -> Result<(), DomainError> {
+        self.table
+            .get_or_try_init(|| self.client.query(CREATE_TABLE).execute())
+            .await
+            .map(|_| ())
+            .map_err(infra)
+    }
+}
+
+/// A server that cannot be reached is `Unavailable`, which `api::to_http_err`
+/// turns into a 503 — the same treatment `GrpcGreeter` gives a dead upstream.
+/// Anything the server itself answered (a bad query, a type mismatch) is a real
+/// `Other`: the dependency is up, the request was wrong.
+fn infra(e: clickhouse::error::Error) -> DomainError {
+    match e {
+        clickhouse::error::Error::Network(_) | clickhouse::error::Error::TimedOut => {
+            DomainError::Unavailable
+        }
+        other => DomainError::Other(Box::new(other)),
+    }
+}
+
+/// `check_event` has already refused anything before the epoch; a timestamp far
+/// enough in the future to overflow saturates rather than wrapping into the past.
+fn millis(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+#[async_trait]
+impl EventSink for ClickhouseEventSink {
+    async fn write(&self, events: Vec<Event>) -> Result<(), DomainError> {
+        for event in &events {
+            check_event(event)?;
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        let send = async {
+            self.ensure_table().await?;
+            // one INSERT for the whole batch: the client streams the rows into a
+            // single request and `end()` is what waits for the server to accept it
+            let mut insert = self.client.insert("events").map_err(infra)?;
+            for event in &events {
+                let at = millis(event.at);
+                for (field, value) in &event.fields {
+                    insert
+                        .write(&EventRow {
+                            name: event.name.clone(),
+                            field: field.clone(),
+                            value: *value,
+                            at,
+                        })
+                        .await
+                        .map_err(infra)?;
+                }
+            }
+            insert.end().await.map_err(infra)
+        };
+        // a sink that stops answering mid-insert is a sink that is down, which is
+        // what `Unavailable` means everywhere else in this project
+        tokio::time::timeout(TIMEOUT, send)
+            .await
+            .unwrap_or(Err(DomainError::Unavailable))
+    }
+}
+"##;
+
+/// Inserted above `// kodegen:resources` in `build_services_from_env`.
+const CLICKHOUSE_RESOURCE: &str = r##"    // one ClickHouse client for the whole process. It is a handle, not a
+    // connection: nothing is dialed until the first write, so a sink that is not
+    // up cannot stop the service booting.
+    let clickhouse = std::env::var("CLICKHOUSE_URL").ok().map(|url| {
+        let mut client = clickhouse::Client::default()
+            .with_url(url)
+            .with_database(std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "default".into()));
+        // both optional here, but not on the dev server: the images have
+        // required a password for `default` since 25.x, so the compose service
+        // creates a user and these are how the app connects as it
+        if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+            client = client.with_user(user);
+        }
+        if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+            client = client.with_password(password);
+        }
+        client
+    });"##;
+
+/// Appended to `bootstrap.rs`.
+const BUILD_EVENT_SINK_CLICKHOUSE: &str = r##"/// ClickHouse when `CLICKHOUSE_URL` is set, the tracing log otherwise — the same
+/// env-picks-the-adapter rule `build_user_service` follows for `DATABASE_URL`.
+fn build_event_sink(clickhouse: Option<&clickhouse::Client>) -> Arc<dyn crate::domain::EventSink> {
+    match clickhouse {
+        Some(client) => Arc::new(
+            crate::infrastructure::clickhouse_events::ClickhouseEventSink::new(client.clone()),
+        ),
+        None => Arc::new(crate::infrastructure::log_events::LogEventSink::new()),
+    }
+}
+"##;
+
+const LINE_PROTOCOL_EVENTS_TPL: &str = r##"//! `EventSink` adapter over the InfluxDB line protocol — which is InfluxDB v2,
+//! InfluxDB v3 **and** GreptimeDB, because all three accept the same text on the
+//! same kind of HTTP endpoint. The URL is the only thing that differs between
+//! them, and that is configuration, not code (see the README).
+//!
+//! Written by `kodegen add influxdb`. The client and the fully-resolved write
+//! URL are owned by the composition root (`bootstrap.rs`) and handed in, exactly
+//! like the Diesel `Db` handle: an adapter never reads `INFLUX_URL` itself.
+//!
+//! Why hyper rather than a client crate: the write path is one POST of one text
+//! body, and `tonic` already puts hyper in this project's dependency graph — so
+//! this adapter costs Cargo.lock nothing at all. The trade is that it speaks
+//! **plain HTTP only**; for a managed endpoint on https, either put it behind a
+//! TLS-terminating proxy or swap `build_http()` below for a `hyper-rustls`
+//! connector (one line here, one dependency in Cargo.toml).
+
+use crate::domain::{check_event, DomainError, Event, EventSink};
+use async_trait::async_trait;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
+use hyper::Request;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+
+/// One budget for the whole exchange — connect, send, and read the answer.
+/// hyper's client has no default timeout of its own, so this is the only thing
+/// bounding a write.
+///
+/// ponytail: one flat 5s, not configurable; make it a field on the sink if a
+/// deployment needs it. The `Cache` port's Redis adapter is deliberately *not*
+/// wrapped this way — its `ConnectionManager` is unbounded too, but it owns its
+/// own reconnect loop and a cache call is not the thing that must not hang.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub struct LineProtocolEventSink {
+    client: Client<HttpConnector, Full<Bytes>>,
+    /// The complete write endpoint, query string included — see
+    /// `bootstrap.rs`, which is where the vendor differences live.
+    url: String,
+    token: Option<String>,
+}
+
+impl LineProtocolEventSink {
+    pub fn new(url: impl Into<String>, token: Option<String>) -> Self {
+        Self {
+            // one pooled, keep-alive client for the whole process; it dials on
+            // the first write, so a sink that is not up cannot stop the service
+            // booting
+            client: Client::builder(TokioExecutor::new()).build_http(),
+            url: url.into(),
+            token,
+        }
+    }
+}
+
+/// `<name> <key>=<value>[,<key>=<value>] <nanoseconds>`.
+///
+/// No escaping anywhere, and that is a property rather than an omission:
+/// `check_event` has already refused every character line protocol would need
+/// escaped (spaces, commas, `=`, quotes, newlines), so what goes on the wire is
+/// what the caller wrote.
+fn line(event: &Event) -> String {
+    let fields = event
+        .fields
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    // nanoseconds, matching the `precision=ns` the composition root asks for. A
+    // timestamp too far in the future saturates rather than wrapping into the
+    // past; `check_event` has already refused anything before the epoch.
+    let at = event
+        .at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    format!("{} {fields} {at}", event.name)
+}
+
+#[async_trait]
+impl EventSink for LineProtocolEventSink {
+    async fn write(&self, events: Vec<Event>) -> Result<(), DomainError> {
+        for event in &events {
+            check_event(event)?;
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        let body = events.iter().map(line).collect::<Vec<_>>().join("\n");
+        // a sink that accepts the connection and then says nothing would
+        // otherwise hold this task — and the request it is on — forever
+        tokio::time::timeout(TIMEOUT, self.post(body))
+            .await
+            .unwrap_or(Err(DomainError::Unavailable))
+    }
+}
+
+impl LineProtocolEventSink {
+    async fn post(&self, body: String) -> Result<(), DomainError> {
+        let mut req = Request::post(&self.url).header(CONTENT_TYPE, "text/plain; charset=utf-8");
+        if let Some(token) = &self.token {
+            // v2's own scheme, which InfluxDB 3 accepts as well. A server that
+            // wants `Bearer` or basic auth is a one-line change here.
+            req = req.header(AUTHORIZATION, format!("Token {token}"));
+        }
+        let req = req
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|e| DomainError::Other(Box::new(e)))?;
+
+        let res = self.client.request(req).await.map_err(|e| {
+            // nothing answered: the sink is down, which `api::to_http_err` turns
+            // into a 503 — the same treatment `GrpcGreeter` gives a dead upstream
+            if e.is_connect() {
+                DomainError::Unavailable
+            } else {
+                DomainError::Other(Box::new(e))
+            }
+        })?;
+
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // the server answered, so this is a real `Other`: the dependency is up
+        // and the request was wrong (a bad token, an unknown bucket, a
+        // malformed point). Its body says which, so it is not thrown away.
+        let body = res
+            .into_body()
+            .collect()
+            .await
+            .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
+            .unwrap_or_default();
+        Err(DomainError::Other(
+            format!("event sink answered {status}: {}", body.trim()).into(),
+        ))
+    }
+}
+"##;
+
+/// Inserted above `// kodegen:resources` in `build_services_from_env`.
+///
+/// The vendor differences live here, in the URL, rather than in the adapter:
+/// this is the one place that knows there is such a thing as a bucket.
+const INFLUX_RESOURCE: &str = r##"    // the write endpoint, assembled once. `INFLUX_URL` is the server's base
+    // address and the path is appended, which is what makes one adapter cover:
+    //
+    //   InfluxDB v2    INFLUX_URL=http://127.0.0.1:8086          (+ INFLUX_ORG)
+    //   InfluxDB v3    INFLUX_URL=http://127.0.0.1:8181          (bucket = database)
+    //   GreptimeDB     INFLUX_URL=http://127.0.0.1:4000/v1/influxdb
+    //
+    // ponytail: the bucket and org go into the query string verbatim, so a name
+    // with a space or an `&` in it would need percent-encoding — reach for a URL
+    // crate if you ever have one
+    let influx = std::env::var("INFLUX_URL").ok().map(|base| {
+        let bucket = std::env::var("INFLUX_BUCKET").expect("INFLUX_URL is set but INFLUX_BUCKET is not");
+        let mut url = format!(
+            "{}/api/v2/write?bucket={bucket}&precision=ns",
+            base.trim_end_matches('/')
+        );
+        // v2 only: v3 and GreptimeDB ignore it, so it is set when it exists
+        if let Ok(org) = std::env::var("INFLUX_ORG") {
+            url.push_str(&format!("&org={org}"));
+        }
+        (url, std::env::var("INFLUX_TOKEN").ok())
+    });"##;
+
+/// Appended to `bootstrap.rs`.
+const BUILD_EVENT_SINK_INFLUX: &str = r##"/// The time-series database when `INFLUX_URL` is set, the tracing log otherwise
+/// — the same env-picks-the-adapter rule `build_user_service` follows for
+/// `DATABASE_URL`.
+fn build_event_sink(influx: Option<&(String, Option<String>)>) -> Arc<dyn crate::domain::EventSink> {
+    match influx {
+        Some((url, token)) => Arc::new(
+            crate::infrastructure::line_protocol_events::LineProtocolEventSink::new(
+                url,
+                token.clone(),
+            ),
+        ),
+        None => Arc::new(crate::infrastructure::log_events::LogEventSink::new()),
+    }
+}
+"##;
+
+/// One contract test with the server half filled in per backend: the assertions
+/// that do not need a server are the same either way, and they are the ones that
+/// keep the two adapters interchangeable.
+const EVENTS_TEST_TPL: &str = r##"//! The `EventSink` contract, run against both adapters. Written by
+//! `kodegen add clickhouse` / `kodegen add influxdb`.
+//!
+//! The server half is gated on the sink's URL rather than `#[ignore]`: booting
+//! `docker compose -f docker-compose.dev.yml up -d` and exporting the variables
+//! is all it takes to run it, and CI stays green without a server — the same
+//! switch that picks the adapter at runtime.
+
+use std::time::{Duration, SystemTime};
+use {{crate_name}}::domain::{DomainError, Event, EventSink};
+use {{crate_name}}::infrastructure::{{{adapter_module}}::*, log_events::LogEventSink};
+
+/// A name unique to this run: the server adapters append to a real table that
+/// earlier runs have already written to, so the assertions below must not be
+/// able to see anything but their own rows.
+fn measurement(tag: &str) -> String {
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("kodegen.test.{tag}.{unique}")
+}
+
+/// One contract, every adapter. Two adapters that pass the same assertions are
+/// substitutable; two that are merely similar are a production-only bug.
+async fn behaves_like_an_event_sink(sink: &dyn EventSink, name: &str) {
+    sink.write(vec![]).await.expect("an empty batch writes nothing and is Ok");
+
+    sink.write(vec![Event::now(name, vec![("value".into(), 1.0)])])
+        .await
+        .expect("write");
+
+    // a batch, several fields, and a timestamp that is not `now` — the three
+    // things the two adapters shape differently on the wire
+    sink.write(vec![
+        Event {
+            name: name.to_string(),
+            at: SystemTime::now() - Duration::from_secs(60),
+            fields: vec![("value".into(), 2.5), ("count".into(), 3.0)],
+        },
+        Event::now(name, vec![("value".into(), -0.5)]),
+    ])
+    .await
+    .expect("batch write");
+
+    // every adapter refuses the same events, and refuses them the same way: line
+    // protocol would silently mean something else for most of these, and a
+    // project developed against the default adapter must not discover that on
+    // the day it points at a real server
+    for bad in [
+        Event::now("", vec![("value".into(), 1.0)]),
+        Event::now("has space", vec![("value".into(), 1.0)]),
+        Event::now("has,comma", vec![("value".into(), 1.0)]),
+        Event::now("ok", vec![]),
+        Event::now("ok", vec![("has=equals".into(), 1.0)]),
+        // reserved names: `time` is the timestamp's own column and InfluxDB
+        // rejects a point carrying it outright, while the `_` prefix is Flux's
+        // namespace — written happily and then indistinguishable from the query
+        // engine's own columns
+        Event::now("_reserved", vec![("value".into(), 1.0)]),
+        Event::now("ok", vec![("_reserved".into(), 1.0)]),
+        Event::now("ok", vec![("time".into(), 1.0)]),
+        Event::now("ok", vec![("value".into(), f64::NAN)]),
+        Event::now("ok", vec![("value".into(), f64::INFINITY)]),
+        Event {
+            name: "ok".into(),
+            at: SystemTime::UNIX_EPOCH - Duration::from_secs(1),
+            fields: vec![("value".into(), 1.0)],
+        },
+    ] {
+        let name = bad.name.clone();
+        assert!(
+            matches!(sink.write(vec![bad]).await, Err(DomainError::Validation(_))),
+            "event {name:?} must be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn log_event_sink_honors_the_contract() {
+    behaves_like_an_event_sink(&LogEventSink::new(), &measurement("log")).await;
+}
+
+{{server_test}}"##;
+
+/// The ClickHouse half of `tests/events.rs`. It is the one adapter whose write
+/// can be *verified* rather than only acknowledged — the client can query, even
+/// though the port cannot.
+const CLICKHOUSE_TEST: &str = r##"#[tokio::test]
+async fn clickhouse_event_sink_honors_the_contract() {
+    let Ok(url) = std::env::var("CLICKHOUSE_URL") else {
+        eprintln!("CLICKHOUSE_URL unset — skipping the ClickHouse contract test");
+        return;
+    };
+    // the same wiring bootstrap.rs does, so this tests the configuration the app
+    // actually runs with — credentials included, since the dev server needs them
+    let mut client = clickhouse::Client::default()
+        .with_url(url)
+        .with_database(std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "default".into()));
+    if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+        client = client.with_user(user);
+    }
+    if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+        client = client.with_password(password);
+    }
+    let name = measurement("clickhouse");
+    behaves_like_an_event_sink(&ClickhouseEventSink::new(client.clone()), &name).await;
+
+    // and then the half the port cannot express: the rows are actually there.
+    // Four of them: the three valid events written above have four fields
+    // between them, and the table is one row per field.
+    let rows: u64 = client
+        .query("SELECT count() FROM events WHERE name = ?")
+        .bind(&name)
+        .fetch_one()
+        .await
+        .expect("count");
+    assert_eq!(rows, 4, "one row per field of every event written");
+}
+"##;
+
+/// The line-protocol half. There is no read-back here on purpose: what "query"
+/// means differs across the three servers this adapter supports, while a 2xx from
+/// the write endpoint means the same thing on all of them (the adapter turns
+/// anything else into an error, which is what makes this assertion real).
+const INFLUX_TEST: &str = r##"#[tokio::test]
+async fn line_protocol_event_sink_honors_the_contract() {
+    let Ok(url) = std::env::var("INFLUX_URL") else {
+        eprintln!("INFLUX_URL unset — skipping the line-protocol contract test");
+        return;
+    };
+    // the same wiring bootstrap.rs does, so this tests the configuration the app
+    // actually runs with
+    let bucket = std::env::var("INFLUX_BUCKET").expect("INFLUX_BUCKET");
+    let mut url = format!(
+        "{}/api/v2/write?bucket={bucket}&precision=ns",
+        url.trim_end_matches('/')
+    );
+    if let Ok(org) = std::env::var("INFLUX_ORG") {
+        url.push_str(&format!("&org={org}"));
+    }
+    let sink = LineProtocolEventSink::new(url, std::env::var("INFLUX_TOKEN").ok());
+    // every write above is asserted to succeed, and the adapter only succeeds on
+    // a 2xx — a rejected point, a bad token or an unknown bucket all fail here
+    behaves_like_an_event_sink(&sink, &measurement("influx")).await;
+}
+"##;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2411,7 +3626,7 @@ mod tests {
     fn a_multiline_default_array_is_refused_not_truncated() {
         let wrapped = "[features]\ndefault = [\n    \"sqlite\",\n    \"cache\",\n]\n";
         assert!(default_span(wrapped).is_none(), "a wrapped array must not look like an anchor");
-        let err = enable_feature(wrapped, "postgres", true).unwrap_err().to_string();
+        let err = enable_feature(wrapped, "postgres", Some(Slot::Datastore)).unwrap_err().to_string();
         assert!(err.contains("split across lines"), "{err}");
         assert!(err.contains("single line"), "must say how to fix it: {err}");
         // and the other shape still gets the other message
@@ -2584,9 +3799,12 @@ mod tests {
     fn every_capability_leads_with_the_variable_that_selects_it() {
         for (cap, first) in [
             (Capability::Postgres, "DATABASE_URL"),
+            (Capability::Timescaledb, "DATABASE_URL"),
             (Capability::Mongodb, "MONGODB_URL"),
             (Capability::Redis, "REDIS_URL"),
             (Capability::S3, "S3_BUCKET"),
+            (Capability::Clickhouse, "CLICKHOUSE_URL"),
+            (Capability::Influxdb, "INFLUX_URL"),
         ] {
             assert_eq!(cap.env()[0].0, first, "{}", cap.name());
         }
@@ -2797,24 +4015,45 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// `DATASTORE` is a list of feature names that has to stay in step with
-    /// `Kind::is_datastore()`: the exhaustive match is what makes a new kind a
-    /// compile error, but nothing makes a new *feature name* show up here.
+    /// `Slot::features()` is a list of feature *names* that has to stay in step
+    /// with `Kind::slot()`: the exhaustive matches are what make a new kind or a
+    /// new slot a compile error, but nothing makes a new feature name show up in
+    /// the right list — and a capability missing from its slot's list would be
+    /// added on top of the one already there instead of refused.
     #[test]
-    fn the_datastore_list_covers_every_datastore_capability() {
+    fn every_slot_lists_the_features_of_the_capabilities_that_fill_it() {
         use clap::ValueEnum;
         for cap in Capability::value_variants() {
-            assert_eq!(
-                cap.kind().is_datastore(),
-                DATASTORE.contains(&cap.feature()),
-                "'{}' (feature `{}`) disagrees with DATASTORE",
-                cap.name(),
-                cap.feature()
-            );
+            for slot in Slot::ALL {
+                assert_eq!(
+                    cap.kind().slot() == Some(slot),
+                    slot.features().contains(&cap.feature()),
+                    "'{}' (feature `{}`) disagrees with the {} slot",
+                    cap.name(),
+                    cap.feature(),
+                    slot.what()
+                );
+            }
         }
         // not reachable through any capability — it is what the template ships
         // with, and the one entry `add` skips when it looks for a rival
-        assert!(DATASTORE.contains(&"sqlite"), "the default backend must be in the list: {DATASTORE:?}");
+        assert_eq!(Slot::Datastore.shipped(), Some("sqlite"));
+        assert!(
+            Slot::Datastore.features().contains(&"sqlite"),
+            "the default backend must be in the list: {:?}",
+            Slot::Datastore.features()
+        );
+        // the event sink has no shipped occupant: a fresh project has no
+        // `EventSink` port at all, so the first `add` is always the only one
+        assert_eq!(Slot::Events.shipped(), None);
+        // `ALL` is the one list a new variant does not break by itself, so it is
+        // pinned against a match that a new variant *does* break
+        for slot in Slot::ALL {
+            match slot {
+                Slot::Datastore | Slot::Events => {}
+            }
+        }
+        assert_eq!(Slot::ALL.len(), 2, "a new Slot variant has to join Slot::ALL");
     }
 
     #[test]
@@ -3052,7 +4291,7 @@ mod tests {
                 .dirs()
                 .flat_map(|d| d.files())
                 .filter(|f| f.path().ends_with("up.sql"))
-                .any(|f| KNOWN_SEEDS.contains(&f.contents_utf8().unwrap().trim())),
+                .any(|f| is_known(KNOWN_SEEDS, f.contents_utf8().unwrap())),
             "the template's seed migration is no longer one `add` recognises as its own"
         );
     }
@@ -3074,18 +4313,358 @@ mod tests {
         }
     }
 
+    /// The Phase 5 path, and the same shape as the redis one: a new port, a new
+    /// `Services` field and a builder in both composition roots — plus the thing
+    /// that is new here, a *slot* around a port that is otherwise additive.
+    #[test]
+    fn clickhouse_writes_the_event_port_and_wires_both_composition_roots() {
+        let root = fixture("clickhouse");
+        add(&root, Capability::Clickhouse, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        // additive: the datastore it arrived with is untouched
+        assert!(toml.contains("default = [\"sqlite\", \"analytics\"]"), "{toml}");
+
+        let ports = fs::read_to_string(root.join(PORTS)).unwrap();
+        assert!(ports.contains("pub trait EventSink: Send + Sync"), "{ports}");
+        assert!(ports.contains("pub fn check_event"), "{ports}");
+        assert!(ports.contains("pub struct Event {"), "{ports}");
+        assert!(ports.contains("pub trait UserRepository"), "the existing ports were lost: {ports}");
+        // write path only — an analytical query port is a different shape per
+        // backend and is deliberately out of scope
+        assert!(!ports.contains("EventSink") || !ports.contains("async fn query"), "{ports}");
+        assert!(
+            fs::read_to_string(root.join("src/domain/mod.rs"))
+                .unwrap()
+                .contains("pub use ports::{check_event, Event, EventSink};")
+        );
+
+        let api = fs::read_to_string(root.join("src/api/mod.rs")).unwrap();
+        assert!(api.contains("pub events: Arc<dyn crate::domain::EventSink>"), "{api}");
+
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("CLICKHOUSE_URL"), "{bootstrap}");
+        assert!(bootstrap.contains("events: build_event_sink(clickhouse.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("events: build_event_sink(None),"), "{bootstrap}");
+        assert!(bootstrap.contains("fn build_event_sink("), "{bootstrap}");
+        for marker in [RESOURCES_MARKER, "// kodegen:services:env", "// kodegen:services:default"] {
+            assert!(bootstrap.contains(marker), "marker '{marker}' was consumed: {bootstrap}");
+        }
+
+        // the default adapter is what makes a generated project green with no
+        // server, so it is written whichever backend was asked for
+        let log = fs::read_to_string(root.join(LOG_EVENTS)).unwrap();
+        assert!(log.contains("impl EventSink for LogEventSink"), "{log}");
+        assert!(log.contains("check_event(event)?"), "both adapters validate: {log}");
+        let adapter = fs::read_to_string(root.join(CLICKHOUSE_EVENTS)).unwrap();
+        assert!(adapter.contains("impl EventSink for ClickhouseEventSink"), "{adapter}");
+        assert!(adapter.contains("CREATE TABLE IF NOT EXISTS events"), "{adapter}");
+        assert!(!root.join(LINE_PROTOCOL_EVENTS).exists(), "the other backend was written too");
+
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        assert!(compose.contains("image: clickhouse/clickhouse-server:"), "{compose}");
+        let test = fs::read_to_string(root.join(EVENTS_TEST)).unwrap();
+        assert!(test.contains("demo_svc::domain::{DomainError, Event, EventSink}"), "{test}");
+        assert!(test.contains("clickhouse_events::*"), "{test}");
+        // the default adapter has to be exercised with no server, or the
+        // "generated projects are green out of the box" promise is untested
+        assert!(test.contains("fn log_event_sink_honors_the_contract"), "{test}");
+        assert!(test.contains("CLICKHOUSE_URL"), "the server half must be env-gated: {test}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The other backend of the same slot: same port, same default adapter, same
+    /// wiring — a different adapter file, resource and compose service. If these
+    /// two ever stop sharing everything else, the slot is the wrong abstraction.
+    #[test]
+    fn influxdb_writes_the_same_port_with_the_line_protocol_adapter() {
+        let root = fixture("influxdb");
+        add(&root, Capability::Influxdb, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"sqlite\", \"timeseries\"]"), "{toml}");
+        let ports = fs::read_to_string(root.join(PORTS)).unwrap();
+        assert!(ports.contains("pub trait EventSink: Send + Sync"), "{ports}");
+
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("INFLUX_URL") && bootstrap.contains("INFLUX_BUCKET"), "{bootstrap}");
+        // the one place that knows a bucket exists is the composition root
+        assert!(bootstrap.contains("/api/v2/write?bucket="), "{bootstrap}");
+        assert!(bootstrap.contains("events: build_event_sink(influx.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("events: build_event_sink(None),"), "{bootstrap}");
+
+        let adapter = fs::read_to_string(root.join(LINE_PROTOCOL_EVENTS)).unwrap();
+        assert!(adapter.contains("impl EventSink for LineProtocolEventSink"), "{adapter}");
+        // the reason this covers three products with one adapter, documented
+        // where the decision is made
+        assert!(adapter.contains("GreptimeDB"), "{adapter}");
+        assert!(root.join(LOG_EVENTS).is_file(), "the default adapter is written either way");
+        assert!(!root.join(CLICKHOUSE_EVENTS).exists());
+
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        assert!(compose.contains("image: influxdb:2"), "{compose}");
+        assert!(compose.contains("greptime"), "the Greptime swap must be documented where it is made");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Both directions of the event-sink slot, because a user can arrive at it
+    /// from either side — the same rule the datastore slot has, which is the
+    /// whole point of there being a `Slot` at all.
+    #[test]
+    fn a_second_event_sink_fails_with_instructions() {
+        let root = fixture("clickhouse-then-influx");
+        add(&root, Capability::Clickhouse, false).unwrap();
+        let err = add(&root, Capability::Influxdb, true).unwrap_err().to_string();
+        assert!(err.contains("'analytics' already provides this project's event sink"), "{err}");
+        assert!(err.contains("clickhouse_events.rs"), "must name the file to remove: {err}");
+        assert!(err.contains("rerun `kodegen add influxdb`"), "{err}");
+        // nothing was written by the refusal
+        assert!(!root.join(LINE_PROTOCOL_EVENTS).exists());
+
+        let root2 = fixture("influx-then-clickhouse");
+        add(&root2, Capability::Influxdb, false).unwrap();
+        let err = add(&root2, Capability::Clickhouse, true).unwrap_err().to_string();
+        assert!(err.contains("'timeseries' already provides this project's event sink"), "{err}");
+        assert!(err.contains("line_protocol_events.rs"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root2).unwrap();
+    }
+
+    #[test]
+    fn adding_an_event_sink_twice_fails() {
+        for (tag, cap) in [("ch-twice", Capability::Clickhouse), ("influx-twice", Capability::Influxdb)] {
+            let root = fixture(tag);
+            add(&root, cap, false).unwrap();
+            let err = add(&root, cap, true).unwrap_err().to_string();
+            assert!(err.contains(&format!("capability '{}' already added", cap.name())), "{err}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn event_sink_dry_run_writes_nothing_but_plans_the_same_change() {
+        for (tag, cap) in [("ch-dry", Capability::Clickhouse), ("influx-dry", Capability::Influxdb)] {
+            let root = fixture(tag);
+            let before = snapshot(&root);
+            let planned = add(&root, cap, true).unwrap();
+            assert_eq!(before, snapshot(&root), "dry run touched the tree");
+            assert_eq!(planned, add(&root, cap, false).unwrap());
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_event_sink_names_the_missing_resources_marker() {
+        let root = fixture("ch-no-marker");
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        fs::write(root.join(BOOTSTRAP), bootstrap.replace(RESOURCES_MARKER, "")).unwrap();
+        let err = add(&root, Capability::Clickhouse, true).unwrap_err().to_string();
+        assert!(err.contains(RESOURCES_MARKER), "{err}");
+        assert!(err.contains("build_services_from_env"), "{err}");
+        // the variable to resolve by hand is the one that selects the adapter
+        assert!(err.contains("CLICKHOUSE_URL"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Appending to `ports.rs` is anchor-free, but it can still produce a file
+    /// that will not compile — and the event port appends a trait, a struct *and*
+    /// a free function, so it has three collisions to refuse.
+    #[test]
+    fn an_event_sink_refuses_a_ports_file_it_cannot_append_to() {
+        let root = fixture("events-ports-guard");
+        let ports = fs::read_to_string(root.join(PORTS)).unwrap();
+        for (spike, expected) in [
+            ("pub trait EventSink {}", "an `EventSink` trait"),
+            ("pub struct Event {}", "an `Event` type"),
+            ("pub fn check_event() {}", "`check_event`"),
+        ] {
+            fs::write(root.join(PORTS), format!("{ports}\n{spike}\n")).unwrap();
+            let err = add(&root, Capability::Clickhouse, true).unwrap_err().to_string();
+            assert!(err.contains(expected), "{spike}: {err}");
+        }
+        fs::write(root.join(PORTS), ports.replace(ASYNC_TRAIT_USE, "")).unwrap();
+        let err = add(&root, Capability::Influxdb, true).unwrap_err().to_string();
+        assert!(err.contains(ASYNC_TRAIT_USE), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_event_sink_refuses_to_overwrite_an_existing_adapter() {
+        let root = fixture("events-existing-adapter");
+        fs::write(root.join(LOG_EVENTS), "// mine now\n").unwrap();
+        let err = add(&root, Capability::Clickhouse, true).unwrap_err().to_string();
+        assert!(err.contains(LOG_EVENTS) && err.contains("already exists"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Four capabilities on four different axes, which is the arrangement the
+    /// slot model has to allow while refusing a second occupant of either slot.
+    #[test]
+    fn an_event_sink_coexists_with_a_datastore_a_cache_and_a_blob_store() {
+        let root = fixture("all-four-slots");
+        add(&root, Capability::Mongodb, false).unwrap();
+        add(&root, Capability::Redis, false).unwrap();
+        add(&root, Capability::S3, false).unwrap();
+        add(&root, Capability::Clickhouse, false).unwrap();
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"document\", \"cache\", \"blob\", \"analytics\"]"), "{toml}");
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        for service in ["  mongo:", "  redis:", "  s3:", "  clickhouse:"] {
+            assert!(compose.contains(service), "{service} missing: {compose}");
+        }
+        let api = fs::read_to_string(root.join("src/api/mod.rs")).unwrap();
+        assert!(api.contains("pub cache:") && api.contains("pub blobs:") && api.contains("pub events:"), "{api}");
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        for line in [
+            "user: build_user_service(db.as_ref()),",
+            "cache: build_cache(redis.as_ref()),",
+            "blobs: build_blob_store(s3.as_ref()),",
+            "events: build_event_sink(clickhouse.as_ref()),",
+        ] {
+            assert!(bootstrap.contains(line), "{line} missing: {bootstrap}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The other order, because `add clickhouse` writes into `bootstrap.rs`
+    /// before `add mongodb` goes looking for the three blocks it has to swap.
+    #[test]
+    fn an_event_sink_added_before_mongodb_survives_the_rewrite() {
+        // both backends, because `add mongodb` refuses any `Db` it did not write
+        // and each of these leaves a different resource block behind for it to
+        // walk past
+        for (tag, cap, feature, url, resource) in [
+            ("influx-then-mongo", Capability::Influxdb, "timeseries", "INFLUX_URL", "influx"),
+            ("ch-then-mongo", Capability::Clickhouse, "analytics", "CLICKHOUSE_URL", "clickhouse"),
+        ] {
+            let root = fixture(tag);
+            add(&root, cap, false).unwrap();
+            add(&root, Capability::Mongodb, false).unwrap();
+            let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+            assert!(toml.contains(&format!("default = [\"{feature}\", \"document\"]")), "{toml}");
+            let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+            assert!(bootstrap.contains(url) && bootstrap.contains("MONGODB_URL"), "{bootstrap}");
+            assert!(
+                bootstrap.contains(&format!("events: build_event_sink({resource}.as_ref()),")),
+                "{bootstrap}"
+            );
+            assert!(bootstrap.contains("fn build_user_service(db: Option<&Mongo>)"), "{bootstrap}");
+            // the sweep that makes `add mongodb` safe: nothing may still name the
+            // Diesel handle, and an event sink's own code must not look like one
+            assert!(!bootstrap.contains("Db"), "the Diesel handle survived: {bootstrap}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// TimescaleDB is the PostgreSQL capability with one migration on top: same
+    /// feature, same connection type, same adapter files. Only the migration and
+    /// the image differ, and this is what says so.
+    #[test]
+    fn timescaledb_is_postgres_plus_a_hypertable_migration() {
+        let root = fixture("timescale");
+        add(&root, Capability::Timescaledb, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"postgres\"]"), "the ORM feature is postgres's: {toml}");
+        let db = fs::read_to_string(root.join(DIESEL_DB)).unwrap();
+        assert!(db.contains("PgConnection"), "{db}");
+        assert!(db.contains("TimescaleDB"), "the docs must say which server this is for: {db}");
+        let repo = fs::read_to_string(root.join(DIESEL_REPO)).unwrap();
+        assert!(repo.contains(".on_conflict(users::id)"), "the PostgreSQL upsert: {repo}");
+
+        let dir = "migrations/2026-07-26-000000_create_users";
+        let up = fs::read_to_string(root.join(format!("{dir}/up.sql"))).unwrap();
+        assert!(up.contains("CREATE EXTENSION IF NOT EXISTS timescaledb;"), "{up}");
+        assert!(up.contains("create_hypertable('events', by_range('recorded_at'))"), "{up}");
+        // the users table is still the PostgreSQL one, byte for byte
+        assert!(up.contains("CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);"), "{up}");
+        // and the revert drops what the migration created, or the next `migration
+        // run` fails on a table that is already there
+        let down = fs::read_to_string(root.join(format!("{dir}/down.sql"))).unwrap();
+        assert!(down.contains("DROP TABLE events;") && down.contains("DROP TABLE users;"), "{down}");
+
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        assert!(compose.contains("image: timescale/timescaledb:"), "{compose}");
+        // the service keeps postgres's name, port and credentials: DATABASE_URL
+        // does not change when a project moves between the two
+        assert!(compose.contains("  postgres:") && compose.contains("\"5432:5432\""), "{compose}");
+        assert_eq!(Capability::Timescaledb.env()[0].1, Capability::Postgres.env()[0].1);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A rewrite to the bytes already on disk is not a change, and `--dry-run`
+    /// must not name a file it will leave alone: PostgreSQL's `CREATE TABLE` is
+    /// what the SQLite seed already says, and only TimescaleDB has a `down.sql`
+    /// of its own.
+    #[test]
+    fn only_the_migrations_that_actually_change_are_in_the_plan() {
+        for (tag, cap, up, down) in [
+            ("plan-pg", Capability::Postgres, false, false),
+            ("plan-mysql", Capability::Mysql, true, false),
+            ("plan-timescale", Capability::Timescaledb, true, true),
+        ] {
+            let root = fixture(tag);
+            let (_, edited) = add(&root, cap, true).unwrap();
+            let has = |f: &str| edited.iter().any(|e| e.ends_with(f));
+            assert_eq!(has("up.sql"), up, "{tag}: up.sql in {edited:?}");
+            assert_eq!(has("down.sql"), down, "{tag}: down.sql in {edited:?}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// TimescaleDB and PostgreSQL are one cargo feature, so they are one
+    /// capability as far as `add` is concerned — the same relationship mariadb
+    /// has with mysql, and it has to be refused the same way.
+    #[test]
+    fn timescaledb_and_postgres_are_the_same_capability() {
+        let err = check_combination(&[Capability::Postgres, Capability::Timescaledb])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the same capability"), "{err}");
+        assert!(err.contains("`postgres` cargo feature"), "{err}");
+
+        let root = fixture("timescale-on-pg");
+        add(&root, Capability::Postgres, false).unwrap();
+        let err = add(&root, Capability::Timescaledb, true).unwrap_err().to_string();
+        assert!(err.contains("capability 'timescaledb' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The slot rule through `--with`, where it has to fire *before* `new`
+    /// renders anything.
+    #[test]
+    fn with_more_than_one_event_sink_is_refused() {
+        let err = check_combination(&[Capability::Clickhouse, Capability::Influxdb])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most one event sink"), "{err}");
+        assert!(err.contains("clickhouse, influxdb"), "must name both: {err}");
+        // one of each slot, plus the two additive ones, is the arrangement that
+        // has to keep working
+        assert!(
+            check_combination(&[
+                Capability::Mongodb,
+                Capability::Redis,
+                Capability::S3,
+                Capability::Clickhouse
+            ])
+            .is_ok()
+        );
+        assert!(check_combination(&[Capability::Timescaledb, Capability::Influxdb]).is_ok());
+    }
+
     #[test]
     fn default_is_matched_by_line_not_by_substring() {
         // the commented line comes first, and is the state of nothing
         let manifest = "[features]\n# default = [\"mysql\"]\ndefault = [\"sqlite\", \"cache\"]\n";
         assert_eq!(parse_features(default_line(manifest).unwrap()), ["sqlite", "cache"]);
-        let out = enable_feature(manifest, "postgres", true).unwrap();
+        let out = enable_feature(manifest, "postgres", Some(Slot::Datastore)).unwrap();
         assert_eq!(out, "[features]\n# default = [\"mysql\"]\ndefault = [\"cache\", \"postgres\"]\n");
         // a cache is additive: the backend that is on stays on, and enabling a
         // feature that is already listed is a no-op rather than a duplicate
-        let out = enable_feature(manifest, "cache", false).unwrap();
+        let out = enable_feature(manifest, "cache", None).unwrap();
         assert_eq!(out, manifest, "already-enabled must be idempotent");
-        let out = enable_feature("[features]\ndefault = [\"sqlite\"]\n", "cache", false).unwrap();
+        let out = enable_feature("[features]\ndefault = [\"sqlite\"]\n", "cache", None).unwrap();
         assert_eq!(out, "[features]\ndefault = [\"sqlite\", \"cache\"]\n");
     }
 }

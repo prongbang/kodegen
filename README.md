@@ -7,7 +7,7 @@ switching their infrastructure capabilities.
 |---|---|
 | `kodegen new <name>` | Generate a project from a template |
 | `kodegen feature <name>` | Scaffold one feature across every layer and wire it up |
-| `kodegen add <capability>` | Add infrastructure: a datastore (postgres/mysql/mariadb/mongodb), a cache (redis) or object storage (s3) |
+| `kodegen add <capability>` | Add infrastructure: a datastore (postgres/mysql/mariadb/timescaledb/mongodb), a cache (redis), object storage (s3) or an event sink (clickhouse/influxdb) |
 | `kodegen list` | List built-in and cached templates |
 | `kodegen update <template>` | Re-clone a cached remote template |
 
@@ -103,28 +103,36 @@ later, not only on day one:
 kodegen add postgres                     # Diesel + PostgreSQL
 kodegen add mysql                        # Diesel + MySQL
 kodegen add mariadb                      # same driver as mysql, MariaDB image + docs
+kodegen add timescaledb                  # same driver as postgres, + a hypertable migration
 kodegen add mongodb                      # the same UserRepository, on the Mongo driver
 kodegen add redis                        # a Cache port + a Redis adapter (Valkey too)
 kodegen add s3                           # a BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
+kodegen add clickhouse                   # an EventSink port + a ClickHouse adapter
+kodegen add influxdb                     # the same port, over line protocol (Influx v2/v3, Greptime)
 kodegen add postgres --path ~/svc        # run from outside the project
 kodegen add postgres --dry-run           # show the plan, write nothing
 kodegen add --list                       # what's supported + what this project has on
 kodegen new svc --with postgres,redis,s3 # generate, then add, in one command
 ```
 
-| Capability | Kind | Port | Default adapter (no server) | Env |
+| Capability | Slot | Port | Default adapter (no server) | Env |
 |---|---|---|---|---|
-| `postgres` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
-| `mysql` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
-| `mariadb` | relational | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
-| `mongodb` | document | the existing `UserRepository` | in-memory repo | `MONGODB_URL` (+ `MONGODB_DB`) |
-| `redis` | cache | **`Cache`** (new) | in-memory cache | `REDIS_URL` |
-| `s3` | object storage | **`BlobStore`** (new) | files under `./data/blobs` | `S3_BUCKET` (+ endpoint/credentials) |
+| `postgres` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
+| `mysql` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
+| `mariadb` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
+| `timescaledb` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
+| `mongodb` | datastore | the existing `UserRepository` | in-memory repo | `MONGODB_URL` (+ `MONGODB_DB`) |
+| `redis` | — (additive) | **`Cache`** (new) | in-memory cache | `REDIS_URL` |
+| `s3` | — (additive) | **`BlobStore`** (new) | files under `./data/blobs` | `S3_BUCKET` (+ endpoint/credentials) |
+| `clickhouse` | event sink | **`EventSink`** (new) | the tracing log | `CLICKHOUSE_URL` (+ `_DB`/`_USER`/`_PASSWORD`) |
+| `influxdb` | event sink | **`EventSink`** (same) | the tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`/`_ORG`/`_TOKEN`) |
 
-`--with` takes at most one **datastore** — the three relational backends and
-`mongodb` are four adapters of the same `UserRepository`, so a second is rejected
-before `new` writes anything — but capabilities on different axes combine freely
-(`--with postgres,redis,s3`, `--with mongodb,redis,s3`).
+A **slot** holds exactly one adapter, so the capabilities in it are alternatives:
+the four relational backends and `mongodb` are all adapters of the same
+`UserRepository`, and `clickhouse`/`influxdb` are both adapters of the same
+`EventSink`. `--with` rejects a second occupant of either slot before `new`
+writes anything. Everything else combines freely — one datastore, one event sink,
+a cache and a blob store is a legal set (`--with mongodb,redis,s3,clickhouse`).
 
 `add postgres` rewrites the six things that actually differ between dialects:
 
@@ -132,7 +140,7 @@ before `new` writes anything — but capabilities on different axes combine free
 Cargo.toml                              default = ["sqlite"] -> ["postgres"]
 src/infrastructure/diesel_db.rs         SqliteConnection -> PgConnection (whole file replaced)
 src/infrastructure/diesel_repo.rs       save() -> the dialect's upsert; test module replaced
-migrations/*_create_users/up.sql        the dialect's CREATE TABLE
+migrations/*_create_users/up.sql        the dialect's CREATE TABLE (skipped when it is already what the file says — PostgreSQL's is)
 docker-compose.dev.yml                  a dev service with a healthcheck (created if absent)
 Dockerfile                              perl/make/cmake for the bundled C driver
 ```
@@ -150,12 +158,15 @@ than fail.
 
 Two rules the command enforces:
 
-- **One datastore per project.** The composition root builds a single handle
-  behind `UserRepository` — `Db` for the relational backends, `Mongo` for
-  MongoDB — so `add mysql` on top of `postgres`, or either on top of `mongodb`,
-  is refused with the steps to undo the first one, not applied halfway. `add
-  redis` and `add s3` are not datastores and are never caught by this rule.
-- **Adding the same capability twice** is an error, not a no-op rewrite.
+- **One occupant per slot.** The composition root builds a single handle behind
+  each port — `Db`/`Mongo` behind `UserRepository`, one client behind
+  `EventSink` — so `add mysql` on top of `postgres`, either on top of `mongodb`,
+  or `add influxdb` on top of `clickhouse`, is refused with the steps to undo the
+  first one, not applied halfway. `add redis` and `add s3` fill no slot and are
+  never caught by this rule.
+- **Adding the same capability twice** is an error, not a no-op rewrite. So is
+  adding two names for one cargo feature: `mariadb` after `mysql`, or
+  `timescaledb` after `postgres`.
 
 Two of those are replacements, not edits, so both are guarded: `diesel_db.rs`
 must still be byte-for-byte what `kodegen new` wrote, and `diesel_repo.rs` must
@@ -175,10 +186,40 @@ exactly as it would without the flag.
 
 MariaDB is not a separate adapter. It speaks the MySQL wire protocol, so it is
 the same driver, the same cargo feature and the same generated code — only the
-compose image and the wording differ. Valkey stands in the same relation to
-`redis`: same RESP protocol, same client, same generated Rust — swap the image
-in `docker-compose.dev.yml` and nothing else changes. So do MinIO and Ceph to
-`s3`: one API, one adapter, one endpoint variable.
+compose image and the wording differ. TimescaleDB stands in the same relation to
+`postgres` (an extension, not a different server — see below), Valkey to `redis`
+(same RESP protocol, same client, same generated Rust — swap the image in
+`docker-compose.dev.yml` and nothing else changes), MinIO and Ceph to `s3` (one
+API, one adapter, one endpoint variable), and GreptimeDB to `influxdb` (the same
+line protocol on a different path). Nine capabilities, six adapters.
+
+#### `add timescaledb`
+
+Not a fifth dialect either: TimescaleDB *is* PostgreSQL with an extension
+loaded, so `add timescaledb` writes the PostgreSQL capability — same
+`postgres` cargo feature, same `PgConnection`, same upsert, same
+`DATABASE_URL` — and adds the two things that are actually different:
+
+```
+migrations/*_create_users/up.sql        CREATE EXTENSION timescaledb + an example hypertable
+migrations/*_create_users/down.sql      drops the example table as well as users
+docker-compose.dev.yml                  timescale/timescaledb instead of postgres (same name, port, credentials)
+```
+
+The example `events` table is a hypertable — a normal table the extension
+partitions by time — and nothing in the generated Rust reads it: it is there to
+show what the extension is for, and to be replaced by your own measurement
+table. `CREATE EXTENSION` is the first statement in the migration because Diesel
+runs each migration inside one transaction and TimescaleDB requires it there.
+
+Moving an existing PostgreSQL project onto TimescaleDB is the image plus that
+migration; nothing in `src/` changes. That is also why there is no separate
+`timescaledb` cargo feature — and why `--with postgres,timescaledb` is refused as
+one capability named twice.
+
+An app-side `EventSink` (`add clickhouse` / `add influxdb`) is a different thing
+and can be added alongside: the hypertable is schema in *this* project's
+database, the event sink is a port to somebody else's.
 
 #### `add mongodb`
 
@@ -296,6 +337,97 @@ Three things worth knowing before you build on it:
 - **The bucket is not created for you.** `tests/blob.rs` creates it because a
   test may; the app assumes it exists, the way it assumes the database does.
 
+#### `add clickhouse` / `add influxdb`
+
+One port, two backends, and the only additive capability with a *slot*: the
+`EventSink` port has one adapter, so a project has ClickHouse or a time-series
+database, never both. Everything else about it is additive — either one sits
+next to any datastore, the cache and the blob store.
+
+```
+Cargo.toml                                  default = [...] gains "analytics" or "timeseries"
+src/domain/ports.rs                         the EventSink port + Event + check_event, appended
+src/domain/mod.rs                           pub use ports::{check_event, Event, EventSink};
+src/infrastructure/log_events.rs            default adapter — writes to the tracing log, no server
+src/infrastructure/clickhouse_events.rs     ClickHouse adapter        (add clickhouse)
+src/infrastructure/line_protocol_events.rs  line-protocol adapter     (add influxdb)
+src/api/mod.rs                              one `events` field on Services
+src/bootstrap.rs                            the client built once + a build_event_sink builder
+tests/events.rs                             the port's contract, run against both adapters
+docker-compose.dev.yml                      a clickhouse or influxdb service with a healthcheck
+```
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+CLICKHOUSE_URL=http://127.0.0.1:8123 CLICKHOUSE_DB=app \
+  CLICKHOUSE_USER=app CLICKHOUSE_PASSWORD=app cargo run
+# or
+INFLUX_URL=http://127.0.0.1:8086 INFLUX_BUCKET=app INFLUX_ORG=app \
+  INFLUX_TOKEN=kodegen-dev-token cargo run
+```
+
+**`influxdb` is three products.** InfluxDB v2, InfluxDB v3 and GreptimeDB all
+accept the same line protocol over the same kind of HTTP endpoint, so they are
+one adapter and the difference is `INFLUX_URL`:
+
+| Server | `INFLUX_URL` | Notes |
+|---|---|---|
+| InfluxDB v2 | `http://127.0.0.1:8086` | set `INFLUX_ORG`; `INFLUX_BUCKET` is the bucket |
+| InfluxDB v3 | `http://127.0.0.1:8181` | `INFLUX_BUCKET` is the database; org is ignored |
+| GreptimeDB | `http://127.0.0.1:4000/v1/influxdb` | `INFLUX_BUCKET` is the database; if auth is on, `INFLUX_TOKEN` is `<user>:<password>`, not a bare token |
+
+The composition root appends `/api/v2/write?bucket=…&precision=ns` to whatever
+you set, which is the whole reason the path is yours to choose. Swap the image in
+`docker-compose.dev.yml` and nothing in the generated Rust changes.
+
+What the port is, and is not:
+
+- **Write only.** There is no query method, deliberately: what you ask an
+  analytical store is not what you ask a time-series one, and a port that tried
+  to be both would be an interface nobody could implement twice. Query the store
+  directly from whatever needs to; this port is how the application *records*.
+- **Not fire-and-forget.** `write` awaits the round trip and returns the failure.
+  There is no queue, no retry and no backpressure behind it — one call is one
+  request. Batch and `tokio::spawn` if the caller must not wait; `let _ =
+  sink.write(..).await;` if it can afford to lose events. That is the caller's
+  decision to make, not the port's.
+- **One event = a name, a timestamp and `f64` fields.** No tags and no other
+  field types, because that is the shape both backends take honestly: line
+  protocol has tags and integers/booleans/strings, ClickHouse would need a `Map`
+  column and a schema decision. Put the dimension in the name
+  (`http.requests.checkout`) until a real requirement says otherwise.
+- **`check_event` runs in every adapter**, including the default one, and its
+  character rule (ASCII letters, digits and `_-./:`) is what lets the
+  line-protocol adapter skip escaping entirely — a comma or a space in a
+  measurement changes what the line *means*. A batch is validated as a whole
+  before anything is sent; once it is on the wire, an error says nothing about
+  how much of it landed.
+- **The default adapter is a log, not a store.** With no URL set, events go to
+  the tracing subscriber the service already installs and nothing is queryable.
+  That is the honest default for a port with no read path — an in-memory buffer
+  would grow without bound while looking like durability.
+- **Every write has a 5s budget.** Neither hyper nor the ClickHouse client has a
+  default timeout, so without one a sink that accepts the connection and then
+  says nothing holds the caller — and the request it is on — indefinitely. A
+  timeout is `Unavailable`, the same as a refused connection. (The `Cache` port's
+  Redis adapter is deliberately not wrapped this way: its connection manager is
+  unbounded too, but it owns its own reconnect loop and a cache call is not the
+  thing that must not hang.)
+- **Both adapters speak plain HTTP.** For a managed endpoint on https, put it
+  behind a TLS-terminating proxy, or turn on `clickhouse`'s `rustls-tls` feature
+  / swap the line-protocol adapter's `build_http()` for a `hyper-rustls`
+  connector. The line-protocol adapter is written on hyper rather than a client
+  crate precisely because `tonic` already puts hyper in the graph: it costs
+  `Cargo.lock` **nothing**, where `reqwest` would have cost 12 packages including
+  a QUIC stack.
+
+ClickHouse creates its `events` table on the first write (`CREATE TABLE IF NOT
+EXISTS … ENGINE = MergeTree`) — it is not the project's relational database, so
+there is no `migrations/` step for it. The table is one row per field, which is
+what keeps the row type a plain `derive(Row)`; a wide table is the right answer
+once you know your fields, and `clickhouse_events.rs` is where you would make
+that change.
+
 #### Why the dependency tree looks bigger than the build
 
 Every backend is declared as an **optional** dependency, and `add` only flips
@@ -326,6 +458,13 @@ still builds on the declared MSRV, so a `cargo update` cannot quietly hand
 someone a lock their toolchain refuses. Raising `rust-version` is what moves the
 SDK forward — and the lock costs 73 more entries with `blob` declared, none of
 them compiled until the feature is on.
+
+It is also what holds `clickhouse` at 0.13: 0.14 and 0.15 declare
+`rust-version = 1.89`, so the range in `Cargo.toml` is what keeps the declared
+MSRV honest rather than letting the resolver fall back to a version nobody on
+1.88 can build. The whole `analytics` capability costs 11 lock entries;
+`timeseries` costs **zero**, because it is `hyper`/`hyper-util`/`http-body-util`,
+which `tonic` already pulls in.
 
 ### Update a cached template
 

@@ -63,6 +63,19 @@ jobs:
       - name: Check blob feature
         run: cargo check --locked --features blob
 
+      # The two halves of the event-sink slot. `analytics` is the other MSRV
+      # check that matters: `clickhouse` is held at 0.13 because 0.14+ needs
+      # rustc 1.89 and this package declares 1.88, and only a real resolve says
+      # whether that is still true.
+      - name: Check analytics feature
+        run: cargo check --locked --features analytics
+
+      # `timeseries` adds no package to the lock at all — it names hyper,
+      # hyper-util and http-body-util, which tonic already pulls in. This is what
+      # notices if that stops being true.
+      - name: Check timeseries feature
+        run: cargo check --locked --features timeseries
+
   # Separate job: an advisory landing in RustSec is not a reason to hold up the
   # fmt/clippy/test signal, and vice versa. cargo-audit is run directly rather
   # than via rustsec/audit-check, which needs a write-scoped token to publish a

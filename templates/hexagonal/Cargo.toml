@@ -87,6 +87,27 @@ mongodb = { version = "3.8.0", default-features = false, features = [
     "rustls-tls",
     "dns-resolver",
 ], optional = true }
+# The official ClickHouse client, held at 0.13 **by MSRV**: 0.14 and 0.15 declare
+# `rust-version = 1.89`, and this package declares 1.88. With `resolver = "3"`
+# cargo would still pick 0.15 (it warns and falls back when no compatible version
+# exists in the range), so the range itself is what keeps that line honest.
+# Raising `rust-version` to 1.89 is all it takes to move to 0.15.
+clickhouse = { version = "0.13", optional = true }
+# The line-protocol sink posts text over HTTP, and the graph already contains a
+# full HTTP client: tonic's channel brings hyper + hyper-util + http-body-util in
+# unconditionally, so naming them here as direct dependencies adds **nothing** to
+# Cargo.lock. That is the whole reason this capability is not `reqwest` (+12
+# packages, including a QUIC stack) — the adapter is one POST.
+hyper = { version = "1", default-features = false, features = [
+    "client",
+    "http1",
+], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "client-legacy",
+    "http1",
+    "tokio",
+], optional = true }
+http-body-util = { version = "0.1", optional = true }
 
 # Which backend C driver gets compiled and linked. Optional dependencies are all
 # pinned in Cargo.lock whether or not their feature is on, so flipping `default`
@@ -118,6 +139,15 @@ cache = ["dep:redis"]
 # Also not a backend. `tokio/fs` is for the *default* adapter, which stores blobs
 # in a directory — the S3 SDK is only half of what `blob` turns on.
 blob = ["dep:aws-sdk-s3", "tokio/fs"]
+# The event sink, which is one port with two backends — so these two occupy one
+# slot the way `sqlite`/`postgres`/`mysql` occupy the datastore's, and at most one
+# is ever on. Named for the shape rather than the vendor for the usual reason:
+# `timeseries` is InfluxDB v2, InfluxDB v3 *and* GreptimeDB, which all accept the
+# same line protocol over the same kind of endpoint.
+# `tokio/sync` is for the `OnceCell` the ClickHouse adapter creates its table
+# through — the composition root is a plain `fn`, so the DDL cannot run there.
+analytics = ["dep:clickhouse", "tokio/sync"]
+timeseries = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

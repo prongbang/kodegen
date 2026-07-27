@@ -37,12 +37,22 @@ jobs:
   # C from source. It stays a full fmt/clippy/check/test job anyway — this is the
   # only place that compiles the adapter at all, and a cheaper job would prove
   # less than nothing.
+  #
+  # `timescaledb` is here even though its Rust output is postgres's byte for
+  # byte: what differs is the migration, and `cargo test` runs it only when
+  # DATABASE_URL is set — so this job is a typo check on the SQL constants and
+  # nothing more. The migration itself is proven against a real server locally
+  # (`CREATE EXTENSION` inside Diesel's transaction, then `create_hypertable`).
+  #
+  # `clickhouse` and `influxdb` are both listed because they are the two halves
+  # of one slot: only one of them can ever be compiled in a single project, so a
+  # job per capability is the only way either adapter is compiled at all.
   generated:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        capability: [postgres, mysql, mongodb, redis, s3]
+        capability: [postgres, mysql, timescaledb, mongodb, redis, s3, clickhouse, influxdb]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -50,12 +60,13 @@ jobs:
           components: rustfmt, clippy
       # the generated projects are built outside this workspace, so their target
       # dirs are cached only if the action is told where they are
+      # demo-with is not listed: nothing compiles it — the `new --with` step
+      # below only proves the command produces the same tree in one go
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             .
             ${{ runner.temp }}/demo
-            ${{ runner.temp }}/demo-with
 
       # the generated project's build.rs compiles its .proto files
       - name: Install protoc
@@ -95,20 +106,42 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: ${{ runner.temp }}/demo
 
+      # The one adapter with no server anywhere else in this file: the
+      # generated-all job below runs clickhouse (the event sink whose write can
+      # be counted back out), so without this the line-protocol adapter is only
+      # ever compiled. Booted from the compose file `add influxdb` just wrote,
+      # which makes this a check on that file too. `--wait` blocks on its
+      # healthcheck; the variables go into the environment only on this branch,
+      # so every other capability's Test step still runs with none of them set.
+      - name: Boot the time-series server the compose file generated
+        if: matrix.capability == 'influxdb'
+        working-directory: ${{ runner.temp }}/demo
+        run: |
+          docker compose -f docker-compose.dev.yml up -d --wait
+          {
+            echo "INFLUX_URL=http://127.0.0.1:8086"
+            echo "INFLUX_BUCKET=app"
+            echo "INFLUX_ORG=app"
+            echo "INFLUX_TOKEN=kodegen-dev-token"
+          } >> "$GITHUB_ENV"
+
       # no `cargo check` step: `clippy --all-targets` above already type-checks
       # everything `check` would, and compiling the AWS SDK twice is minutes.
       #
       # no DATABASE_URL and no REDIS_URL, so the adapter tests skip themselves
       # and the in-memory adapters are what run — the promise that a generated
-      # project is green without a server
+      # project is green without a server. The influxdb row is the exception, and
+      # deliberately so: the step above sets INFLUX_* for it, so there the
+      # line-protocol adapter runs against a real server instead of skipping.
       - name: Test
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo
 
-  # One job with every capability on at once. Two things only exist here: cargo
-  # feature unification across the whole optional-dependency set, and two
-  # independent `add`s writing into the same `Services` literal and the same
-  # compose file. Neither is visible from a per-capability job.
+  # One job with one occupant of every slot plus both additive capabilities. Two
+  # things only exist here: cargo feature unification across the whole
+  # optional-dependency set, and four independent `add`s writing into the same
+  # `Services` literal and the same compose file. Neither is visible from a
+  # per-capability job.
   #
   # It is also the only job that puts a real server behind an adapter — the
   # matrix above proves a generated project is green *without* one, which is a
@@ -157,6 +190,30 @@ jobs:
           RUSTFS_SECRET_KEY: rustfsadmin
         ports:
           - 9000:9000
+      # The event sink here is clickhouse, not influxdb, for the same reason the
+      # datastore is mongodb: one of the two has to be picked (they share a slot),
+      # and this is the one whose write can be *verified* rather than only
+      # acknowledged — `tests/events.rs` counts the rows back out. influxdb is
+      # proven at compile time in the matrix above and against a real server
+      # locally (a 2xx from /api/v2/write, which the adapter turns into the only
+      # `Ok` it can return).
+      #
+      # The credentials are not optional: since 25.x the image refuses to leave
+      # its `default` user without a password.
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.3-alpine
+        env:
+          CLICKHOUSE_DB: app
+          CLICKHOUSE_USER: app
+          CLICKHOUSE_PASSWORD: app
+        ports:
+          - 8123:8123
+        options: >-
+          --ulimit nofile=262144:262144
+          --health-cmd "wget --spider -q http://127.0.0.1:8123/ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -182,7 +239,7 @@ jobs:
           echo "rustfs did not come up"; exit 1
 
       - name: Generate with every capability on
-        run: cargo run --locked -- new demo-all --with mongodb,redis,s3 --output "$RUNNER_TEMP"
+        run: cargo run --locked -- new demo-all --with mongodb,redis,s3,clickhouse --output "$RUNNER_TEMP"
 
       - name: Format check
         run: cargo fmt --check
@@ -198,7 +255,7 @@ jobs:
       # repository here. Nothing needs seeding first: the blob test creates its
       # own bucket, and the Mongo tests upsert. Re-running the job against a
       # database a previous run left non-empty is green for the same reason.
-      - name: Test against a live datastore, cache and object store
+      - name: Test against a live datastore, cache, object store and event sink
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo-all
         env:
@@ -209,3 +266,7 @@ jobs:
           S3_ENDPOINT: http://127.0.0.1:9000
           AWS_ACCESS_KEY_ID: rustfsadmin
           AWS_SECRET_ACCESS_KEY: rustfsadmin
+          CLICKHOUSE_URL: http://127.0.0.1:8123
+          CLICKHOUSE_DB: app
+          CLICKHOUSE_USER: app
+          CLICKHOUSE_PASSWORD: app
