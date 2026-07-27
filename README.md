@@ -28,6 +28,10 @@ kodegen new my-service -t https://gitlab.com/x/y.git
 kodegen new my-service -t /path/to/local/template
 ```
 
+Building a project generated from the `hexagonal` template needs `protoc`
+(`brew install protobuf` / `apt-get install protobuf-compiler`) — its
+`build.rs` compiles the `.proto` files.
+
 Template resolution order for `-t`:
 
 1. A directory name under `templates/` (built into the binary — works offline)

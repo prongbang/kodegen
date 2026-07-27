@@ -5,12 +5,14 @@ This project follows a **Hexagonal/Clean Architecture** with a clear composition
 
 ```
 src/
- ├─ main.rs            # entrypoint (runtime & serve)
- ├─ bootstrap.rs       # composition root (wiring)
- ├─ api/               # delivery/HTTP layer (Axum)
- ├─ application/       # use-cases (orchestration)
+ ├─ main.rs            # entrypoint (HTTP; also serves gRPC when GRPC_PORT is set)
+ ├─ bootstrap.rs       # composition root (one builder per feature + grpc_routes)
+ ├─ api/               # delivery layer: one module per feature —
+ │                     #   <feature>.rs (axum routes) or <feature>_grpc.rs (tonic adapter)
+ ├─ application/       # use-cases, one module per feature
  ├─ domain/            # core business + ports (traits)
  └─ infrastructure/    # adapters (DB, cache, clients, etc.)
+proto/                 # protobuf definitions — every file here is compiled by build.rs
 ```
 
 ## Quick Start
@@ -18,17 +20,16 @@ src/
 ### Prerequisites
 
 - Rust (stable, edition 2021).
-- `protoc` — required for local builds because `build.rs` compiles `proto/greeter.proto` via `tonic-prost-build`.
+- `protoc` — required for local builds because `build.rs` compiles every `.proto` in `proto/` via `tonic-prost-build`.
   - macOS: `brew install protobuf`
   - Debian/Ubuntu: `apt-get install protobuf-compiler`
 
 ### Run
 
 ```bash
-cargo run
+cargo run                       # HTTP on 0.0.0.0:$PORT (default 8080)
+GRPC_PORT=50052 cargo run       # + inbound gRPC features on 0.0.0.0:50052
 ```
-
-Starts the HTTP server on `0.0.0.0:$PORT` (default `8080`).
 
 ### Test
 
@@ -88,7 +89,7 @@ curl localhost:8080/hello/world
 - The underlying tonic `Channel` is wrapped with a tower `BreakerLayer` (`src/infrastructure/circuit_breaker.rs`), backed by [`recloser`](https://docs.rs/recloser). The default breaker (`default_breaker()`) opens once ≥50% of the last 100 calls fail, and after a 30s cooldown allows a half-open trial call through.
 - The tonic `Endpoint` is configured with a 2s connect timeout and a 5s request timeout (`GrpcGreeter::connect_lazy`).
 - When the circuit is open, calls are rejected before hitting the network and mapped to `DomainError::Unavailable`; the same mapping applies to genuine gRPC `Unavailable`/`DeadlineExceeded` statuses. The `api` layer turns `DomainError::Unavailable` into HTTP `503`.
-- Swapping the greeter implementation or tuning the breaker/timeouts only touches `bootstrap.rs` (`build_services()`) — `domain` and `api` stay unaware of gRPC/recloser.
+- Swapping the greeter implementation or tuning the breaker/timeouts only touches `bootstrap.rs` (`build_greeter()`) — `domain` and `api` stay unaware of gRPC/recloser.
 
 ## Benchmarks
 
@@ -111,19 +112,21 @@ Allocations per request (`alloc_bench`):
 
 ### `main.rs` — Entrypoint
 - Starts the runtime (logging/tracing/Tokio).
-- Binds the TCP listener and calls `axum::serve`.
+- Binds the TCP listener and calls `axum::serve`; when `GRPC_PORT` is set it also spawns a tonic server with `bootstrap::grpc_routes(&services)`.
 - Contains no business logic or wiring details.
 
 ### `bootstrap.rs` — Composition Root
 - Builds concrete adapters (e.g., Diesel/SQLite vs. in-memory), services, and the HTTP router/state.
+- `build_services_from_env()` resolves shared resources once (e.g. the `Db` pool from `DATABASE_URL`), then one `build_<feature>_service(db)` builder per feature picks its adapter — adding a feature adds one builder and one `Services` field, nothing multiplies.
+- `grpc_routes(&services)` collects inbound tonic services (one `.add_service(...)` per gRPC feature); `main.rs` serves it when `GRPC_PORT` is set.
 - The only module allowed to import **everything** (api + application + domain + infra).
 - Great place to switch implementations by config/env/feature flags.
 - Tests build on top of it: call `bootstrap::build_services()` to get real defaults (in-memory repo, `GrpcGreeter`), then swap in a fake port implementation before passing the services to `api::router()`. See `tests/api.rs` (`FakeGreeter`) for the pattern. One test also asserts the response JSON's exact key set (`["id", "name"]`) as a trip-wire: if the domain `User` gains a field, that assertion fails instead of silently widening the public API — the fix is a response DTO, not loosening the test.
 
-### `api/` — Delivery/HTTP Layer
-- Axum routes and handlers (HTTP ⇄ DTOs).
+### `api/` — Delivery Layer
+- One module per feature: `<feature>.rs` holds that feature's axum `routes()` + handlers; `<feature>_grpc.rs` holds a tonic adapter registered in `bootstrap::grpc_routes`. `mod.rs` just owns `Services` and assembles `router()` from `.merge(<feature>::routes())` lines.
 - Handlers pull only the dependencies they need via `State<…>` (often with `FromRef`).
-- Maps domain/application errors into HTTP status codes.
+- Maps domain/application errors into HTTP status codes (`to_http_err`) or gRPC `Status` (`to_status` in each `*_grpc.rs`).
 - No database or business rules here.
 
 ### `application/` — Use‑Cases
@@ -161,6 +164,8 @@ bootstrap depends on all to assemble the app
 
 `POST /users` → `api` handler → `application` use‑case → domain validation → call `UserRepository` (port) → `infrastructure` repository hits DB → result mapped back to HTTP.
 
+A gRPC feature is the same flow with a different first hop: `Create` RPC → `api/<feature>_grpc.rs` adapter → the **same** `application` use-case; errors map to `tonic::Status` instead of HTTP codes.
+
 ## Adding a Feature
 
 If this project was generated with [kodegen](https://github.com/prongbang/kodegen), the whole
@@ -177,7 +182,7 @@ Manually, follow the dependency direction, inside out. Example: `orders`.
 2. **`application/orders.rs`** — define `OrderService` (trait) + `OrderServiceImpl` (impl over the port). Register in `application/mod.rs`: `pub mod orders;` + re-export.
 3. **`infrastructure/`** — implement the port: `orders_repo.rs` (start in-memory; a Diesel one reuses `Db` by cloning it). Register in `infrastructure/mod.rs`.
 4. **`api/orders.rs`** — handlers + a `OrderSvc(Arc<dyn OrderService>)` wrapper with `FromRef<Services>` + its own `routes()`. Then in `api/mod.rs`: add `pub mod orders;`, one `order` field on `Services`, and one `.merge(orders::routes())` in `router()` (or `.nest("/orders", …)` for a prefix).
-5. **`bootstrap.rs`** — add a `build_order_service(db: Option<&Db>)` builder (picks the adapter, reuses the pool via `db.clone()`) and set the new field in `build_router()`/`build_services()`.
+5. **`bootstrap.rs`** — add a `build_order_service(db: Option<&Db>)` builder (picks the adapter, reuses the pool via `db.clone()`) and set the new field in `build_services_from_env()`/`build_services()`. For a gRPC feature, also add `.add_service(...)` in `grpc_routes()`.
 6. **`tests/`** — hit the new routes through `bootstrap::build_services()`, swapping in a fake port impl where needed (see `FakeGreeter` in `tests/api.rs`).
 
 Each step touches one file per layer; nothing existing changes shape — `Services` gains a field, `router()` gains routes, everything else is new files.
@@ -199,15 +204,19 @@ greeter/circuit-breaker wiring, `PORT`/`GREETER_ADDR` env handling, and graceful
 ```rust
 // bootstrap.rs
 pub fn build_router() -> axum::Router {
+    api::router(build_services_from_env())
+}
+
+pub fn build_services_from_env() -> api::Services {
     // shared resources are resolved once; each feature builder picks its adapter
     let db = std::env::var("DATABASE_URL")
         .ok()
         .map(|url| Db::new(build_pool(&url).expect("diesel pool init failed")));
 
-    api::router(api::Services {
+    api::Services {
         user: build_user_service(db.as_ref()),
         greeter: build_greeter(),
-    })
+    }
 }
 
 // one builder per feature: picks Diesel when a Db is available, in-memory otherwise
