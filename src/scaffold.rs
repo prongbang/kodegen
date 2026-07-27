@@ -15,7 +15,16 @@ pub enum Transport {
     Grpc,
 }
 
-pub fn add_feature(project: &Path, name: &str, transport: Transport) -> Result<()> {
+/// Computes the whole change in memory first (rendering every new file and
+/// applying every edit, which is what validates the anchors), then writes it in
+/// one phase at the end — so `dry_run` is the same code path minus the writes.
+/// Returns the plan as (files created, files edited) for the caller to report.
+pub fn add_feature(
+    project: &Path,
+    name: &str,
+    transport: Transport,
+    dry_run: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
     validate_feature_name(name)?;
     let crate_name = crate::package_name(project)
         .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
@@ -34,12 +43,6 @@ pub fn add_feature(project: &Path, name: &str, transport: Transport) -> Result<(
             .into());
         }
     }
-    for existing in [format!("src/api/{name}.rs"), format!("src/api/{name}_grpc.rs")] {
-        if project.join(&existing).exists() {
-            return Err(format!("feature '{name}' already exists ({existing})").into());
-        }
-    }
-
     let pascal = pascal_case(name);
     let render = |tpl: &str| {
         tpl.replace("{{feature}}", name)
@@ -49,91 +52,112 @@ pub fn add_feature(project: &Path, name: &str, transport: Transport) -> Result<(
 
     // new files, one per layer (+ an integration test); domain, application and
     // infrastructure are transport-agnostic — only the delivery adapter differs
-    fs::write(project.join(format!("src/domain/{name}.rs")), render(DOMAIN_TPL))?;
-    fs::write(project.join(format!("src/application/{name}.rs")), render(APPLICATION_TPL))?;
-    fs::write(project.join(format!("src/infrastructure/{name}_repo.rs")), render(REPO_TPL))?;
-    fs::create_dir_all(project.join("tests"))?;
+    let mut creates = vec![
+        (format!("src/domain/{name}.rs"), render(DOMAIN_TPL)),
+        (format!("src/application/{name}.rs"), render(APPLICATION_TPL)),
+        (format!("src/infrastructure/{name}_repo.rs"), render(REPO_TPL)),
+    ];
     match transport {
         Transport::Rest => {
-            fs::write(project.join(format!("src/api/{name}.rs")), render(API_TPL))?;
-            fs::write(project.join(format!("tests/{name}.rs")), render(TEST_TPL))?;
+            creates.push((format!("src/api/{name}.rs"), render(API_TPL)));
+            creates.push((format!("tests/{name}.rs"), render(TEST_TPL)));
         }
         Transport::Grpc => {
-            fs::write(project.join(format!("proto/{name}.proto")), render(PROTO_TPL))?;
-            fs::write(project.join(format!("src/api/{name}_grpc.rs")), render(API_GRPC_TPL))?;
-            fs::write(project.join(format!("tests/{name}.rs")), render(TEST_GRPC_TPL))?;
+            creates.push((format!("proto/{name}.proto"), render(PROTO_TPL)));
+            creates.push((format!("src/api/{name}_grpc.rs"), render(API_GRPC_TPL)));
+            creates.push((format!("tests/{name}.rs"), render(TEST_GRPC_TPL)));
         }
+    }
+
+    // the write phase overwrites blindly, so nothing in `creates` may exist yet —
+    // this is what stops `kodegen feature api` from clobbering tests/api.rs
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(format!("feature '{name}' already exists ({rel})").into());
     }
 
     // registrations
-    edit(project, "src/domain/mod.rs", |c| {
-        Ok(format!("{c}\npub mod {name};\npub use {name}::{{{pascal}, {pascal}Repository}};\n"))
-    })?;
-    edit(project, "src/application/mod.rs", |c| {
-        Ok(format!("{c}\npub mod {name};\npub use {name}::{{{pascal}Service, {pascal}ServiceImpl}};\n"))
-    })?;
-    edit(project, "src/infrastructure/mod.rs", |c| {
-        Ok(format!("{c}\npub mod {name}_repo;\n"))
-    })?;
-    edit(project, "src/api/mod.rs", |c| {
-        let c = match transport {
-            Transport::Rest => {
-                let c = insert_pub_mod(&c, name)?;
-                insert_before_line(
-                    &c,
-                    ".with_state(services)",
-                    &format!("        .merge({name}::routes())"),
-                )?
-            }
-            Transport::Grpc => insert_pub_mod(&c, &format!("{name}_grpc"))?,
-        };
-        insert_after_line(
-            &c,
-            "pub struct Services {",
-            &format!("    pub {name}: Arc<dyn crate::application::{pascal}Service>,"),
-        )
-    })?;
-    edit(project, "src/bootstrap.rs", |c| {
-        let c = insert_after_line(
-            &c,
-            "user: build_user_service(db.as_ref()),",
-            &format!("        {name}: build_{name}_service(db.as_ref()),"),
-        )?;
-        let mut c = insert_after_line(
-            &c,
-            "user: build_user_service(None),",
-            &format!("        {name}: build_{name}_service(None),"),
-        )?;
-        if transport == Transport::Grpc {
-            c = insert_before_line(
+    let edits = vec![
+        edit(project, "src/domain/mod.rs", |c| {
+            Ok(format!("{c}\npub mod {name};\npub use {name}::{{{pascal}, {pascal}Repository}};\n"))
+        })?,
+        edit(project, "src/application/mod.rs", |c| {
+            Ok(format!("{c}\npub mod {name};\npub use {name}::{{{pascal}Service, {pascal}ServiceImpl}};\n"))
+        })?,
+        edit(project, "src/infrastructure/mod.rs", |c| {
+            Ok(format!("{c}\npub mod {name}_repo;\n"))
+        })?,
+        edit(project, "src/api/mod.rs", |c| {
+            let c = match transport {
+                Transport::Rest => {
+                    let c = insert_pub_mod(&c, name)?;
+                    insert_before_line(
+                        &c,
+                        ".with_state(services)",
+                        &format!("        .merge({name}::routes())"),
+                    )?
+                }
+                Transport::Grpc => insert_pub_mod(&c, &format!("{name}_grpc"))?,
+            };
+            insert_after_line(
                 &c,
-                "routes.routes()",
-                &format!(
-                    "    routes.add_service(crate::api::{name}_grpc::server(services.{name}.clone()));"
-                ),
+                "pub struct Services {",
+                &format!("    pub {name}: Arc<dyn crate::application::{pascal}Service>,"),
+            )
+        })?,
+        edit(project, "src/bootstrap.rs", |c| {
+            let c = insert_after_line(
+                &c,
+                "user: build_user_service(db.as_ref()),",
+                &format!("        {name}: build_{name}_service(db.as_ref()),"),
             )?;
-        }
-        Ok(format!("{c}\n{}", render(BOOTSTRAP_TPL)))
-    })?;
+            let mut c = insert_after_line(
+                &c,
+                "user: build_user_service(None),",
+                &format!("        {name}: build_{name}_service(None),"),
+            )?;
+            if transport == Transport::Grpc {
+                c = insert_before_line(
+                    &c,
+                    "routes.routes()",
+                    &format!(
+                        "    routes.add_service(crate::api::{name}_grpc::server(services.{name}.clone()));"
+                    ),
+                )?;
+            }
+            Ok(format!("{c}\n{}", render(BOOTSTRAP_TPL)))
+        })?,
+    ];
 
-    // scaffolded line widths vary with the feature name; let rustfmt settle them
-    let fmt_ok = Command::new("cargo")
-        .arg("fmt")
-        .current_dir(project)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !fmt_ok {
-        eprintln!("warning: `cargo fmt` failed — run it manually before committing");
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    // everything above is pure, so this is the only side effect — dry-run skips it
+    // wholesale and reports the very same plan
+    if !dry_run {
+        for (rel, content) in creates.iter().chain(&edits) {
+            let path = project.join(rel);
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(path, content)?;
+        }
+
+        // scaffolded line widths vary with the feature name; let rustfmt settle them
+        let fmt_ok = Command::new("cargo")
+            .arg("fmt")
+            .current_dir(project)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !fmt_ok {
+            eprintln!("warning: `cargo fmt` failed — run it manually before committing");
+        }
     }
-    Ok(())
+    Ok((paths(&creates), paths(&edits)))
 }
 
-fn edit(project: &Path, rel: &str, f: impl FnOnce(String) -> Result<String>) -> Result<()> {
-    let path = project.join(rel);
-    let content = fs::read_to_string(&path)?;
-    fs::write(&path, f(content).map_err(|e| format!("{rel}: {e}"))?)?;
-    Ok(())
+/// Applies `f` to `rel`'s current content in memory (this is where anchors are
+/// checked) and returns the pending write.
+fn edit(project: &Path, rel: &str, f: impl FnOnce(String) -> Result<String>) -> Result<(String, String)> {
+    let content = fs::read_to_string(project.join(rel)).map_err(|e| format!("{rel}: {e}"))?;
+    Ok((rel.to_string(), f(content).map_err(|e| format!("{rel}: {e}"))?))
 }
 
 fn anchor_err(anchor: &str) -> String {
@@ -187,6 +211,9 @@ pub fn pascal_case(s: &str) -> String {
 }
 
 fn validate_feature_name(name: &str) -> Result<()> {
+    // Rust keywords would not compile as a module name — and "mod" is doing extra
+    // work here: `kodegen feature mod` would generate src/domain/mod.rs and friends
+    // right on top of the layer mod files this scaffolder edits.
     const KEYWORDS: &[&str] = &[
         "as", "async", "await", "box", "break", "const", "continue", "crate", "dyn", "else",
         "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
@@ -548,6 +575,101 @@ mod tests {
         assert!(validate_feature_name("Order").is_err());
         assert!(validate_feature_name("order-item").is_err());
         assert!(validate_feature_name("type").is_err());
+    }
+
+    /// Smallest tree that carries every anchor `add_feature` looks for.
+    fn fixture(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("kodegen-scaffold-{tag}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        // edition included so the `cargo fmt` a real run shells out to stays quiet
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo-svc\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        for layer in ["domain", "application", "infrastructure"] {
+            fs::create_dir_all(root.join("src").join(layer)).unwrap();
+            fs::write(root.join(format!("src/{layer}/mod.rs")), "pub mod user;\n").unwrap();
+        }
+        fs::create_dir_all(root.join("src/api")).unwrap();
+        fs::write(
+            root.join("src/api/mod.rs"),
+            "pub mod user;\n\npub struct Services {\n    pub user: Arc<dyn crate::application::UserService>,\n}\n\nfn router(services: Services) -> Router {\n    Router::new()\n        .with_state(services)\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/bootstrap.rs"),
+            "fn a() -> Services {\n    Services {\n        user: build_user_service(db.as_ref()),\n    }\n}\nfn b() -> Services {\n    Services {\n        user: build_user_service(None),\n    }\n}\nfn c() {\n    routes.routes()\n}\n",
+        )
+        .unwrap();
+        root
+    }
+
+    fn snapshot(root: &Path) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for e in fs::read_dir(dir).unwrap().flatten() {
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(e.path());
+                } else {
+                    let rel = e.path().strip_prefix(root).unwrap().display().to_string();
+                    out.push((rel, fs::read_to_string(e.path()).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn dry_run_writes_nothing() {
+        for (tag, transport) in [("rest", Transport::Rest), ("grpc", Transport::Grpc)] {
+            let root = fixture(tag);
+            let before = snapshot(&root);
+            add_feature(&root, "order", transport, true).unwrap();
+            assert_eq!(before, snapshot(&root), "{tag}: dry run touched the tree");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn dry_run_plan_matches_what_a_real_run_creates() {
+        let root = fixture("plan");
+        let before: Vec<String> = snapshot(&root).into_iter().map(|(rel, _)| rel).collect();
+        let planned = add_feature(&root, "order", Transport::Rest, true).unwrap();
+        assert_eq!(planned, add_feature(&root, "order", Transport::Rest, false).unwrap());
+
+        let mut appeared: Vec<String> = snapshot(&root)
+            .into_iter()
+            .map(|(rel, _)| rel)
+            .filter(|rel| !before.contains(rel))
+            .collect();
+        appeared.sort();
+        let mut promised = planned.0;
+        promised.sort();
+        assert_eq!(appeared, promised);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_overwrite_an_existing_file() {
+        let root = fixture("collide");
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(root.join("tests/api.rs"), "// hand-written\n").unwrap();
+        let err = add_feature(&root, "api", Transport::Rest, true).unwrap_err().to_string();
+        assert!(err.contains("already exists (tests/api.rs)"), "unexpected error: {err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn dry_run_still_validates_anchors() {
+        let root = fixture("no-anchor");
+        fs::write(root.join("src/bootstrap.rs"), "fn nothing() {}\n").unwrap();
+        let err = add_feature(&root, "order", Transport::Rest, true).unwrap_err().to_string();
+        assert!(err.contains("anchor"), "unexpected error: {err}");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

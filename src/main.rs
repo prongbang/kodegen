@@ -44,6 +44,14 @@ enum Cmd {
         /// Project root
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
+        /// Print what would be created and wired, without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Re-clone a cached template (registry name, owner/repo, or git URL)
+    Update {
+        /// Template to refresh in ~/.kodegen/templates
+        template: String,
     },
     /// List registry and cached templates
     List,
@@ -75,23 +83,36 @@ fn main() -> Result<()> {
             println!("Created {} from template '{template}'", dest.display());
             println!("  cd {name} && cargo run");
         }
-        Cmd::Feature { name, transport, path } => {
-            scaffold::add_feature(&path, &name, transport)?;
-            let delivery = match transport {
-                scaffold::Transport::Rest => format!("src/api/{name}.rs"),
-                scaffold::Transport::Grpc => format!("proto/{name}.proto + src/api/{name}_grpc.rs"),
-            };
-            println!("Added feature '{name}':");
-            for f in [
-                format!("src/domain/{name}.rs"),
-                format!("src/application/{name}.rs"),
-                format!("src/infrastructure/{name}_repo.rs"),
-                delivery,
-                format!("tests/{name}.rs"),
-            ] {
+        Cmd::Update { template } => {
+            let (_, cached) = remote_target(&template)?;
+            // a failed removal would leave resolve_template reusing the stale clone
+            // and us reporting a refresh that never happened
+            if let Err(e) = fs::remove_dir_all(&cached) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("cannot remove cached {}: {e}", cached.display()).into());
+                }
+            }
+            resolve_template(&template)?;
+            println!("Updated {}", cached.display());
+        }
+        Cmd::Feature { name, transport, path, dry_run } => {
+            // the plan is reported from what add_feature actually computed, so
+            // --dry-run and a real run can never drift apart
+            let (created, edited) = scaffold::add_feature(&path, &name, transport, dry_run)?;
+            if dry_run {
+                println!("Dry run — feature '{name}' would be scaffolded, nothing written:");
+            } else {
+                println!("Added feature '{name}':");
+            }
+            for f in created {
                 println!("  + {f}");
             }
-            println!("  ~ wired into api/mod.rs, bootstrap.rs and layer mod files");
+            for f in edited {
+                println!("  ~ {f}");
+            }
+            if dry_run {
+                return Ok(());
+            }
             match transport {
                 scaffold::Transport::Rest => {
                     println!("Routes: POST /{name}, GET /{name}/{{id}} — run `cargo test` to verify")
@@ -129,22 +150,7 @@ fn resolve_template(template: &str) -> Result<PathBuf> {
         return Ok(as_path.to_path_buf());
     }
 
-    let url = if template.contains("://") || template.starts_with("git@") {
-        template.to_string()
-    } else if template.contains('/') {
-        format!("https://github.com/{template}")
-    } else {
-        return Err(format!("unknown template '{template}' (try `kodegen list`, owner/repo, or a git URL)").into());
-    };
-
-    let cache_name = url
-        .trim_end_matches(".git")
-        .rsplit(['/', ':'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("cannot derive a template name from '{url}'"))?
-        .to_string();
-    let cached = cache_root()?.join(&cache_name);
+    let (url, cached) = remote_target(template)?;
     if cached.is_dir() {
         return Ok(cached);
     }
@@ -162,6 +168,37 @@ fn resolve_template(template: &str) -> Result<PathBuf> {
     }
     let _ = fs::remove_dir_all(cached.join(".git"));
     Ok(cached)
+}
+
+/// Clone URL + cache directory for a remote template. Built-in names and local
+/// paths have no cache, so they are an error here (`resolve_template` handles
+/// them before it gets this far).
+fn remote_target(template: &str) -> Result<(String, PathBuf)> {
+    if TEMPLATES.get_dir(template).is_some() {
+        return Err(format!("'{template}' is a built-in template — it ships with the binary, nothing to update").into());
+    }
+    if Path::new(template).is_dir() {
+        return Err(format!("'{template}' is a local path — it is used in place, nothing to update").into());
+    }
+    let url = if template.contains("://") || template.starts_with("git@") {
+        template.to_string()
+    } else if template.contains('/') {
+        format!("https://github.com/{template}")
+    } else {
+        return Err(format!("unknown template '{template}' (try `kodegen list`, owner/repo, or a git URL)").into());
+    };
+
+    // "." / ".." would escape the cache root — `update owner/..` must not be able
+    // to point remove_dir_all at ~/.kodegen itself
+    let cache_name = url
+        .strip_suffix(".git")
+        .unwrap_or(&url)
+        .rsplit(['/', ':'])
+        .next()
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .ok_or_else(|| format!("cannot derive a template name from '{url}'"))?;
+    let cached = cache_root()?.join(cache_name);
+    Ok((url, cached))
 }
 
 /// Replacements applied to file names and contents:

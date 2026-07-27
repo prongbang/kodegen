@@ -37,14 +37,13 @@ Template resolution order for `-t`:
 1. A directory name under `templates/` (built into the binary — works offline)
 2. An existing local path
 3. `owner/repo` shorthand or a full git URL — cloned once into
-   `~/.kodegen/templates/` and reused from there (delete the cached copy to
-   refresh)
+   `~/.kodegen/templates/` and reused from there (`kodegen update` re-clones it)
 
 No placeholders required: kodegen reads the template's own package name from
 its `Cargo.toml` and rewrites it (kebab **and** snake case) to the new project
 name across file contents, file names, and `Cargo.lock`. `{{project_name}}` /
 `{{crate_name}}` placeholders are also supported for dedicated template repos.
-`.git`, and `target` are never copied.
+`.git` and `target` are never copied.
 
 ### Scaffold a feature
 
@@ -53,6 +52,7 @@ Inside a project generated from the `hexagonal` template:
 ```bash
 kodegen feature order                    # REST (default): POST /order, GET /order/{id}
 kodegen feature payment --transport grpc # tonic service: payment.PaymentApi Create/Get
+kodegen feature order --dry-run          # show the plan, write nothing
 cargo test                               # both come with a passing integration test
 ```
 
@@ -78,6 +78,22 @@ Feature names are snake_case (`order`, `order_item`). Wiring is anchor-based
 against the template's structure; if the project has diverged the command
 fails with a pointer to the template README's "Adding a Feature" checklist
 instead of guessing.
+
+`--dry-run` prints the files that would be created (`+`) and the wiring files
+that would be edited (`~`), then stops before writing anything (`cargo fmt`
+included). It is the same code path as a real run — the whole change is
+computed in memory first — so every anchor is still checked and a diverged
+project fails exactly as it would without the flag.
+
+### Update a cached template
+
+```bash
+kodegen update prongbang/hexagonal-rs    # drop the cached clone and re-clone it
+kodegen update https://gitlab.com/x/y.git
+```
+
+Built-in templates ship inside the binary and local paths are used in place —
+neither has a cache, so `update` reports that instead of doing nothing.
 
 ### List templates
 
