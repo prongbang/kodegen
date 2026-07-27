@@ -27,18 +27,30 @@ jobs:
   # runs `kodegen add`. One job per capability that generates distinct code —
   # mariadb is skipped because it is byte-for-byte identical to mysql (same
   # feature, same connection type, same migration; only the image differs).
+  #
+  # `s3` is the slow one: the AWS SDK brings rustls and aws-lc-sys, which builds
+  # C from source. It stays a full fmt/clippy/check/test job anyway — this is the
+  # only place that compiles the adapter at all, and a cheaper job would prove
+  # less than nothing.
   generated:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        capability: [postgres, mysql, redis]
+        capability: [postgres, mysql, redis, s3]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # the generated projects are built outside this workspace, so their target
+      # dirs are cached only if the action is told where they are
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            ${{ runner.temp }}/demo
+            ${{ runner.temp }}/demo-with
 
       # the generated project's build.rs compiles its .proto files
       - name: Install protoc
@@ -69,10 +81,9 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: ${{ runner.temp }}/demo
 
-      - name: Check
-        run: cargo check --locked
-        working-directory: ${{ runner.temp }}/demo
-
+      # no `cargo check` step: `clippy --all-targets` above already type-checks
+      # everything `check` would, and compiling the AWS SDK twice is minutes.
+      #
       # no DATABASE_URL and no REDIS_URL, so the adapter tests skip themselves
       # and the in-memory adapters are what run — the promise that a generated
       # project is green without a server
@@ -100,18 +111,49 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
+      # the same image `kodegen add s3` writes into docker-compose.dev.yml, so
+      # what CI proves and what a developer boots locally are one thing. Any
+      # S3-compatible server would do — that is the point of the adapter. The
+      # compose file can swap in `minio/minio`; a service container here cannot,
+      # because MinIO needs `command: server /data` and there is no `command:`
+      # key for service containers.
+      #
+      # no `--health-cmd`: it runs *inside* the image, so it would tie this job
+      # to whether that image happens to ship curl. Polled from the runner below
+      # instead, where the tools are ours.
+      s3:
+        image: rustfs/rustfs:1.0.0-beta.11
+        env:
+          RUSTFS_ACCESS_KEY: rustfsadmin
+          RUSTFS_SECRET_KEY: rustfsadmin
+        ports:
+          - 9000:9000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            ${{ runner.temp }}/demo-all
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      # any answer means it is listening — an unauthenticated request to the
+      # root is a 403, which is why this does not use `curl -f`
+      - name: Wait for the object store
+        run: |
+          for _ in $(seq 1 60); do
+            curl -s -o /dev/null http://127.0.0.1:9000 && exit 0
+            sleep 2
+          done
+          echo "rustfs did not come up"; exit 1
+
       - name: Generate with every capability on
-        run: cargo run --locked -- new demo-all --with postgres,redis --output "$RUNNER_TEMP"
+        run: cargo run --locked -- new demo-all --with postgres,redis,s3 --output "$RUNNER_TEMP"
 
       - name: Format check
         run: cargo fmt --check
@@ -121,15 +163,17 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: ${{ runner.temp }}/demo-all
 
-      - name: Check
-        run: cargo check --locked
-        working-directory: ${{ runner.temp }}/demo-all
-
-      # REDIS_URL set, DATABASE_URL not: the cache adapter is exercised against
-      # the service container above, and the Diesel tests skip as they do
-      # everywhere else (Postgres is proven at compile time here, not at runtime)
-      - name: Test against a live cache
+      # REDIS_URL and the S3 variables set, DATABASE_URL not: both additive
+      # adapters are exercised against the service containers above, and the
+      # Diesel tests skip as they do everywhere else (Postgres is proven at
+      # compile time here, not at runtime). The blob test creates its own bucket,
+      # so there is no setup step between booting the server and using it.
+      - name: Test against a live cache and a live object store
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo-all
         env:
           REDIS_URL: redis://127.0.0.1:6379
+          S3_BUCKET: app
+          S3_ENDPOINT: http://127.0.0.1:9000
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin

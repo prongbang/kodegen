@@ -1,2 +1,4 @@
 .DS_Store
 target
+# where the default BlobStore adapter writes, after `kodegen add s3`
+/data

@@ -38,7 +38,7 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         with: Vec<capability::Capability>,
     },
-    /// Add an infrastructure capability (relational backend, cache) to a generated project
+    /// Add an infrastructure capability (relational backend, cache, object storage) to a generated project
     Add {
         /// Capability to add
         capability: Option<capability::Capability>,
@@ -117,14 +117,22 @@ fn run() -> Result<()> {
             println!("Created {} from template '{template}'", dest.display());
             // --with is a loop over the same `add`, not a second code path, so
             // there is nothing here for `kodegen add` to drift away from
+            let mut env: Vec<(&str, &str)> = Vec::new();
             for cap in with {
                 let (created, edited) = capability::add(&dest, cap, false)?;
-                let (var, value) = cap.env();
                 println!("Added capability '{}':", cap.name());
                 print_plan(&created, &edited);
-                println!("  {var}={value}");
+                env.extend_from_slice(cap.env());
             }
-            println!("  cd {name} && cargo run");
+            // one runnable line for every capability at once — printing each
+            // capability's variables on their own leaves the reader to assemble
+            // a command, and half of them are useless on their own anyway
+            let run = if env.is_empty() {
+                "cargo run".to_string()
+            } else {
+                format!("{} cargo run", env_line(&env))
+            };
+            println!("  cd {name} && {run}");
         }
         Cmd::Add { capability: cap, path, dry_run, list } => {
             if list {
@@ -141,11 +149,13 @@ fn run() -> Result<()> {
             if dry_run {
                 return Ok(());
             }
-            let (var, value) = cap.env();
+            let env = cap.env();
             println!("Start it and point the app at it:");
             println!("  docker compose -f docker-compose.dev.yml up -d");
-            println!("  {var}={value} cargo run");
-            println!("Leave {var} unset for the in-memory adapter, as before.");
+            println!("  {} cargo run", env_line(env));
+            // the first one is the switch: s3 needs four variables, but only the
+            // bucket decides which adapter is built
+            println!("Leave {} unset for the default adapter, as before.", env[0].0);
         }
         Cmd::Update { template } => {
             let (_, cached) = remote_target(&template)?;
@@ -194,6 +204,12 @@ fn print_plan(created: &[String], edited: &[String]) {
     for f in edited {
         println!("  ~ {f}");
     }
+}
+
+/// The capability's env vars as one shell prefix — an S3 client with three of
+/// its four variables is not a client, so they are printed together.
+fn env_line(env: &[(&str, &str)]) -> String {
+    env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
 }
 
 fn cache_root() -> Result<PathBuf> {

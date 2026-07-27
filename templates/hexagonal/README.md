@@ -23,7 +23,7 @@ proto/                 # protobuf definitions — every file here is compiled by
 - `protoc` — required for local builds because `build.rs` compiles every `.proto` in `proto/` via `tonic-prost-build`.
   - macOS: `brew install protobuf`
   - Debian/Ubuntu: `apt-get install protobuf-compiler`
-- Docker — only if you switch off the default SQLite backend and want to run the real database locally (see [Capabilities](#capabilities)).
+- Docker — only if you switch off the default SQLite backend, or want a real cache or object store locally (see [Capabilities](#capabilities)).
 
 ### Run
 
@@ -38,7 +38,7 @@ GRPC_PORT=50052 cargo run       # + inbound gRPC features on 0.0.0.0:50052
 cargo test
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `cache`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `cache`, `blob`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
 
 ### Examples
 
@@ -84,6 +84,11 @@ curl localhost:8080/hello/world
 | `RUST_LOG` | `info` | Tracing log filter (`EnvFilter`) |
 | `DATABASE_URL` | unset (in-memory repo) | Optional. Connection string for the Diesel-backed `UserRepository`; the format depends on which backend is enabled (see [Capabilities](#capabilities)). Unset falls back to the in-memory adapter. |
 | `REDIS_URL` | unset (in-memory cache) | Optional, and only meaningful after `kodegen add redis`. Redis/Valkey connection string for the `Cache` port, e.g. `redis://127.0.0.1:6379`. Unset falls back to the in-memory adapter. |
+| `S3_BUCKET` | unset (files on disk) | Optional, and only meaningful after `kodegen add s3`. The bucket the `BlobStore` port writes to, and the switch that selects the S3 adapter. Unset falls back to the filesystem adapter. |
+| `S3_ENDPOINT` | unset (real AWS) | Only for a self-hosted server (RustFS, MinIO, Ceph): setting it also turns on path-style addressing, which those need. |
+| `S3_REGION` | `us-east-1` | Sent with every request. Self-hosted servers ignore it; AWS does not. |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | unset | Required when `S3_BUCKET` is set (`AWS_SESSION_TOKEN` too, if you use one). |
+| `BLOB_DIR` | `./data/blobs` | Where the default `BlobStore` adapter keeps objects when `S3_BUCKET` is unset. The production image is `distroless/cc` with a read-only working directory, so in a container either point this at a mounted volume (`-v blobs:/data -e BLOB_DIR=/data/blobs`) or set `S3_BUCKET` and use the S3 adapter. |
 
 `DATABASE_URL` per backend — the one that applies is whichever feature is in
 `default = [...]` in `Cargo.toml`:
@@ -109,11 +114,12 @@ kodegen add postgres      # Diesel + PostgreSQL
 kodegen add mysql         # Diesel + MySQL
 kodegen add mariadb       # same driver as mysql; MariaDB image
 kodegen add redis         # the Cache port + a Redis adapter (Valkey too)
+kodegen add s3            # the BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
 kodegen add --list        # what's supported + what this project has on
 ```
 
-The first three are **relational backends** and replace each other; `redis` is a
-different axis and sits alongside whichever one is on.
+The first three are **relational backends** and replace each other; `redis` and
+`s3` are different axes and sit alongside whichever one is on, and each other.
 
 ### Relational backend
 
@@ -174,6 +180,52 @@ same port and is driven by the same client, so switching is an image swap in
 `docker-compose.dev.yml` (`valkey/valkey:8-alpine`, and `valkey-cli` in the
 healthcheck) — the generated Rust is unchanged. Verified against both.
 
+### Object storage (`kodegen add s3`)
+
+Additive as well, and one adapter for every S3-compatible server — RustFS,
+MinIO, Ceph and AWS S3 differ by an endpoint, not by code:
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | `default = [...]` gains `blob` (everything else is left alone) |
+| `src/domain/ports.rs` | the `BlobStore` port is **appended**: `put`/`get`/`delete`, plus `check_blob_key` |
+| `src/domain/mod.rs` | `pub use ports::{check_blob_key, BlobStore};` |
+| `src/infrastructure/fs_blobs.rs` | default adapter — one file per key under `BLOB_DIR`, no server needed |
+| `src/infrastructure/s3_blobs.rs` | S3 adapter over a client the composition root builds |
+| `src/api/mod.rs` | one `blobs: Arc<dyn BlobStore>` field on `Services` |
+| `src/bootstrap.rs` | builds the S3 client from `S3_BUCKET`/`S3_ENDPOINT`/credentials, plus a `build_blob_store` builder |
+| `tests/blob.rs` | the port's contract, run against **both** adapters (the S3 half is `S3_BUCKET`-gated) |
+| `docker-compose.dev.yml` | a RustFS service with a healthcheck (created if missing) |
+
+**Keys are checked before they reach an adapter.** `check_blob_key` requires a
+non-empty key of at most 1024 bytes with no backslashes, colons or control
+characters, no empty/`.`/`..` segments, and no component the platform reads as a
+root, drive or prefix. The filesystem adapter turns a key into a path, so `../`
+would walk out of the blob directory and `C:evil.txt` — drive-relative on
+Windows — would throw the blob directory away when joined. Doing it in the port
+rather than in each adapter is also what keeps the two substitutable: a key S3
+would have accepted must not be a key that only works in production.
+
+**Keys must not be prefixes of one another.** `a` and `a/b` are both fine on S3,
+which has no directories; on disk `a` has to become a directory to hold `a/b`.
+`get` and `delete` are aligned anyway (a directory reads as a miss), but a `put`
+of `a` while `a/b` exists fails on the filesystem and succeeds on S3 — so keep
+every key a leaf.
+
+**RustFS is not a separate adapter, and neither is MinIO.** They speak the S3
+API, so swapping `image: rustfs/rustfs:...` for `image: minio/minio` with
+`command: server /data` and `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` changes
+nothing in the generated Rust. On AWS itself, drop `S3_ENDPOINT` and set a real
+`S3_REGION`. Credentials come from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+rather than the full AWS provider chain — `aws-config` resolves credentials
+asynchronously and `build_services_from_env()` is a plain `fn`; if you need IAM
+roles or SSO, add `aws-config`, make that function `async` and `.await` the
+loader where the client is built.
+
+The bucket itself is not created for you — `tests/blob.rs` creates it because a
+test may, but the app assumes it exists, the same way it assumes the database
+does.
+
 ### Running a backend locally
 
 `docker-compose.dev.yml` (written by `kodegen add`, dev-only — the production
@@ -193,6 +245,8 @@ is around and skip quietly otherwise:
 cargo test                                                   # in-memory, no server needed
 DATABASE_URL=postgres://app:app@127.0.0.1:5432/app cargo test # + the real adapter
 REDIS_URL=redis://127.0.0.1:6379 cargo test                  # + the real cache
+S3_BUCKET=app S3_ENDPOINT=http://127.0.0.1:9000 \
+  AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin cargo test  # + real object storage
 ```
 
 ## Outbound gRPC + Circuit Breaker
@@ -250,6 +304,7 @@ Allocations per request (`alloc_bench`):
 - Entities, value objects, domain services, and domain errors.
 - **Ports (traits)** such as `UserRepository` are defined here, each documenting a behavioral contract — e.g. `UserRepository::save` is an upsert and never returns `NotFound`; `get` returns `NotFound` when the id is absent, not an empty/default value. Adapters must honor the documented contract so they stay substitutable.
 - `kodegen add redis` appends a `Cache` port on the same terms, and its contract deliberately differs where the semantics do: a cache miss is `Ok(None)`, never `NotFound`, and `delete` on an absent key is `Ok(())`. `tests/cache.rs` runs those assertions against every adapter, which is what keeps "substitutable" a fact rather than a claim.
+- `kodegen add s3` appends a `BlobStore` port the same way: `get` on a missing key is `Ok(None)` (a blob store has no `NotFound`), `put` overwrites, `delete` is idempotent, and `check_blob_key` lives beside the trait so every adapter refuses the same keys instead of each one deciding for itself. `tests/blob.rs` runs one contract against both adapters.
 - Pure business rules; framework‑agnostic; minimal dependencies.
 
 ### `infrastructure/` — Adapters
@@ -257,6 +312,7 @@ Allocations per request (`alloc_bench`):
 - Swappable without touching `domain`/`application` code.
 - `UserRepository` ships two adapters: `in_memory_repo::InMemoryUserRepository` (default) and `diesel_repo::DieselUserRepository`, selected at startup by setting `DATABASE_URL` (see `bootstrap::build_router`).
 - After `kodegen add redis` the `Cache` port has the same pair: `in_memory_cache::InMemoryCache` (default) and `redis_cache::RedisCache`, selected by `REDIS_URL`. The Redis connection is created lazily by the composition root, so an unreachable cache delays nothing at startup and reconnects on its own — but a command issued while it is down returns `DomainError::Other`, it is not silently swallowed.
+- After `kodegen add s3` the `BlobStore` port has its own pair: `fs_blobs::FsBlobStore` (default — one file per key under `BLOB_DIR`) and `s3_blobs::S3BlobStore`, selected by `S3_BUCKET`. The S3 client is built once by the composition root, so the adapter never reads `S3_ENDPOINT` itself; an unreachable server surfaces as `DomainError::Unavailable` (a 503), while anything the server actually answered — no such bucket, access denied — stays `Other`.
 - Diesel/SQLite plumbing shared by every repository lives in `diesel_db.rs`, not in the repository itself: `build_pool(url)` runs the embedded migrations and, on a single setup connection, switches the database file to `WAL` mode once; the resulting r2d2 pool is wrapped in a cheap-to-clone `Db` handle whose `run(closure)` does the `spawn_blocking` + connection checkout + error mapping every repository needs. `DieselUserRepository::new(db: Db)` just takes that handle, so a future repository shares the same pool by cloning `Db` rather than re-deriving pool/pragma logic.
 - Every pooled connection also sets `PRAGMA busy_timeout` and `PRAGMA synchronous = NORMAL` on acquire: SQLite allows only one writer at a time, so without WAL + `busy_timeout` concurrent writers fail immediately with `SQLITE_BUSY` instead of waiting their turn. **This paragraph and the one above describe the default SQLite backend** — on PostgreSQL or MySQL (see [Capabilities](#capabilities)) `diesel_db.rs` has no pragma customizer at all, because neither has SQLite's single-writer problem; `Db`, `Db::run` and every repository stay exactly the same.
 - The composition root (`bootstrap.rs`) is the only place that builds the pool and constructs `DieselUserRepository`; repositories never see `DATABASE_URL` or the pool directly.

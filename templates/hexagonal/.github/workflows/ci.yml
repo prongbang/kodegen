@@ -49,6 +49,12 @@ jobs:
       - name: Check cache feature
         run: cargo check --locked --features cache
 
+      # Same idea, and the one that matters most for the lock: the AWS SDK moves
+      # its MSRV faster than anything else here, so `resolver = "3"` picking a
+      # version this toolchain can build is a claim only a real resolve proves.
+      - name: Check blob feature
+        run: cargo check --locked --features blob
+
   # Separate job: an advisory landing in RustSec is not a reason to hold up the
   # fmt/clippy/test signal, and vice versa. cargo-audit is run directly rather
   # than via rustsec/audit-check, which needs a write-scoped token to publish a

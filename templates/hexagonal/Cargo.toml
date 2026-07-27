@@ -7,6 +7,14 @@ edition = "2021"
 # rustc 1.88" instead of an unrelated error deep in a dependency. Keep the
 # Dockerfile's build stage at or above this.
 rust-version = "1.88"
+# MSRV-aware resolution, and not optional once `aws-sdk-s3` is in the graph: the
+# whole AWS SDK now requires rustc 1.94, so re-resolving this lock with the
+# default resolver would pull a version of it nobody on `rust-version` can
+# build. With resolver 3 cargo picks the newest release that still compiles on
+# the MSRV above, which is what keeps that line honest across a `cargo update`.
+# (It also raises the floor for cargo itself: below 1.84 this key fails to parse
+# with "`resolver` setting `3` is not valid", before any MSRV message.)
+resolver = "3"
 
 [dependencies]
 axum = { version = "0.8.4", features = ["tokio", "http1"] }
@@ -49,6 +57,19 @@ redis = { version = "1.4.1", default-features = false, features = [
     "tokio-comp",
     "connection-manager",
 ], optional = true }
+# S3-compatible object storage: one SDK covers RustFS, MinIO, Ceph and AWS S3
+# itself, because they all speak the same API. Pure Rust over rustls, so the
+# distroless/cc runtime image needs nothing extra — but the SDK's own MSRV moves
+# fast (1.94 as of today), which is what `resolver = "3"` above is holding back.
+# The default features are trimmed to what an S3 client needs. `sigv4a` is for
+# multi-region access points and drags in an elliptic-curve stack; `rustls` is
+# the SDK's *legacy* hyper-0.14 TLS path, and `default-https-client` already
+# brings a current rustls — enabling both locks two full TLS stacks.
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "http-1x",
+    "default-https-client",
+], optional = true }
 
 # Which backend C driver gets compiled and linked. Optional dependencies are all
 # pinned in Cargo.lock whether or not their feature is on, so flipping `default`
@@ -66,6 +87,9 @@ mysql = ["diesel/mysql", "dep:mysqlclient-sys", "dep:openssl-sys"]
 # Not a backend: `cache` sits alongside whichever relational feature is on.
 # Redis and Valkey speak the same protocol, so this one feature covers both.
 cache = ["dep:redis"]
+# Also not a backend. `tokio/fs` is for the *default* adapter, which stores blobs
+# in a directory — the S3 SDK is only half of what `blob` turns on.
+blob = ["dep:aws-sdk-s3", "tokio/fs"]
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

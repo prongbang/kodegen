@@ -1,5 +1,5 @@
 //! `kodegen add <capability>`: give a generated project a piece of
-//! infrastructure — a relational backend, or a cache.
+//! infrastructure — a relational backend, a cache, or object storage.
 //!
 //! Same shape as `scaffold::add_feature` — the whole change is computed in
 //! memory (which is what validates every anchor and signature) and written in
@@ -14,9 +14,10 @@
 //!   wrote (the embedded template with the project's name substituted in), so a
 //!   file the user has touched is refused with manual instructions rather than
 //!   clobbered. Only one may be on at a time.
-//! - **redis** (`add_redis`) *adds a port* the template does not ship, together
-//!   with both of its adapters and the wiring. Purely additive, so it composes
-//!   with any backend and never has anything to refuse.
+//! - **redis** (`add_redis`) and **s3** (`add_s3`) *add a port* the template does
+//!   not ship, together with both of its adapters and the wiring. Purely
+//!   additive, so they compose with any backend and with each other, and neither
+//!   has an existing file to refuse.
 
 use crate::scaffold::{
     edit, insert_after_line, insert_at_marker, insert_before_line, insert_pub_mod, require_files,
@@ -32,14 +33,17 @@ pub enum Capability {
     Mysql,
     Mariadb,
     Redis,
+    S3,
 }
 
 /// The axis a capability sits on: relational backends replace each other, a
-/// cache is additive. Every kind needs its own `add_*` function, its own env var
-/// and its own feature, which is exactly what the matches on this enforce.
+/// cache and a blob store are additive. Every kind needs its own `add_*`
+/// function, its own env vars and its own feature, which is exactly what the
+/// matches on this enforce.
 enum Kind {
     Relational(Relational),
     Cache,
+    Blob,
 }
 
 /// The relational subset of `Capability`. Split out so that everything about a
@@ -76,6 +80,23 @@ const ASYNC_TRAIT_USE: &str = "use async_trait::async_trait;";
 /// Default port, and `127.0.0.1` for the same reason the database URLs use it:
 /// a literal address is the one thing that behaves identically on every host.
 const REDIS_URL: &str = "redis://127.0.0.1:6379";
+const PG_URL: &str = "postgres://app:app@127.0.0.1:5432/app";
+const MYSQL_URL: &str = "mysql://app:app@127.0.0.1:3306/app";
+
+const FS_BLOBS: &str = "src/infrastructure/fs_blobs.rs";
+const S3_BLOBS: &str = "src/infrastructure/s3_blobs.rs";
+const BLOB_TEST: &str = "tests/blob.rs";
+
+/// What the generated `docker-compose.dev.yml` boots, and the credentials it
+/// boots it with — dev-only defaults, printed together because an S3 client with
+/// three of the four is not a client.
+const S3_ENV: &[(&str, &str)] = &[
+    // first, and the one the composition root gates on: no bucket, no S3
+    ("S3_BUCKET", "app"),
+    ("S3_ENDPOINT", "http://127.0.0.1:9000"),
+    ("AWS_ACCESS_KEY_ID", "rustfsadmin"),
+    ("AWS_SECRET_ACCESS_KEY", "rustfsadmin"),
+];
 
 impl Capability {
     pub fn name(self) -> &'static str {
@@ -84,6 +105,7 @@ impl Capability {
             Capability::Mysql => "mysql",
             Capability::Mariadb => "mariadb",
             Capability::Redis => "redis",
+            Capability::S3 => "s3",
         }
     }
 
@@ -97,6 +119,7 @@ impl Capability {
             Capability::Mysql => Kind::Relational(Relational::Mysql),
             Capability::Mariadb => Kind::Relational(Relational::Mariadb),
             Capability::Redis => Kind::Cache,
+            Capability::S3 => Kind::Blob,
         }
     }
 
@@ -108,16 +131,21 @@ impl Capability {
             // Redis and Valkey speak the same protocol, so one feature covers
             // both: the capability is the cache, not the vendor
             Kind::Cache => "cache",
+            // RustFS, MinIO, Ceph and AWS are one adapter over one API: the
+            // capability is object storage, not the vendor
+            Kind::Blob => "blob",
         }
     }
 
-    /// The env var that selects this capability's adapter, and a value matching
-    /// what the generated `docker-compose.dev.yml` boots. Unset = the default,
-    /// server-less adapter.
-    pub fn env(self) -> (&'static str, &'static str) {
+    /// The env vars that select this capability's adapter, and values matching
+    /// what the generated `docker-compose.dev.yml` boots. The **first** one is
+    /// the switch: leave it unset and the default, server-less adapter is what
+    /// runs.
+    pub fn env(self) -> &'static [(&'static str, &'static str)] {
         match self.kind() {
-            Kind::Relational(rel) => ("DATABASE_URL", rel.database_url()),
-            Kind::Cache => ("REDIS_URL", REDIS_URL),
+            Kind::Relational(rel) => rel.database_env(),
+            Kind::Cache => &[("REDIS_URL", REDIS_URL)],
+            Kind::Blob => S3_ENV,
         }
     }
 }
@@ -162,8 +190,15 @@ impl Relational {
     /// configured. The literal address forces TCP on every backend.
     fn database_url(self) -> &'static str {
         match self {
-            Relational::Postgres => "postgres://app:app@127.0.0.1:5432/app",
-            Relational::Mysql | Relational::Mariadb => "mysql://app:app@127.0.0.1:3306/app",
+            Relational::Postgres => PG_URL,
+            Relational::Mysql | Relational::Mariadb => MYSQL_URL,
+        }
+    }
+
+    fn database_env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Relational::Postgres => &[("DATABASE_URL", PG_URL)],
+            Relational::Mysql | Relational::Mariadb => &[("DATABASE_URL", MYSQL_URL)],
         }
     }
 
@@ -236,8 +271,9 @@ pub fn list(project: &Path) -> Result<()> {
     println!("  mysql      relational — Diesel + MySQL");
     println!("  mariadb    relational — Diesel + MariaDB (MySQL protocol: same driver, same adapter)");
     println!("  redis      cache — the `Cache` port + a Redis adapter (Valkey speaks the same protocol)");
+    println!("  s3         object storage — the `BlobStore` port + an S3 adapter (RustFS, MinIO, AWS)");
     println!();
-    println!("Only one relational backend can be on at a time; redis sits alongside it.");
+    println!("Only one relational backend can be on at a time; redis and s3 sit alongside it.");
     match fs::read_to_string(project.join("Cargo.toml")).ok().as_deref().and_then(default_line) {
         // `default = [...]` is the only state there is — the features it lists
         // are exactly the dependencies that get compiled
@@ -292,6 +328,7 @@ pub fn add(project: &Path, cap: Capability, dry_run: bool) -> Result<(Vec<String
     match cap.kind() {
         Kind::Relational(rel) => add_relational(project, rel, &enabled, dry_run),
         Kind::Cache => add_redis(project, dry_run),
+        Kind::Blob => add_s3(project, dry_run),
     }
 }
 
@@ -477,6 +514,111 @@ fn add_redis(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)
         edits.push(edit(project, COMPOSE, |c| add_compose_service(&c, "redis", REDIS_COMPOSE))?);
     } else {
         creates.push((COMPOSE.to_string(), format!("{COMPOSE_HEADER}{REDIS_COMPOSE}")));
+    }
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    // everything above is pure, so this is the only side effect
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
+/// `kodegen add s3` — RustFS, MinIO, Ceph and AWS S3, which are one adapter
+/// because they are one API.
+///
+/// The same purely additive shape as `add_redis`: a port the template does not
+/// ship, both of its adapters, and the wiring. The default adapter here writes
+/// files under a directory rather than keeping bytes in memory, because a blob
+/// store is a system of record and "it was there a moment ago" is the one thing
+/// it must not do.
+fn add_s3(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(
+        project,
+        &[PORTS, "src/domain/mod.rs", "src/infrastructure/mod.rs", "src/api/mod.rs", "src/bootstrap.rs"],
+    )?;
+    let crate_name = crate::package_name(project)
+        .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
+        .replace('-', "_");
+
+    let mut creates = vec![
+        (FS_BLOBS.to_string(), FS_BLOBS_TPL.to_string()),
+        (S3_BLOBS.to_string(), S3_BLOBS_TPL.to_string()),
+        (BLOB_TEST.to_string(), BLOB_TEST_TPL.replace("{{crate_name}}", &crate_name)),
+    ];
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(format!("{rel} already exists — remove it first, or keep the one you have").into());
+    }
+
+    let mut edits = vec![
+        // one list of feature names, never [dependencies] — that is what keeps
+        // Cargo.lock valid and `--locked` working across an `add`
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "blob", false))?,
+        // append-only, so no anchor can go missing — but appending still has
+        // three ways to produce a file that will not compile
+        edit(project, PORTS, |c| {
+            if c.contains("trait BlobStore") {
+                return Err("already declares a `BlobStore` trait — appending a second one would not \
+                            compile. Remove yours, or keep it and skip `kodegen add s3`."
+                    .into());
+            }
+            if c.contains("fn check_blob_key") {
+                return Err("already declares `check_blob_key` — appending a second one would not \
+                            compile. Remove yours, or keep it and skip `kodegen add s3`."
+                    .into());
+            }
+            if !c.contains(ASYNC_TRAIT_USE) {
+                return Err(format!(
+                    "has no `{ASYNC_TRAIT_USE}` — the appended `BlobStore` port is `#[async_trait]`, \
+                     so restore that line at the top of the file and rerun"
+                )
+                .into());
+            }
+            Ok(format!("{c}\n{BLOB_PORT_TPL}"))
+        })?,
+        edit(project, "src/domain/mod.rs", |c| {
+            Ok(format!("{c}pub use ports::{{check_blob_key, BlobStore}};\n"))
+        })?,
+        edit(project, "src/infrastructure/mod.rs", |c| {
+            let c = insert_pub_mod(&c, "fs_blobs")?;
+            insert_pub_mod(&c, "s3_blobs")
+        })?,
+        edit(project, "src/api/mod.rs", |c| {
+            insert_after_line(&c, "pub struct Services {", "    pub blobs: Arc<dyn crate::domain::BlobStore>,")
+        })?,
+        edit(project, "src/bootstrap.rs", |c| {
+            let c = insert_before_line(&c, RESOURCES_MARKER, S3_RESOURCE).map_err(|_| {
+                format!(
+                    "marker '{RESOURCES_MARKER}' is missing — put the line `    {RESOURCES_MARKER}` \
+                     back just above the `api::Services {{ ... }}` literal in \
+                     `build_services_from_env()`, then rerun (or wire the blob store manually: build \
+                     the S3 client there and pass it to a `build_blob_store` builder)"
+                )
+            })?;
+            let c = insert_at_marker(
+                &c,
+                "// kodegen:services:env",
+                "build_services_from_env",
+                "user: build_user_service(db.as_ref()),",
+                "        blobs: build_blob_store(s3.as_ref()),",
+            )?;
+            let c = insert_at_marker(
+                &c,
+                "// kodegen:services:default",
+                "build_services",
+                "user: build_user_service(None),",
+                "        blobs: build_blob_store(None),",
+            )?;
+            Ok(format!("{c}\n{BUILD_BLOB_STORE_TPL}"))
+        })?,
+    ];
+
+    // whichever `add` runs first creates the compose file, the next one appends
+    if project.join(COMPOSE).is_file() {
+        edits.push(edit(project, COMPOSE, |c| add_compose_service(&c, "s3", S3_COMPOSE))?);
+    } else {
+        creates.push((COMPOSE.to_string(), format!("{COMPOSE_HEADER}{S3_COMPOSE}")));
     }
 
     let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
@@ -1160,6 +1302,470 @@ async fn redis_cache_honors_the_contract() {
 }
 "##;
 
+const S3_COMPOSE: &str = r##"  s3:
+    # RustFS, but any S3-compatible server does: the generated Rust talks to the
+    # API, not to a vendor. MinIO is the drop-in swap — `image: minio/minio`,
+    # `command: server /data`, `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` instead of
+    # the two below, and the same 9000. AWS itself needs no S3_ENDPOINT at all.
+    image: rustfs/rustfs:1.0.0-beta.11
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+"##;
+
+/// Appended to `domain/ports.rs`, next to the `Cache` port `add redis` writes.
+const BLOB_PORT_TPL: &str = r##"/// Outbound port: keyed binary objects. Written by `kodegen add s3`.
+///
+/// Both adapters must honor this contract — the filesystem one is what runs when
+/// `S3_BUCKET` is unset, so a behavioral difference between them shows up as a
+/// bug that only reproduces in production. `tests/blob.rs` runs one set of
+/// assertions against both.
+///
+/// Unlike a cache, a blob store **is** a system of record: a failed `put` must
+/// not be swallowed, and nothing here expires on its own.
+/// **Keys must not be prefixes of one another.** `a` and `a/b` can both exist on
+/// S3, which has no directories; the filesystem adapter has to make `a` a
+/// directory to hold `a/b`, so one of the two writes loses. Pick a layout where
+/// every key is a leaf (`blobs/<id>`, never `blobs` *and* `blobs/<id>`).
+#[async_trait]
+pub trait BlobStore: Send + Sync {
+    /// Overwrites any object already under `key`. Whole-object writes only —
+    /// streaming and multipart uploads are out of scope for the port.
+    ///
+    /// The one case the adapters cannot agree on: writing `a` when `a/b` exists
+    /// fails on the filesystem (`a` is a directory) and succeeds on S3. See the
+    /// note on the trait — `get` and `delete` are aligned, `put` cannot be.
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), DomainError>;
+    /// `Ok(None)` when the key is absent: a miss is not an error, so unlike
+    /// `UserRepository::get` this never returns `NotFound`.
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, DomainError>;
+    /// Idempotent — deleting a key that is not there is `Ok(())`, which is also
+    /// what S3 itself does.
+    async fn delete(&self, key: &str) -> Result<(), DomainError>;
+}
+
+/// The key rules every `BlobStore` adapter enforces before touching its backend.
+///
+/// S3 would accept most of what this rejects, but the filesystem adapter maps
+/// keys onto paths, where `../` walks out of the blob directory. Checking in one
+/// place keeps the two adapters substitutable *and* puts the traversal check on
+/// the path everything takes, rather than trusting each adapter to remember it.
+pub fn check_blob_key(key: &str) -> Result<(), DomainError> {
+    let invalid = |why: &str| Err(DomainError::Validation(format!("blob key {key:?}: {why}")));
+    if key.is_empty() {
+        return invalid("must not be empty");
+    }
+    // S3's own limit, in bytes rather than chars
+    if key.len() > 1024 {
+        return invalid("must be at most 1024 bytes");
+    }
+    // ':' for Windows, where `C:evil.txt` is a *drive-relative* path and
+    // `PathBuf::push` drops everything joined before it. Rejected on every
+    // platform so a key that works in dev cannot fail in production.
+    if key.contains('\\') || key.contains(':') || key.chars().any(|c| c.is_control()) {
+        return invalid("must not contain backslashes, colons or control characters");
+    }
+    // `..` is the one that matters: the filesystem adapter joins the key onto its
+    // root, and a single `../` there reads or overwrites a file outside it
+    if key
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return invalid("must not contain empty, '.' or '..' path segments");
+    }
+    // and then whatever *this* platform reads as more than a plain name: a root,
+    // a drive prefix, a UNC share. Asking `Path` is the only check that stays
+    // right on a platform this was not written on.
+    //
+    // ponytail: Windows reserved device names (CON, NUL, COM1) still get
+    // through — they are only a problem if you deploy the filesystem adapter on
+    // Windows, and rejecting them is a list, not a rule
+    if std::path::Path::new(key)
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return invalid("must be a plain relative path: no root, drive or prefix components");
+    }
+    Ok(())
+}
+"##;
+
+const FS_BLOBS_TPL: &str = r##"//! Default `BlobStore` adapter: one file per key under a directory, so
+//! `cargo run` and `cargo test` work with `S3_BUCKET` unset — the same rule
+//! `in_memory_repo` follows for `DATABASE_URL`.
+//!
+//! Written by `kodegen add s3`.
+
+use crate::domain::{check_blob_key, BlobStore, DomainError};
+use async_trait::async_trait;
+use std::io::ErrorKind;
+use std::path::PathBuf;
+
+pub struct FsBlobStore {
+    root: PathBuf,
+}
+
+impl FsBlobStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The only place a key becomes a path. `check_blob_key` has already refused
+    /// `..` segments and absolute keys, which is what makes the join safe.
+    fn path(&self, key: &str) -> Result<PathBuf, DomainError> {
+        check_blob_key(key)?;
+        Ok(self.root.join(key))
+    }
+}
+
+fn infra(e: std::io::Error) -> DomainError {
+    DomainError::Other(Box::new(e))
+}
+
+#[async_trait]
+impl BlobStore for FsBlobStore {
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), DomainError> {
+        let path = self.path(key)?;
+        // a key with slashes in it is a nested path here and a flat name on S3;
+        // both end up addressable by the same key, which is all the port promises
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(infra)?;
+        }
+        // ponytail: writes in place, so a reader can see a half-written object.
+        // Write to `<key>.tmp` and rename if concurrent readers ever matter — on
+        // S3 the same call is atomic, which is the difference this leaves open
+        tokio::fs::write(&path, bytes).await.map_err(infra)
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, DomainError> {
+        match tokio::fs::read(self.path(key)?).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            // all three are "nothing stored under this key", which the port
+            // documents as `Ok(None)` — matching what S3 answers for each:
+            // NotFound is the plain miss, NotADirectory is `a/b` where `a` is a
+            // file, IsADirectory is `a` where only `a/b` was ever written
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::IsADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(infra(e)),
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), DomainError> {
+        // ponytail: leaves the directories a nested key created behind, and a
+        // path segment over 255 bytes fails as ENAMETOOLONG where S3 would take
+        // it. Both are the price of one file per key; sweep empty directories or
+        // hash long keys here if either ever bites
+        match tokio::fs::remove_file(self.path(key)?).await {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::IsADirectory
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(infra(e)),
+        }
+    }
+}
+"##;
+
+const S3_BLOBS_TPL: &str = r##"//! `BlobStore` adapter over the S3 API — which is also RustFS, MinIO and Ceph,
+//! since they all speak it (SigV4 over the same requests). Only the endpoint
+//! differs, and that is configuration, not code.
+//!
+//! Written by `kodegen add s3`. The client is owned by the composition root
+//! (`bootstrap.rs`) and handed in, exactly like the Diesel `Db` handle: an
+//! adapter never reads `S3_ENDPOINT` itself.
+
+use crate::domain::{check_blob_key, BlobStore, DomainError};
+use async_trait::async_trait;
+use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client;
+
+pub struct S3BlobStore {
+    client: Client,
+    bucket: String,
+}
+
+impl S3BlobStore {
+    pub fn new(client: Client, bucket: impl Into<String>) -> Self {
+        Self {
+            client,
+            bucket: bucket.into(),
+        }
+    }
+}
+
+/// A bucket that cannot be reached is `Unavailable`, which `api::to_http_err`
+/// turns into a 503 — the same treatment `GrpcGreeter` gives a dead upstream.
+/// Anything the service itself answered (no such bucket, access denied) is a
+/// real `Other`: the dependency is up, the request was wrong.
+fn infra<E, R>(e: SdkError<E, R>) -> DomainError
+where
+    SdkError<E, R>: std::error::Error + Send + Sync + 'static,
+{
+    match &e {
+        SdkError::DispatchFailure(_) | SdkError::TimeoutError(_) => DomainError::Unavailable,
+        _ => DomainError::Other(Box::new(e)),
+    }
+}
+
+#[async_trait]
+impl BlobStore for S3BlobStore {
+    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), DomainError> {
+        check_blob_key(key)?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(bytes))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(infra)
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, DomainError> {
+        check_blob_key(key)?;
+        let out = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(out) => out,
+            // a missing key is the miss the port documents, not an error
+            Err(e) if e.as_service_error().is_some_and(|e| e.is_no_such_key()) => return Ok(None),
+            Err(e) => return Err(infra(e)),
+        };
+        // the body arrives as a stream; the port hands back bytes, so it is
+        // collected here rather than leaking S3's shape into the domain
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .map_err(|e| DomainError::Other(Box::new(e)))?;
+        Ok(Some(bytes.to_vec()))
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), DomainError> {
+        check_blob_key(key)?;
+        // S3 answers 204 whether or not the key was there, which is the
+        // idempotence the port documents — nothing to special-case
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(infra)
+    }
+}
+"##;
+
+/// Inserted above `// kodegen:resources` in `build_services_from_env`.
+///
+/// Static credentials out of the environment rather than `aws-config`'s provider
+/// chain: that chain is built asynchronously and this composition root is a
+/// plain `fn`. Swapping it in is a local change — make `build_services_from_env`
+/// `async`, `.await` the loader here, and everything below stays as it is.
+const S3_RESOURCE: &str = r##"    // one S3 client for the whole process. `S3_BUCKET` is what turns it on: a
+    // bucket is the one thing with no sensible default, so leaving it unset is
+    // how a project stays on the filesystem adapter.
+    let s3 = std::env::var("S3_BUCKET").ok().map(|bucket| {
+        // read once, at startup, and never refreshed: static keys only. Anything
+        // that rotates — STS, IRSA, SSO, an instance role — needs `aws-config`'s
+        // provider chain, which is async (see the README for that swap).
+        let creds = aws_sdk_s3::config::Credentials::new(
+            std::env::var("AWS_ACCESS_KEY_ID")
+                .expect("S3_BUCKET is set but AWS_ACCESS_KEY_ID is not"),
+            std::env::var("AWS_SECRET_ACCESS_KEY")
+                .expect("S3_BUCKET is set but AWS_SECRET_ACCESS_KEY is not"),
+            std::env::var("AWS_SESSION_TOKEN").ok(),
+            None,
+            "env",
+        );
+        let mut conf = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new(
+                std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
+            ))
+            .credentials_provider(creds);
+        // RustFS, MinIO and Ceph serve every bucket from one host, so the bucket
+        // has to stay in the path: virtual-host style would address
+        // `<bucket>.<endpoint>`, a name that does not resolve. AWS needs neither
+        // setting, which is why both hang off S3_ENDPOINT.
+        if let Ok(endpoint) = std::env::var("S3_ENDPOINT") {
+            conf = conf.endpoint_url(endpoint).force_path_style(true);
+        }
+        (aws_sdk_s3::Client::from_conf(conf.build()), bucket)
+    });"##;
+
+/// Appended to `bootstrap.rs`.
+const BUILD_BLOB_STORE_TPL: &str = r##"/// S3 when `S3_BUCKET` is set, a directory on disk otherwise — the same
+/// env-picks-the-adapter rule `build_user_service` follows for `DATABASE_URL`.
+fn build_blob_store(
+    s3: Option<&(aws_sdk_s3::Client, String)>,
+) -> Arc<dyn crate::domain::BlobStore> {
+    match s3 {
+        Some((client, bucket)) => Arc::new(crate::infrastructure::s3_blobs::S3BlobStore::new(
+            client.clone(),
+            bucket,
+        )),
+        // relative by default, so a `cargo run` in the project directory writes
+        // under it and nowhere else
+        None => Arc::new(crate::infrastructure::fs_blobs::FsBlobStore::new(
+            std::env::var("BLOB_DIR").unwrap_or_else(|_| "./data/blobs".into()),
+        )),
+    }
+}
+"##;
+
+const BLOB_TEST_TPL: &str = r##"//! The `BlobStore` contract, run against both adapters. Written by
+//! `kodegen add s3`.
+//!
+//! The S3 half is gated on `S3_BUCKET` rather than `#[ignore]`: booting
+//! `docker compose -f docker-compose.dev.yml up -d` and exporting the variables
+//! is all it takes to run it, and CI stays green without a server — the same
+//! switch that picks the adapter at runtime.
+
+use {{crate_name}}::domain::{BlobStore, DomainError};
+use {{crate_name}}::infrastructure::{fs_blobs::FsBlobStore, s3_blobs::S3BlobStore};
+
+/// One contract, every adapter. Two adapters that pass the same assertions are
+/// substitutable; two that are merely similar are a production-only bug.
+async fn behaves_like_a_blob_store(store: &dyn BlobStore, key: &str) {
+    // the S3 run reuses a real bucket, so start from a known state
+    store
+        .delete(key)
+        .await
+        .expect("deleting an absent key is Ok(())");
+    assert!(
+        store.get(key).await.expect("get").is_none(),
+        "a miss must be Ok(None), not an error"
+    );
+
+    store.put(key, b"v1".to_vec()).await.expect("put");
+    assert_eq!(
+        store.get(key).await.expect("get").as_deref(),
+        Some(&b"v1"[..])
+    );
+
+    store.put(key, b"v2".to_vec()).await.expect("overwrite");
+    assert_eq!(
+        store.get(key).await.expect("get").as_deref(),
+        Some(&b"v2"[..]),
+        "put must overwrite"
+    );
+
+    // bytes, not text: an adapter that round-tripped through a String would pass
+    // every assertion above and corrupt the first image anybody stores
+    let binary: Vec<u8> = (0u8..=255).collect();
+    store.put(key, binary.clone()).await.expect("put binary");
+    assert_eq!(store.get(key).await.expect("get"), Some(binary));
+
+    store.delete(key).await.expect("delete");
+    assert!(
+        store.get(key).await.expect("get").is_none(),
+        "the object was still there after delete"
+    );
+
+    // every adapter rejects the same keys, and rejects them the same way: the
+    // filesystem one would otherwise walk out of its directory, and an S3-only
+    // deployment would accept keys that stop working the day it moves to disk
+    for bad in [
+        "",
+        "/absolute",
+        "../escape",
+        "nested/../escape",
+        "a//b",
+        "a/./b",
+        // drive-relative on Windows: `PathBuf::push` would drop the blob root
+        "C:evil.txt",
+        "back\\slash",
+    ] {
+        assert!(
+            matches!(
+                store.put(bad, b"x".to_vec()).await,
+                Err(DomainError::Validation(_))
+            ),
+            "key {bad:?} must be refused"
+        );
+        assert!(matches!(
+            store.get(bad).await,
+            Err(DomainError::Validation(_))
+        ));
+        assert!(matches!(
+            store.delete(bad).await,
+            Err(DomainError::Validation(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn fs_blob_store_honors_the_contract() {
+    let dir = std::env::temp_dir().join(format!("{{crate_name}}-blob-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // a nested key exercises the directory creation `put` has to do
+    behaves_like_a_blob_store(&FsBlobStore::new(&dir), "objects/k1").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn s3_blob_store_honors_the_contract() {
+    let Ok(bucket) = std::env::var("S3_BUCKET") else {
+        eprintln!("S3_BUCKET unset — skipping the S3 contract test");
+        return;
+    };
+    // the same wiring bootstrap.rs does, so this tests the configuration the app
+    // actually runs with
+    let creds = aws_sdk_s3::config::Credentials::new(
+        std::env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID"),
+        std::env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY"),
+        std::env::var("AWS_SESSION_TOKEN").ok(),
+        None,
+        "env",
+    );
+    let mut conf = aws_sdk_s3::Config::builder()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(
+            std::env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        ))
+        .credentials_provider(creds);
+    if let Ok(endpoint) = std::env::var("S3_ENDPOINT") {
+        conf = conf.endpoint_url(endpoint).force_path_style(true);
+    }
+    let client = aws_sdk_s3::Client::from_conf(conf.build());
+    // the bucket is the one piece of setup the app does not do for itself
+    if let Err(e) = client.create_bucket().bucket(&bucket).send().await {
+        let already_there = e
+            .as_service_error()
+            .is_some_and(|e| e.is_bucket_already_owned_by_you() || e.is_bucket_already_exists());
+        assert!(already_there, "cannot create bucket {bucket}: {e}");
+    }
+    behaves_like_a_blob_store(&S3BlobStore::new(client, bucket), "kodegen/test/k1").await;
+}
+"##;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1380,6 +1986,150 @@ mod tests {
         let err = add(&root, Capability::Redis, true).unwrap_err().to_string();
         assert!(err.contains(ASYNC_TRAIT_USE), "{err}");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The same shape as the redis test, for the same reason: a new port, a new
+    /// `Services` field, and a builder wired into both composition roots.
+    #[test]
+    fn s3_writes_the_blob_port_and_wires_both_composition_roots() {
+        let root = fixture("s3");
+        add(&root, Capability::S3, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"sqlite\", \"blob\"]"), "{toml}");
+
+        let ports = fs::read_to_string(root.join(PORTS)).unwrap();
+        assert!(ports.contains("pub trait BlobStore: Send + Sync"), "{ports}");
+        assert!(ports.contains("pub fn check_blob_key"), "{ports}");
+        assert!(ports.contains("pub trait UserRepository"), "the existing ports were lost: {ports}");
+        assert!(
+            fs::read_to_string(root.join("src/domain/mod.rs"))
+                .unwrap()
+                .contains("pub use ports::{check_blob_key, BlobStore};")
+        );
+
+        let api = fs::read_to_string(root.join("src/api/mod.rs")).unwrap();
+        assert!(api.contains("pub blobs: Arc<dyn crate::domain::BlobStore>"), "{api}");
+
+        let bootstrap = fs::read_to_string(root.join("src/bootstrap.rs")).unwrap();
+        assert!(bootstrap.contains("S3_BUCKET"), "{bootstrap}");
+        // path-style is what makes RustFS/MinIO work at all: without it the
+        // request goes to <bucket>.<endpoint>, which resolves nowhere
+        assert!(bootstrap.contains("force_path_style(true)"), "{bootstrap}");
+        assert!(bootstrap.contains("blobs: build_blob_store(s3.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("blobs: build_blob_store(None),"), "{bootstrap}");
+        assert!(bootstrap.contains("fn build_blob_store("), "{bootstrap}");
+        for marker in [RESOURCES_MARKER, "// kodegen:services:env", "// kodegen:services:default"] {
+            assert!(bootstrap.contains(marker), "marker '{marker}' was consumed: {bootstrap}");
+        }
+
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        assert!(compose.contains("image: rustfs/rustfs:"), "{compose}");
+        assert!(compose.contains("minio"), "the MinIO swap must be documented where it is made");
+        let test = fs::read_to_string(root.join(BLOB_TEST)).unwrap();
+        assert!(test.contains("demo_svc::domain::{BlobStore, DomainError}"), "{test}");
+        // the default adapter has to be exercised with no server, or the
+        // "generated projects are green out of the box" promise is untested
+        assert!(test.contains("fn fs_blob_store_honors_the_contract"), "{test}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Object storage is neither a backend nor a cache, so all three coexist —
+    /// and none of the three `add`s may undo another's feature or compose block.
+    #[test]
+    fn s3_coexists_with_a_backend_and_a_cache() {
+        let root = fixture("s3-and-friends");
+        add(&root, Capability::Postgres, false).unwrap();
+        add(&root, Capability::Redis, false).unwrap();
+        add(&root, Capability::S3, false).unwrap();
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"postgres\", \"cache\", \"blob\"]"), "{toml}");
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        for service in ["  postgres:", "  redis:", "  s3:"] {
+            assert!(compose.contains(service), "{service} missing: {compose}");
+        }
+        let api = fs::read_to_string(root.join("src/api/mod.rs")).unwrap();
+        assert!(api.contains("pub cache:") && api.contains("pub blobs:"), "{api}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn adding_s3_twice_fails() {
+        let root = fixture("s3-twice");
+        add(&root, Capability::S3, false).unwrap();
+        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        assert!(err.contains("capability 's3' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn s3_dry_run_writes_nothing_but_plans_the_same_change() {
+        let root = fixture("s3-dry");
+        let before = snapshot(&root);
+        let planned = add(&root, Capability::S3, true).unwrap();
+        assert_eq!(before, snapshot(&root), "dry run touched the tree");
+        assert_eq!(planned, add(&root, Capability::S3, false).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn s3_names_the_missing_resources_marker() {
+        let root = fixture("s3-no-marker");
+        let bootstrap = fs::read_to_string(root.join("src/bootstrap.rs")).unwrap();
+        fs::write(root.join("src/bootstrap.rs"), bootstrap.replace(RESOURCES_MARKER, "")).unwrap();
+        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        assert!(err.contains(RESOURCES_MARKER), "{err}");
+        assert!(err.contains("build_services_from_env"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Appending to `ports.rs` is anchor-free, but it can still produce a file
+    /// that will not compile — and `add s3` appends a free function as well as a
+    /// trait, so it has one more collision to refuse than `add redis` does.
+    #[test]
+    fn s3_refuses_a_ports_file_it_cannot_append_to() {
+        let root = fixture("s3-ports-guard");
+        let ports = fs::read_to_string(root.join(PORTS)).unwrap();
+
+        fs::write(root.join(PORTS), format!("{ports}\npub trait BlobStore {{}}\n")).unwrap();
+        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        assert!(err.contains("already declares a `BlobStore` trait"), "{err}");
+
+        fs::write(root.join(PORTS), format!("{ports}\npub fn check_blob_key() {{}}\n")).unwrap();
+        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        assert!(err.contains("already declares `check_blob_key`"), "{err}");
+
+        fs::write(root.join(PORTS), ports.replace(ASYNC_TRAIT_USE, "")).unwrap();
+        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        assert!(err.contains(ASYNC_TRAIT_USE), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An adapter file the user already has is theirs — `add` creates files, it
+    /// does not overwrite them.
+    #[test]
+    fn s3_refuses_to_overwrite_an_existing_adapter() {
+        let root = fixture("s3-existing-adapter");
+        fs::write(root.join(S3_BLOBS), "// mine now\n").unwrap();
+        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        assert!(err.contains(S3_BLOBS) && err.contains("already exists"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The four S3 variables are printed as one line because three of them are
+    /// useless on their own — and the first has to be the one that selects the
+    /// adapter, since that is the one `add` tells you to leave unset.
+    #[test]
+    fn every_capability_leads_with_the_variable_that_selects_it() {
+        for (cap, first) in [
+            (Capability::Postgres, "DATABASE_URL"),
+            (Capability::Redis, "REDIS_URL"),
+            (Capability::S3, "S3_BUCKET"),
+        ] {
+            assert_eq!(cap.env()[0].0, first, "{}", cap.name());
+        }
+        let s3: Vec<&str> = Capability::S3.env().iter().map(|(k, _)| *k).collect();
+        assert_eq!(s3, ["S3_BUCKET", "S3_ENDPOINT", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]);
     }
 
     #[test]
