@@ -23,11 +23,13 @@
 //!   not ship, together with both of its adapters and the wiring. Purely
 //!   additive, so they compose with any datastore and with each other, and
 //!   neither has an existing file to refuse.
-//! - **clickhouse** and **influxdb** (`add_event_sink`) add the `EventSink` port
-//!   the same way — but the two of them share one *slot*, the way the datastores
-//!   do: one port, one adapter, so a project has an event sink or the other, never
-//!   both. Everything else about them is additive, so either sits next to any
-//!   datastore, the cache and the blob store.
+//! - **clickhouse**, **influxdb** and **greptimedb** (`add_event_sink`) add the
+//!   `EventSink` port the same way — but the three of them share one *slot*, the
+//!   way the datastores do: one port, one adapter, so a project has an event sink
+//!   or the other, never both. (`greptimedb` is `influxdb` with a different image
+//!   and two different variables, the way `mariadb` is `mysql` — one adapter, one
+//!   cargo feature.) Everything else about them is additive, so any of them sits
+//!   next to any datastore, the cache and the blob store.
 //!
 //! `Slot` is what makes "these exclude each other" one rule rather than one per
 //! pair: a capability names the slot it fills, the slot names the cargo features
@@ -52,6 +54,7 @@ pub enum Capability {
     S3,
     Clickhouse,
     Influxdb,
+    Greptimedb,
 }
 
 /// The axis a capability sits on: datastores replace each other, event sinks
@@ -78,9 +81,9 @@ impl Kind {
     /// The slot this kind fills, if it is exclusive. `Db`/`Mongo` is built once
     /// in the composition root and `UserRepository` gets one adapter, so postgres,
     /// mysql, mariadb, timescaledb and mongodb all exclude each other; the
-    /// `EventSink` port has exactly one adapter for the same reason, so clickhouse
-    /// and influxdb exclude each other. A cache and a blob store fill no slot and
-    /// sit alongside whatever is on.
+    /// `EventSink` port has exactly one adapter for the same reason, so clickhouse,
+    /// influxdb and greptimedb exclude each other. A cache and a blob store fill no
+    /// slot and sit alongside whatever is on.
     fn slot(&self) -> Option<Slot> {
         match self {
             Kind::Relational(_) | Kind::Document => Some(Slot::Datastore),
@@ -150,12 +153,17 @@ enum Relational {
 /// reason `Relational` is: they share every line of the port, the default
 /// adapter and the wiring, and differ only in the adapter file, the resource the
 /// composition root builds, the env that selects it and the compose service.
+///
+/// `Influxdb` and `Greptimedb` are two *names* for one of them, the way mariadb
+/// and mysql are: one adapter, because the write path is one HTTP POST of line
+/// protocol on both — only the image and the env differ.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EventBackend {
     Clickhouse,
-    /// InfluxDB v2, InfluxDB v3 and GreptimeDB — one adapter, because the write
-    /// path is one HTTP POST of line protocol on all three.
-    LineProtocol,
+    /// InfluxDB v2 and v3.
+    Influxdb,
+    /// The same line protocol, under `/v1/influxdb`.
+    Greptimedb,
 }
 
 /// Package name of the built-in template, needed to undo the rename
@@ -228,6 +236,25 @@ const INFLUX_ENV: &[(&str, &str)] = &[
     ("INFLUX_TOKEN", "kodegen-dev-token"),
 ];
 
+/// GreptimeDB's version of the above: the same three-variable shape with the
+/// compat prefix in the URL, and two variables rather than four because the
+/// other two have nothing to select.
+///
+/// - `/v1/influxdb` is where the line-protocol endpoint lives, so it is part of
+///   the *base* address — which is exactly why `INFLUX_URL` is a base and not a
+///   write URL.
+/// - `bucket=` names the database (verified against a real server, not only the
+///   docs), and it has to be one that already exists: Greptime creates a *table*
+///   on write but never a database, so `app` would answer `400 Failed to find
+///   schema`. `public` is the one every standalone server boots with.
+/// - no token: standalone runs with authentication off. Turn it on and the value
+///   is `<user>:<password>`, not a bare token (see the README).
+const GREPTIME_ENV: &[(&str, &str)] = &[
+    // first, and the one the composition root gates on: no URL, no sink
+    ("INFLUX_URL", "http://127.0.0.1:4000/v1/influxdb"),
+    ("INFLUX_BUCKET", "public"),
+];
+
 /// What the generated `docker-compose.dev.yml` boots, and the credentials it
 /// boots it with — dev-only defaults, printed together because an S3 client with
 /// three of the four is not a client.
@@ -251,6 +278,7 @@ impl Capability {
             Capability::S3 => "s3",
             Capability::Clickhouse => "clickhouse",
             Capability::Influxdb => "influxdb",
+            Capability::Greptimedb => "greptimedb",
         }
     }
 
@@ -271,7 +299,12 @@ impl Capability {
             Capability::Redis => Kind::Cache,
             Capability::S3 => Kind::Blob,
             Capability::Clickhouse => Kind::Events(EventBackend::Clickhouse),
-            Capability::Influxdb => Kind::Events(EventBackend::LineProtocol),
+            Capability::Influxdb => Kind::Events(EventBackend::Influxdb),
+            // the same line protocol on a different path, so it is the same
+            // adapter, the same cargo feature and the same generated code —
+            // what differs is the image and the two variables (see the README),
+            // exactly the relationship mariadb has with mysql
+            Capability::Greptimedb => Kind::Events(EventBackend::Greptimedb),
         }
     }
 
@@ -319,14 +352,15 @@ impl EventBackend {
     fn feature(self) -> &'static str {
         match self {
             EventBackend::Clickhouse => "analytics",
-            EventBackend::LineProtocol => "timeseries",
+            EventBackend::Influxdb | EventBackend::Greptimedb => "timeseries",
         }
     }
 
     fn env(self) -> &'static [(&'static str, &'static str)] {
         match self {
             EventBackend::Clickhouse => CLICKHOUSE_ENV,
-            EventBackend::LineProtocol => INFLUX_ENV,
+            EventBackend::Influxdb => INFLUX_ENV,
+            EventBackend::Greptimedb => GREPTIME_ENV,
         }
     }
 
@@ -334,14 +368,27 @@ impl EventBackend {
     fn adapter(self) -> (&'static str, &'static str) {
         match self {
             EventBackend::Clickhouse => (CLICKHOUSE_EVENTS, CLICKHOUSE_EVENTS_TPL),
-            EventBackend::LineProtocol => (LINE_PROTOCOL_EVENTS, LINE_PROTOCOL_EVENTS_TPL),
+            EventBackend::Influxdb | EventBackend::Greptimedb => {
+                (LINE_PROTOCOL_EVENTS, LINE_PROTOCOL_EVENTS_TPL)
+            }
         }
     }
 
     fn module(self) -> &'static str {
         match self {
             EventBackend::Clickhouse => "clickhouse_events",
-            EventBackend::LineProtocol => "line_protocol_events",
+            EventBackend::Influxdb | EventBackend::Greptimedb => "line_protocol_events",
+        }
+    }
+
+    /// The `kodegen add` name that got here — which is not `module()`: two
+    /// capabilities share that file, and neither of them is a command anyone can
+    /// type. An error message that names a command must name a real one.
+    fn capability_name(self) -> &'static str {
+        match self {
+            EventBackend::Clickhouse => "clickhouse",
+            EventBackend::Influxdb => "influxdb",
+            EventBackend::Greptimedb => "greptimedb",
         }
     }
 
@@ -350,7 +397,7 @@ impl EventBackend {
     fn resource_name(self) -> &'static str {
         match self {
             EventBackend::Clickhouse => "clickhouse",
-            EventBackend::LineProtocol => "influx",
+            EventBackend::Influxdb | EventBackend::Greptimedb => "influx",
         }
     }
 
@@ -359,7 +406,7 @@ impl EventBackend {
     fn resource(self) -> &'static str {
         match self {
             EventBackend::Clickhouse => CLICKHOUSE_RESOURCE,
-            EventBackend::LineProtocol => INFLUX_RESOURCE,
+            EventBackend::Influxdb | EventBackend::Greptimedb => INFLUX_RESOURCE,
         }
     }
 
@@ -368,7 +415,7 @@ impl EventBackend {
     fn builder(self) -> &'static str {
         match self {
             EventBackend::Clickhouse => BUILD_EVENT_SINK_CLICKHOUSE,
-            EventBackend::LineProtocol => BUILD_EVENT_SINK_INFLUX,
+            EventBackend::Influxdb | EventBackend::Greptimedb => BUILD_EVENT_SINK_INFLUX,
         }
     }
 
@@ -377,7 +424,7 @@ impl EventBackend {
     fn server_test(self) -> &'static str {
         match self {
             EventBackend::Clickhouse => CLICKHOUSE_TEST,
-            EventBackend::LineProtocol => INFLUX_TEST,
+            EventBackend::Influxdb | EventBackend::Greptimedb => INFLUX_TEST,
         }
     }
 
@@ -385,7 +432,8 @@ impl EventBackend {
     fn compose_service(self) -> (&'static str, &'static str) {
         match self {
             EventBackend::Clickhouse => ("clickhouse", CLICKHOUSE_COMPOSE),
-            EventBackend::LineProtocol => ("influxdb", INFLUX_COMPOSE),
+            EventBackend::Influxdb => ("influxdb", INFLUX_COMPOSE),
+            EventBackend::Greptimedb => ("greptimedb", GREPTIME_COMPOSE),
         }
     }
 }
@@ -531,11 +579,12 @@ pub fn list(project: &Path) -> Result<()> {
     println!("  redis        cache — the `Cache` port + a Redis adapter (Valkey speaks the same protocol)");
     println!("  s3           object storage — the `BlobStore` port + an S3 adapter (RustFS, MinIO, AWS)");
     println!("  clickhouse   event sink — the `EventSink` port + a ClickHouse adapter");
-    println!("  influxdb     event sink — the `EventSink` port + a line-protocol adapter (InfluxDB v2/v3, GreptimeDB)");
+    println!("  influxdb     event sink — the `EventSink` port + a line-protocol adapter (InfluxDB v2/v3)");
+    println!("  greptimedb   event sink — the same line-protocol adapter, GreptimeDB image + docs");
     println!();
     println!(
         "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb) and one event sink \
-         (clickhouse, influxdb) can be on at a time; redis and s3 sit alongside them."
+         (clickhouse, influxdb, greptimedb) can be on at a time; redis and s3 sit alongside them."
     );
     match fs::read_to_string(project.join("Cargo.toml")).ok().as_deref().and_then(default_line) {
         // `default = [...]` is the only state there is — the features it lists
@@ -623,8 +672,8 @@ fn slot_conflict(slot: Slot, other: &str, cap: Capability) -> String {
         // capability rather than swapping a file: the second `add` writes the port
         // and the wiring too, and would refuse every one of them as already there
         Slot::Events => format!(
-            "capability '{other}' already provides this project's event sink, and there can only be \
-             one (the `EventSink` port has a single adapter, and the client behind it is built once \
+            "the `{other}` event sink ({}) already fills this project's `EventSink`, and there can \
+             only be one (the port has a single adapter, and the client behind it is built once \
              in bootstrap.rs).\n\
              To switch to '{}', undo '{other}' first — every file below was written by that one \
              command, so `git revert` of its commit does all of it:\n  \
@@ -636,10 +685,14 @@ fn slot_conflict(slot: Slot, other: &str, cap: Capability) -> String {
              src/bootstrap.rs — the resource block above `// kodegen:resources`, both \
              `events: build_event_sink(...)` lines and `fn build_event_sink`\n  \
              4. rerun `kodegen add {}`",
+            match other {
+                "analytics" => "kodegen add clickhouse",
+                _ => "kodegen add influxdb / greptimedb",
+            },
             cap.name(),
             match other {
                 "analytics" => EventBackend::Clickhouse.module(),
-                _ => EventBackend::LineProtocol.module(),
+                _ => EventBackend::Influxdb.module(),
             },
             cap.name()
         ),
@@ -1067,11 +1120,12 @@ fn add_s3(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
     Ok((paths(&creates), paths(&edits)))
 }
 
-/// `kodegen add clickhouse` and `kodegen add influxdb` — the `EventSink` port,
-/// its log-only default adapter, and one of the two backends behind it.
+/// `kodegen add clickhouse` / `influxdb` / `greptimedb` — the `EventSink` port,
+/// its log-only default adapter, and one of the two backends behind it (three
+/// commands, two adapters: `greptimedb` is `influxdb`'s with another image).
 ///
 /// Additive like `add redis`/`add s3`, with one difference that is the reason
-/// `Slot` exists: the two backends are alternatives, so the second one is refused
+/// `Slot` exists: the backends are alternatives, so the second one is refused
 /// in `add` before this function runs. Everything below is therefore written
 /// exactly once per project, and the only thing that varies is `backend`.
 ///
@@ -1124,7 +1178,7 @@ fn add_event_sink(
                     return Err(format!(
                         "already declares {what} — appending a second one would not compile. \
                          Remove yours, or keep it and skip `kodegen add {}`.",
-                        backend.module()
+                        backend.capability_name()
                     )
                     .into());
                 }
@@ -1444,8 +1498,9 @@ CREATE TABLE users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL);
 -- An example, and the only thing here that is not plain PostgreSQL: a
 -- hypertable is a normal table that the extension partitions by time for you.
 -- Nothing in the generated Rust reads it — replace it with your own measurement
--- table (`kodegen add clickhouse`/`influxdb` write the app-side `EventSink` port
--- instead, which is a different thing and can be added alongside).
+-- table (`kodegen add clickhouse`/`influxdb`/`greptimedb` write the app-side
+-- `EventSink` port instead, which is a different thing and can be added
+-- alongside).
 CREATE TABLE events (
     recorded_at TIMESTAMPTZ NOT NULL,
     name TEXT NOT NULL,
@@ -1950,7 +2005,9 @@ const INFLUX_COMPOSE: &str = r##"  influxdb:
     # `setup` mode creates the org, the bucket and the token on first boot, so
     # INFLUX_TOKEN below is usable without a UI visit. InfluxDB 3 Core
     # (`image: influxdb:3-core`) and GreptimeDB (`image: greptime/greptimedb`)
-    # take the same line protocol — only INFLUX_URL's path changes (see README).
+    # take the same line protocol — on v3 only INFLUX_URL's path changes, and on
+    # GreptimeDB INFLUX_BUCKET must be `public` as well (`kodegen add greptimedb`
+    # does both; see README).
     image: influxdb:2
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
@@ -1963,6 +2020,30 @@ const INFLUX_COMPOSE: &str = r##"  influxdb:
       - "8086:8086"
     healthcheck:
       test: ["CMD", "influx", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+"##;
+
+/// GreptimeDB standalone: the same line protocol as InfluxDB, one path deeper,
+/// which is why `kodegen add greptimedb` writes the same adapter and differs
+/// from `add influxdb` in this block and in two environment variables.
+const GREPTIME_COMPOSE: &str = r##"  greptimedb:
+    # `standalone` is the whole database in one process — the same server the
+    # distributed mode runs, without a metasrv to point it at.
+    #
+    # `--http-addr 0.0.0.0:4000` is not optional: the default binds 127.0.0.1,
+    # which inside a container means the published port answers nothing.
+    #
+    # INFLUX_BUCKET is `public`, not `app`: Greptime creates a table on write but
+    # never a database, and `public` is the one that exists on a fresh server.
+    image: greptime/greptimedb:v1.1.4
+    command: standalone start --http-addr 0.0.0.0:4000
+    ports:
+      - "4000:4000"
+    healthcheck:
+      # curl ships in the image (it is Ubuntu-based); there is no wget
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:4000/health"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -3108,10 +3189,12 @@ fn build_event_sink(clickhouse: Option<&clickhouse::Client>) -> Arc<dyn crate::d
 
 const LINE_PROTOCOL_EVENTS_TPL: &str = r##"//! `EventSink` adapter over the InfluxDB line protocol — which is InfluxDB v2,
 //! InfluxDB v3 **and** GreptimeDB, because all three accept the same text on the
-//! same kind of HTTP endpoint. The URL is the only thing that differs between
+//! same kind of HTTP endpoint. The URL — and on GreptimeDB the bucket, which
+//! has to name a database that already exists — is all that differs between
 //! them, and that is configuration, not code (see the README).
 //!
-//! Written by `kodegen add influxdb`. The client and the fully-resolved write
+//! Written by `kodegen add influxdb` (or `kodegen add greptimedb` — the same
+//! adapter, a different image and URL). The client and the fully-resolved write
 //! URL are owned by the composition root (`bootstrap.rs`) and handed in, exactly
 //! like the Diesel `Db` handle: an adapter never reads `INFLUX_URL` itself.
 //!
@@ -3257,6 +3340,7 @@ const INFLUX_RESOURCE: &str = r##"    // the write endpoint, assembled once. `IN
     //   InfluxDB v2    INFLUX_URL=http://127.0.0.1:8086          (+ INFLUX_ORG)
     //   InfluxDB v3    INFLUX_URL=http://127.0.0.1:8181          (bucket = database)
     //   GreptimeDB     INFLUX_URL=http://127.0.0.1:4000/v1/influxdb
+    //                  (bucket = an existing database; `public` on a fresh server)
     //
     // ponytail: the bucket and org go into the query string verbatim, so a name
     // with a space or an `&` in it would need percent-encoding — reach for a URL
@@ -3295,7 +3379,7 @@ fn build_event_sink(influx: Option<&(String, Option<String>)>) -> Arc<dyn crate:
 /// that do not need a server are the same either way, and they are the ones that
 /// keep the two adapters interchangeable.
 const EVENTS_TEST_TPL: &str = r##"//! The `EventSink` contract, run against both adapters. Written by
-//! `kodegen add clickhouse` / `kodegen add influxdb`.
+//! `kodegen add clickhouse` / `influxdb` / `greptimedb`.
 //!
 //! The server half is gated on the sink's URL rather than `#[ignore]`: booting
 //! `docker compose -f docker-compose.dev.yml up -d` and exporting the variables
@@ -3805,6 +3889,7 @@ mod tests {
             (Capability::S3, "S3_BUCKET"),
             (Capability::Clickhouse, "CLICKHOUSE_URL"),
             (Capability::Influxdb, "INFLUX_URL"),
+            (Capability::Greptimedb, "INFLUX_URL"),
         ] {
             assert_eq!(cap.env()[0].0, first, "{}", cap.name());
         }
@@ -4407,6 +4492,74 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// GreptimeDB is `influxdb` with a different image and two different
+    /// variables — the relationship mariadb has with mysql. Everything the two
+    /// commands write must therefore be identical apart from the compose service:
+    /// the moment one of them grows a file of its own, this is not an alias.
+    #[test]
+    fn greptimedb_is_the_influxdb_capability_with_its_own_service() {
+        let influx = fixture("greptime-parity-influx");
+        let greptime = fixture("greptime-parity");
+        let planned_influx = add(&influx, Capability::Influxdb, false).unwrap();
+        assert_eq!(planned_influx, add(&greptime, Capability::Greptimedb, false).unwrap());
+
+        // one cargo feature, one adapter, one composition root: the only file
+        // that may differ is the compose one
+        for (rel, bytes) in snapshot(&influx) {
+            if rel == COMPOSE {
+                continue;
+            }
+            let mine = fs::read(greptime.join(&rel)).unwrap();
+            assert_eq!(bytes, mine, "{rel} differs between influxdb and greptimedb");
+        }
+
+        let compose = fs::read_to_string(greptime.join(COMPOSE)).unwrap();
+        assert!(compose.contains("image: greptime/greptimedb:"), "{compose}");
+        // the two facts a real server made us learn: it binds loopback unless
+        // told otherwise, and `public` is the database that exists
+        assert!(compose.contains("--http-addr 0.0.0.0:4000"), "{compose}");
+        assert_eq!(
+            Capability::Greptimedb.env(),
+            [("INFLUX_URL", "http://127.0.0.1:4000/v1/influxdb"), ("INFLUX_BUCKET", "public")]
+        );
+        fs::remove_dir_all(&influx).unwrap();
+        fs::remove_dir_all(&greptime).unwrap();
+    }
+
+    /// Two names for the `timeseries` feature, so they refuse each other from
+    /// both sides — the same answer `mysql` and `mariadb` give.
+    #[test]
+    fn greptimedb_and_influxdb_are_the_same_capability() {
+        let err = check_combination(&[Capability::Influxdb, Capability::Greptimedb])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the same capability"), "{err}");
+        assert!(err.contains("`timeseries` cargo feature"), "{err}");
+
+        for (tag, first, second) in [
+            ("greptime-on-influx", Capability::Influxdb, Capability::Greptimedb),
+            ("influx-on-greptime", Capability::Greptimedb, Capability::Influxdb),
+        ] {
+            let root = fixture(tag);
+            add(&root, first, false).unwrap();
+            let err = add(&root, second, true).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("capability '{}' already added", second.name())),
+                "{tag}: {err}"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+
+        // and the other occupant of the slot still refuses it as a *different*
+        // capability, with the undo steps
+        let root = fixture("greptime-on-clickhouse");
+        add(&root, Capability::Clickhouse, false).unwrap();
+        let err = add(&root, Capability::Greptimedb, true).unwrap_err().to_string();
+        assert!(err.contains("the `analytics` event sink (kodegen add clickhouse)"), "{err}");
+        assert!(err.contains("rerun `kodegen add greptimedb`"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Both directions of the event-sink slot, because a user can arrive at it
     /// from either side — the same rule the datastore slot has, which is the
     /// whole point of there being a `Slot` at all.
@@ -4415,7 +4568,7 @@ mod tests {
         let root = fixture("clickhouse-then-influx");
         add(&root, Capability::Clickhouse, false).unwrap();
         let err = add(&root, Capability::Influxdb, true).unwrap_err().to_string();
-        assert!(err.contains("'analytics' already provides this project's event sink"), "{err}");
+        assert!(err.contains("the `analytics` event sink (kodegen add clickhouse)"), "{err}");
         assert!(err.contains("clickhouse_events.rs"), "must name the file to remove: {err}");
         assert!(err.contains("rerun `kodegen add influxdb`"), "{err}");
         // nothing was written by the refusal
@@ -4424,7 +4577,10 @@ mod tests {
         let root2 = fixture("influx-then-clickhouse");
         add(&root2, Capability::Influxdb, false).unwrap();
         let err = add(&root2, Capability::Clickhouse, true).unwrap_err().to_string();
-        assert!(err.contains("'timeseries' already provides this project's event sink"), "{err}");
+        assert!(
+            err.contains("the `timeseries` event sink (kodegen add influxdb / greptimedb)"),
+            "{err}"
+        );
         assert!(err.contains("line_protocol_events.rs"), "{err}");
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&root2).unwrap();
@@ -4432,7 +4588,11 @@ mod tests {
 
     #[test]
     fn adding_an_event_sink_twice_fails() {
-        for (tag, cap) in [("ch-twice", Capability::Clickhouse), ("influx-twice", Capability::Influxdb)] {
+        for (tag, cap) in [
+            ("ch-twice", Capability::Clickhouse),
+            ("influx-twice", Capability::Influxdb),
+            ("greptime-twice", Capability::Greptimedb),
+        ] {
             let root = fixture(tag);
             add(&root, cap, false).unwrap();
             let err = add(&root, cap, true).unwrap_err().to_string();
@@ -4443,7 +4603,11 @@ mod tests {
 
     #[test]
     fn event_sink_dry_run_writes_nothing_but_plans_the_same_change() {
-        for (tag, cap) in [("ch-dry", Capability::Clickhouse), ("influx-dry", Capability::Influxdb)] {
+        for (tag, cap) in [
+            ("ch-dry", Capability::Clickhouse),
+            ("influx-dry", Capability::Influxdb),
+            ("greptime-dry", Capability::Greptimedb),
+        ] {
             let root = fixture(tag);
             let before = snapshot(&root);
             let planned = add(&root, cap, true).unwrap();
@@ -4481,6 +4645,11 @@ mod tests {
             fs::write(root.join(PORTS), format!("{ports}\n{spike}\n")).unwrap();
             let err = add(&root, Capability::Clickhouse, true).unwrap_err().to_string();
             assert!(err.contains(expected), "{spike}: {err}");
+            // the second half names a command to skip, so it has to be one that
+            // exists — `line_protocol_events` is a file, not a capability
+            assert!(err.contains("skip `kodegen add clickhouse`"), "{spike}: {err}");
+            let err = add(&root, Capability::Greptimedb, true).unwrap_err().to_string();
+            assert!(err.contains("skip `kodegen add greptimedb`"), "{spike}: {err}");
         }
         fs::write(root.join(PORTS), ports.replace(ASYNC_TRAIT_USE, "")).unwrap();
         let err = add(&root, Capability::Influxdb, true).unwrap_err().to_string();
@@ -4639,6 +4808,10 @@ mod tests {
             .to_string();
         assert!(err.contains("at most one event sink"), "{err}");
         assert!(err.contains("clickhouse, influxdb"), "must name both: {err}");
+        let err = check_combination(&[Capability::Clickhouse, Capability::Greptimedb])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at most one event sink"), "{err}");
         // one of each slot, plus the two additive ones, is the arrangement that
         // has to keep working
         assert!(

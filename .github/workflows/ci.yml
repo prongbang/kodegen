@@ -47,12 +47,19 @@ jobs:
   # `clickhouse` and `influxdb` are both listed because they are the two halves
   # of one slot: only one of them can ever be compiled in a single project, so a
   # job per capability is the only way either adapter is compiled at all.
+  #
+  # `greptimedb` writes byte-for-byte what `influxdb` does apart from the compose
+  # service (a unit test pins that), so compiling it again would prove nothing.
+  # It is here for the *server*: the step below boots the image it just generated
+  # and runs the contract test against GreptimeDB's line-protocol endpoint, which
+  # is the only thing that keeps "one adapter covers both" a fact rather than a
+  # claim about a compatibility layer nobody exercised.
   generated:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        capability: [postgres, mysql, timescaledb, mongodb, redis, s3, clickhouse, influxdb]
+        capability: [postgres, mysql, timescaledb, mongodb, redis, s3, clickhouse, influxdb, greptimedb]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -106,13 +113,14 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: ${{ runner.temp }}/demo
 
-      # The one adapter with no server anywhere else in this file: the
-      # generated-all job below runs clickhouse (the event sink whose write can
-      # be counted back out), so without this the line-protocol adapter is only
-      # ever compiled. Booted from the compose file `add influxdb` just wrote,
-      # which makes this a check on that file too. `--wait` blocks on its
-      # healthcheck; the variables go into the environment only on this branch,
-      # so every other capability's Test step still runs with none of them set.
+      # The generated-all job below runs clickhouse (the event sink whose write
+      # can be counted back out), so this step and the greptimedb one after it are
+      # the only places the line-protocol adapter meets a server rather than only
+      # a compiler — one per product it claims to cover. Booted from the compose
+      # file `add influxdb` just wrote, which makes this a check on that file too.
+      # `--wait` blocks on its healthcheck; the variables go into the environment
+      # only on this branch, so every other capability's Test step still runs with
+      # none of them set.
       - name: Boot the time-series server the compose file generated
         if: matrix.capability == 'influxdb'
         working-directory: ${{ runner.temp }}/demo
@@ -125,14 +133,29 @@ jobs:
             echo "INFLUX_TOKEN=kodegen-dev-token"
           } >> "$GITHUB_ENV"
 
+      # The same thing one product over, and the reason this capability has a row
+      # at all: `INFLUX_BUCKET` is `public` because GreptimeDB creates a table on
+      # write but never a database, and no token because standalone runs with
+      # authentication off. Both are what `kodegen add greptimedb` prints.
+      - name: Boot the GreptimeDB the compose file generated
+        if: matrix.capability == 'greptimedb'
+        working-directory: ${{ runner.temp }}/demo
+        run: |
+          docker compose -f docker-compose.dev.yml up -d --wait
+          {
+            echo "INFLUX_URL=http://127.0.0.1:4000/v1/influxdb"
+            echo "INFLUX_BUCKET=public"
+          } >> "$GITHUB_ENV"
+
       # no `cargo check` step: `clippy --all-targets` above already type-checks
       # everything `check` would, and compiling the AWS SDK twice is minutes.
       #
       # no DATABASE_URL and no REDIS_URL, so the adapter tests skip themselves
       # and the in-memory adapters are what run — the promise that a generated
-      # project is green without a server. The influxdb row is the exception, and
-      # deliberately so: the step above sets INFLUX_* for it, so there the
-      # line-protocol adapter runs against a real server instead of skipping.
+      # project is green without a server. The influxdb and greptimedb rows are the
+      # exception, and deliberately so: the steps above set INFLUX_* for them, so
+      # there the line-protocol adapter runs against a real server of each product
+      # instead of skipping.
       - name: Test
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo

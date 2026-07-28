@@ -7,7 +7,7 @@ switching their infrastructure capabilities.
 |---|---|
 | `kodegen new <name>` | Generate a project from a template |
 | `kodegen feature <name>` | Scaffold one feature across every layer and wire it up |
-| `kodegen add <capability>` | Add infrastructure: a datastore (postgres/mysql/mariadb/timescaledb/mongodb), a cache (redis), object storage (s3) or an event sink (clickhouse/influxdb) |
+| `kodegen add <capability>` | Add infrastructure: a datastore (postgres/mysql/mariadb/timescaledb/mongodb), a cache (redis), object storage (s3) or an event sink (clickhouse/influxdb/greptimedb) |
 | `kodegen list` | List built-in and cached templates |
 | `kodegen update <template>` | Re-clone a cached remote template |
 
@@ -108,7 +108,8 @@ kodegen add mongodb                      # the same UserRepository, on the Mongo
 kodegen add redis                        # a Cache port + a Redis adapter (Valkey too)
 kodegen add s3                           # a BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
 kodegen add clickhouse                   # an EventSink port + a ClickHouse adapter
-kodegen add influxdb                     # the same port, over line protocol (Influx v2/v3, Greptime)
+kodegen add influxdb                     # the same port, over line protocol (InfluxDB v2/v3)
+kodegen add greptimedb                   # same adapter as influxdb, GreptimeDB image + URL
 kodegen add postgres --path ~/svc        # run from outside the project
 kodegen add postgres --dry-run           # show the plan, write nothing
 kodegen add --list                       # what's supported + what this project has on
@@ -126,12 +127,13 @@ kodegen new svc --with postgres,redis,s3 # generate, then add, in one command
 | `s3` | — (additive) | **`BlobStore`** (new) | files under `./data/blobs` | `S3_BUCKET` (+ endpoint/credentials) |
 | `clickhouse` | event sink | **`EventSink`** (new) | the tracing log | `CLICKHOUSE_URL` (+ `_DB`/`_USER`/`_PASSWORD`) |
 | `influxdb` | event sink | **`EventSink`** (same) | the tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`/`_ORG`/`_TOKEN`) |
+| `greptimedb` | event sink | **`EventSink`** (same) | the tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`) |
 
 A **slot** holds exactly one adapter, so the capabilities in it are alternatives:
 the four relational backends and `mongodb` are all adapters of the same
-`UserRepository`, and `clickhouse`/`influxdb` are both adapters of the same
-`EventSink`. `--with` rejects a second occupant of either slot before `new`
-writes anything. Everything else combines freely — one datastore, one event sink,
+`UserRepository`, and `clickhouse`/`influxdb`/`greptimedb` are all adapters of
+the same `EventSink`. `--with` rejects a second occupant of either slot before
+`new` writes anything. Everything else combines freely — one datastore, one event sink,
 a cache and a blob store is a legal set (`--with mongodb,redis,s3,clickhouse`).
 
 `add postgres` rewrites the six things that actually differ between dialects:
@@ -165,8 +167,8 @@ Two rules the command enforces:
   first one, not applied halfway. `add redis` and `add s3` fill no slot and are
   never caught by this rule.
 - **Adding the same capability twice** is an error, not a no-op rewrite. So is
-  adding two names for one cargo feature: `mariadb` after `mysql`, or
-  `timescaledb` after `postgres`.
+  adding two names for one cargo feature: `mariadb` after `mysql`,
+  `timescaledb` after `postgres`, or `greptimedb` after `influxdb`.
 
 Two of those are replacements, not edits, so both are guarded: `diesel_db.rs`
 must still be byte-for-byte what `kodegen new` wrote, and `diesel_repo.rs` must
@@ -190,8 +192,9 @@ compose image and the wording differ. TimescaleDB stands in the same relation to
 `postgres` (an extension, not a different server — see below), Valkey to `redis`
 (same RESP protocol, same client, same generated Rust — swap the image in
 `docker-compose.dev.yml` and nothing else changes), MinIO and Ceph to `s3` (one
-API, one adapter, one endpoint variable), and GreptimeDB to `influxdb` (the same
-line protocol on a different path). Nine capabilities, six adapters.
+API, one adapter, one endpoint variable), and `greptimedb` to `influxdb` (the
+same line protocol on a different path, so the same `timeseries` feature and the
+same adapter file). Ten capabilities, six adapters.
 
 #### `add timescaledb`
 
@@ -217,9 +220,9 @@ migration; nothing in `src/` changes. That is also why there is no separate
 `timescaledb` cargo feature — and why `--with postgres,timescaledb` is refused as
 one capability named twice.
 
-An app-side `EventSink` (`add clickhouse` / `add influxdb`) is a different thing
-and can be added alongside: the hypertable is schema in *this* project's
-database, the event sink is a port to somebody else's.
+An app-side `EventSink` (`add clickhouse` / `influxdb` / `greptimedb`) is a
+different thing and can be added alongside: the hypertable is schema in *this*
+project's database, the event sink is a port to somebody else's.
 
 #### `add mongodb`
 
@@ -337,12 +340,13 @@ Three things worth knowing before you build on it:
 - **The bucket is not created for you.** `tests/blob.rs` creates it because a
   test may; the app assumes it exists, the way it assumes the database does.
 
-#### `add clickhouse` / `add influxdb`
+#### `add clickhouse` / `add influxdb` / `add greptimedb`
 
-One port, two backends, and the only additive capability with a *slot*: the
-`EventSink` port has one adapter, so a project has ClickHouse or a time-series
-database, never both. Everything else about it is additive — either one sits
-next to any datastore, the cache and the blob store.
+One port, two adapters, three commands, and the only additive capability with a
+*slot*: the `EventSink` port has one adapter, so a project has ClickHouse or a
+time-series database, never both (`influxdb` and `greptimedb` are two names for
+the second one). Everything else about it is additive — any of them sits next to
+any datastore, the cache and the blob store.
 
 ```
 Cargo.toml                                  default = [...] gains "analytics" or "timeseries"
@@ -350,11 +354,11 @@ src/domain/ports.rs                         the EventSink port + Event + check_e
 src/domain/mod.rs                           pub use ports::{check_event, Event, EventSink};
 src/infrastructure/log_events.rs            default adapter — writes to the tracing log, no server
 src/infrastructure/clickhouse_events.rs     ClickHouse adapter        (add clickhouse)
-src/infrastructure/line_protocol_events.rs  line-protocol adapter     (add influxdb)
+src/infrastructure/line_protocol_events.rs  line-protocol adapter     (add influxdb, add greptimedb)
 src/api/mod.rs                              one `events` field on Services
 src/bootstrap.rs                            the client built once + a build_event_sink builder
 tests/events.rs                             the port's contract, run against both adapters
-docker-compose.dev.yml                      a clickhouse or influxdb service with a healthcheck
+docker-compose.dev.yml                      a clickhouse, influxdb or greptimedb service with a healthcheck
 ```
 
 ```bash
@@ -364,21 +368,26 @@ CLICKHOUSE_URL=http://127.0.0.1:8123 CLICKHOUSE_DB=app \
 # or
 INFLUX_URL=http://127.0.0.1:8086 INFLUX_BUCKET=app INFLUX_ORG=app \
   INFLUX_TOKEN=kodegen-dev-token cargo run
+# or (add greptimedb)
+INFLUX_URL=http://127.0.0.1:4000/v1/influxdb INFLUX_BUCKET=public cargo run
 ```
 
-**`influxdb` is three products.** InfluxDB v2, InfluxDB v3 and GreptimeDB all
-accept the same line protocol over the same kind of HTTP endpoint, so they are
-one adapter and the difference is `INFLUX_URL`:
+**One adapter, three products.** InfluxDB v2, InfluxDB v3 and GreptimeDB all
+accept the same line protocol over the same kind of HTTP endpoint, so `add
+influxdb` and `add greptimedb` write the same `timeseries` feature and the same
+adapter file — what differs is the compose service and `INFLUX_URL`:
 
 | Server | `INFLUX_URL` | Notes |
 |---|---|---|
 | InfluxDB v2 | `http://127.0.0.1:8086` | set `INFLUX_ORG`; `INFLUX_BUCKET` is the bucket |
 | InfluxDB v3 | `http://127.0.0.1:8181` | `INFLUX_BUCKET` is the database; org is ignored |
-| GreptimeDB | `http://127.0.0.1:4000/v1/influxdb` | `INFLUX_BUCKET` is the database; if auth is on, `INFLUX_TOKEN` is `<user>:<password>`, not a bare token |
+| GreptimeDB | `http://127.0.0.1:4000/v1/influxdb` | `INFLUX_BUCKET` is the database and it must already exist (the server creates *tables* on write, not databases) — `public` is the one a fresh server has. `INFLUX_ORG` is ignored; `INFLUX_TOKEN` is unused unless authentication is on, and then it is `<user>:<password>`, not a bare token |
 
 The composition root appends `/api/v2/write?bucket=…&precision=ns` to whatever
-you set, which is the whole reason the path is yours to choose. Swap the image in
-`docker-compose.dev.yml` and nothing in the generated Rust changes.
+you set, which is the whole reason the path is yours to choose — GreptimeDB's
+compat endpoint lives under `/v1/influxdb`, so that prefix is part of the base
+address. Swap the image in `docker-compose.dev.yml` and nothing in the generated
+Rust changes; `add greptimedb` is that swap, done for you.
 
 What the port is, and is not:
 
