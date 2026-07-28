@@ -9,4 +9,24 @@
 # Add an advisory id to `ignore` only with a comment saying why, and revisit it:
 #   ignore = ["RUSTSEC-0000-0000"] # not reachable: <reason>, recheck <date>
 [advisories]
-ignore = []
+ignore = [
+    # `rsa` — Marvin attack (a timing sidechannel), no fixed version published.
+    # Reached only through `seaorm-mysql` -> sea-orm/sqlx-mysql, and three things
+    # have to be true at once for that to matter here; none of them are:
+    #
+    # 1. It is in the lock, not in the build, unless `seaorm-mysql` is the
+    #    selected feature. Every other project pins `rsa` and never compiles it.
+    # 2. The advisory is about **private-key decryption** timing. sqlx-mysql's
+    #    only use of the crate is `RsaPublicKey::encrypt` with OAEP, on the public
+    #    key the server hands over during `caching_sha2_password`/`sha256_password`
+    #    auth (`sqlx-mysql/src/connection/auth.rs`, `encrypt_rsa`) — and it skips
+    #    even that on a TLS connection. There is no private key on this side, so
+    #    there is no decryption to time. Verified in the source of the locked
+    #    version, not assumed.
+    # 3. There is nothing to upgrade to: the advisory has no patched release, so
+    #    the alternative to ignoring it is dropping MySQL-on-SeaORM entirely.
+    #
+    # Revisit when `rsa` ships a fix (then delete this entry), or if sqlx ever
+    # starts decrypting with it. Recheck 2027-01.
+    "RUSTSEC-2023-0071",
+]

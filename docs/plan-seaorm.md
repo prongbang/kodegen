@@ -1,7 +1,7 @@
 # Implementation Plan — Phase 6: SeaORM as a second ORM
 
-สถานะ: **plan เท่านั้น ยังไม่ implement** — เจ้าของโปรเจกต์ override gate ใน
-`plan-persistence.md` §6 ("รอ signal") แล้ว
+สถานะ: **ship ครบทั้ง 6a และ 6b แล้ว** (6a = `44b26bc`, 6b = commit ถัดไป)
+เอกสารนี้เก็บไว้เป็นบันทึกการตัดสินใจ + §12/§13 ที่บันทึกว่าอะไรขัดกับความจริงตอนรัน
 ขอบเขต: ให้ผู้ใช้เลือก ORM ได้บน capability กลุ่ม relational โดยไม่แตะ port,
 ไม่แตะ `kodegen feature`, และไม่แตะ composition root ที่เป็น `fn`
 
@@ -547,9 +547,92 @@ sqlx/sea-query/rustls คือ dependency tree ที่ advisory ขยับ�
    - มี test pin กันเติมกลับโดยไม่ตั้งใจ (`embedded_template_still_matches_every_signature_add_checks`)
    - **เงื่อนไขเพิ่มของ 6b:** ต้องตอบเรื่อง `rsa` ให้ได้ก่อน (รอ fix, `--ignore RUSTSEC-2023-0071`
      ใน audit job, หรือ `sqlx-mysql` ที่ไม่ต้องใช้ `rsa` สำหรับ `caching_sha2_password`)
-     ไม่ใช่แค่ "เพิ่ม CI แถวที่รันกับ MySQL จริง"
+     ไม่ใช่แค่ "เพิ่ม CI แถวที่รันกับ MySQL จริง" — **ตอบแล้วใน §13.1**
 
 9. **retry ใน `conn()` ต้องไม่ครอบ error ที่ต่อไม่ติด (พบตอน review).** ของเดิม `is_err()` ล้วน
    ⇒ DB ที่ล่มจ่าย acquire timeout **สองรอบ** (30+30 วิ) ขัดกับที่ README/หัวไฟล์เขียนไว้ว่า 30
    และสิทธิ์ไม่พอก็ยิงซ้ำฟรี ๆ. ตอนนี้ `DbErr::Conn(_) | DbErr::ConnectionAcquire(_)` return ทันที
    ที่เหลือ (= server ตอบมาเอง รวมถึง 23505 ของข้อ 2) retry หนึ่งครั้งตามเดิม
+
+---
+
+## 13. 6b — สิ่งที่ทำจริงและผลวัด (ปิด Phase 6)
+
+ขอบเขตที่ ship: `kodegen add mysql|mariadb --orm seaorm`, template ประกาศ
+`seaorm-mysql`, CI แถว `mysql --orm seaorm` ที่รันกับ MySQL จริงสองรอบ,
+และ housekeeping ของ lock ที่ 6a ค้างไว้
+
+### 13.1 `rsa` / RUSTSEC-2023-0071 — ตัดสินว่า **ignore พร้อมเหตุผล** (precedent Phase 1a)
+
+ทางเลือกที่มี: (ก) รอ fix — advisory ไม่มี patched version เลย จึงเท่ากับไม่ทำ 6b
+(ข) เลิกทำ MySQL บน SeaORM (ค) ignore ใน `.cargo/audit.toml` ที่ template ship อยู่แล้ว
+เลือก (ค) และเขียนเหตุผลสามข้อไว้ในไฟล์:
+
+1. อยู่ใน lock ไม่ได้อยู่ใน build เว้นแต่ `seaorm-mysql` เป็น feature ที่เลือก
+2. **ตรวจจาก source ของ `sqlx-mysql` 0.8.6 ที่ lock pin ไว้จริง ไม่ใช่จากความจำ** —
+   `src/connection/auth.rs::encrypt_rsa` เป็นที่เดียวที่ใช้ crate นี้ และใช้แค่
+   `RsaPublicKey::encrypt` (OAEP/SHA-1) กับ public key ที่ server ส่งมาระหว่าง
+   `caching_sha2_password`/`sha256_password` — แถม `if stream.is_tls { return ... }`
+   ข้ามไปเลยบน TLS. ไม่มี private key ฝั่ง client ⇒ ไม่มี decryption ให้จับเวลา
+   ซึ่งเป็นสิ่งที่ Marvin attack ต้องการ ⇒ **ข้อเท็จจริง (ข) ในคำสั่งเป็นจริง**
+3. ไม่มีอะไรให้ upgrade ไป
+   
+วัดจริงบน template lock: ไม่มี ignore = `error: 1 vulnerability found!` (rsa 0.9.10,
+"No fixed upgrade is available!") · มี ignore = 0. ผลนี้ตกไปถึงทุกโปรเจกต์ที่ generate
+เพราะ `.cargo/audit.toml` เป็นไฟล์ของ template. มี unit test ผูกสองอย่างนี้ไว้ด้วยกัน
+(`embedded_template_still_matches_every_signature_add_checks`): ประกาศ `seaorm-mysql`
+แล้วไม่มี ignore = test แดง
+
+### 13.2 lock
+
+- `seaorm-mysql` คืนมา 14 package เดิมเป๊ะ (`rsa`, `sqlx-mysql`, `pkcs1/8`, `der`, `spki`,
+  `num-bigint-dig`, …) ไม่มี package ไหนถูกถอดหรือขยับเวอร์ชัน — diff ที่เหลือคือ
+  `spin` / `const-oid` ถูกเขียนเป็น `spin 0.10.1` เพราะมีสองเวอร์ชันในกราฟแล้ว
+- housekeeping ที่ 6a flag ไว้: `cargo update -p bytes -p time` → `bytes` 1.10.1→1.12.1,
+  `time` 0.3.44→0.3.54 (+ `num-conv`, `time-core`, `time-macros` ตามมา)
+  ⇒ **453 → 467 package, `cargo audit` เหลือ 0 unignored advisories** (จากเดิม 2)
+- template ผ่าน `cargo test --locked` + `cargo clippy --locked --all-targets -D warnings`
+  หลัง bump
+
+### 13.3 ที่ไม่ต้องแก้เลย (ตามที่ §12.5 คาดไว้)
+
+`Relational::{feature, startup_ddl, compose_service, database_url}` แยก dialect
+มาตั้งแต่ 6a ทั้งหมด ⇒ 6b ฝั่ง Rust คือ **ลบ arm ปฏิเสธใน `check_orm` + สองบรรทัดใน `--list`**
+`SEA_DB_TPL`/`SEA_REPO_TPL`/`SEA_SWAP`/`add_seaorm` ไม่ถูกแตะแม้แต่บรรทัดเดียว
+`check_orm` ที่เหลือจึงเป็น "capability นี้มี ORM ไหม" ล้วน — ไม่ใช่ match สอง arm ที่ตอบ
+`Ok` เหมือนกันทั้งคู่
+
+### 13.4 docker gate (รันจริงบนเครื่อง ไม่ใช่แค่ CI)
+
+| ที่รัน | ผล |
+|---|---|
+| `mysql:8.4` จาก compose ที่ `add` เขียน, `cargo test --locked` **สองรอบทับ DB เดิม** | เขียวทั้งสองรอบ (12 unit + 5 api) — DDL idempotent จริง |
+| `save_twice_identical_values_is_ok` บน MySQL จริง | ผ่าน — `exec_without_returning` ทำงานตามที่ §12.1 สั่ง |
+| `SHOW CREATE TABLE users` | `id varchar(64) NOT NULL, PRIMARY KEY (id)` — dialect lesson ของ `TEXT PRIMARY KEY` ถูกกันไว้ใน startup DDL ด้วย |
+| `cargo run` + HTTP: POST ใหม่ → 201, POST id เดิมค่าใหม่ → 201 + GET เห็นค่าใหม่, **POST id เดิมค่าเดิมซ้ำสองครั้ง → 201 ทั้งคู่**, GET ที่ไม่มี → 404 | ผ่าน — เคส 0 affected rows ตรง ๆ ไม่กลายเป็น 500 |
+| `mariadb:11` หนึ่งรอบ (fmt / clippy -D warnings / test สองรอบ / audit) | เขียวทั้งหมด |
+
+โปรเจกต์ที่ generate: `--locked` ผ่านทุกคำสั่ง, lock ไม่ขยับตอนพลิก feature,
+`diff` ระหว่าง mysql กับ mariadb = ชื่อ project + compose service + ชื่อ dialect ใน doc comment
+เท่านั้น ⇒ CI แถว mariadb ยังไม่ต้องมีตามธรรมเนียมเดิม
+
+### 13.5 ช่องว่างของ §9.3 — ปิดแล้ว ด้วย step เดียว ไม่ใช่การสลับ datastore
+
+§9.3 เสนอให้สลับ datastore ของ job `generated-all` ไปเป็น `seaorm-postgres` แล้วย้าย
+live test ของ mongo ไปแถวของตัวเอง — ราคาคือเสีย live-Mongo coverage ในjob นั้นไป
+ทำถูกกว่า: บนแถว matrix ที่เป็น seaorm อยู่แล้ว เพิ่ม `add s3` ต่อท้ายก่อน Clippy
+(`s3` เป็น additive ไม่แย่ง slot กับใคร) ⇒ `sqlx` กับ `aws-sdk-s3` ถูก compile
+เข้าไบนารีเดียวกันทุก CI run ซึ่งเป็นสิ่งเดียวที่ §9.3 ต้องการจริง ๆ
+(คำถาม rustls provider: `blob` เลือก aws-lc-rs ไม่ได้ ส่วน `seaorm` ถูก pin ตามมัน)
+`generated-all` ไม่ต้องแตะ และ mongo ยัง live เหมือนเดิม — ราคา 3 บรรทัด YAML
+
+พิสูจน์ก่อนเข้า CI: `new` → `add mysql --orm seaorm` → `add s3` บนโปรเจกต์เดียว
+แล้ว `cargo check --locked --all-targets` ผ่าน, lock ไม่ขยับ,
+`cargo tree -e features -i rustls` เหลือ provider เดียว (aws-lc-rs) และ `-i ring` ว่าง
+
+### 13.6 audit ของ template มี job ถาวรแล้ว
+
+`.github/workflows/ci.yml` ของ **kodegen เอง** เพิ่ม job `audit-template`:
+`cargo audit` ใน `working-directory: templates/hexagonal`. เดิม lock ของ template
+ถูก audit ก็ต่อเมื่อมีคน generate โปรเจกต์แล้ว push (job `audit` ของ template)
+— ซึ่งช้าเกินไปสำหรับไฟล์ที่อยู่ใน repo นี้ ผลวัด 2→0 advisories จึงมีตัวรันซ้ำถาวร

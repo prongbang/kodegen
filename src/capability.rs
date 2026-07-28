@@ -663,10 +663,10 @@ impl Relational {
 pub fn list(project: &Path) -> Result<()> {
     println!("Supported capabilities:");
     println!("  postgres     relational — PostgreSQL (--orm diesel [default] | seaorm)");
-    println!("  mysql        relational — MySQL (--orm diesel [default]; seaorm not implemented yet)");
+    println!("  mysql        relational — MySQL (--orm diesel [default] | seaorm)");
     println!(
         "  mariadb      relational — MariaDB (MySQL protocol: same driver, same adapter) (--orm \
-         diesel [default]; seaorm not implemented yet)"
+         diesel [default] | seaorm)"
     );
     println!("  timescaledb  relational — TimescaleDB (a PostgreSQL extension: same driver, plus a hypertable) (--orm diesel [default] | seaorm)");
     println!("  mongodb      document — MongoDB behind the same `UserRepository`, in place of Diesel");
@@ -695,37 +695,24 @@ pub fn list(project: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `--orm` on a capability that has no ORM, and `--orm seaorm` on a backend the
-/// SeaORM path does not generate yet. Both are refused *before* anything is
-/// read: an ignored flag is how a project ends up on the wrong ORM silently.
+/// `--orm` on a capability that has no ORM at all — refused *before* anything is
+/// read, because an ignored flag is how a project ends up on the wrong ORM
+/// silently.
+///
+/// Every relational backend answers to both ORMs now that MySQL/MariaDB have
+/// shipped on SeaORM, so there is nothing left to refuse per backend. A third
+/// ORM would change that: it would arrive supporting some subset, and this is
+/// where that subset gets written down.
 fn check_orm(cap: Capability, orm: Option<Orm>) -> Result<()> {
-    let Some(orm) = orm else { return Ok(()) };
-    let Kind::Relational(rel) = cap.kind() else {
+    if orm.is_some() && !cap.takes_orm() {
         return Err(format!(
             "--orm applies only to relational capabilities (postgres, mysql, mariadb, timescaledb) \
              — '{}' has no ORM",
             cap.name()
         )
         .into());
-    };
-    // matched, not `if`-ed: a third ORM has to answer this question for every
-    // backend rather than falling through to "fine, ship it"
-    match (orm, rel) {
-        (Orm::Diesel, _) => Ok(()),
-        (Orm::Seaorm, Relational::Postgres | Relational::Timescaledb) => Ok(()),
-        (Orm::Seaorm, Relational::Mysql | Relational::Mariadb) => Err(format!(
-            "`--orm seaorm` does not support '{}' yet — the SeaORM path ships PostgreSQL and \
-             TimescaleDB first. MySQL is the one backend where the upsert behaves differently at \
-             *runtime* (an `ON DUPLICATE KEY UPDATE` that changes nothing reports 0 affected rows, \
-             which sea-orm turns into an error), so it ships when there is a CI row running it \
-             against a real MySQL server — not before.\n\
-             Today: `kodegen add {} --orm diesel` (the default), or `kodegen add postgres --orm \
-             seaorm`.",
-            cap.name(),
-            cap.name()
-        )
-        .into()),
     }
+    Ok(())
 }
 
 /// Rejects a `--with` list that cannot be applied, *before* `new` renders
@@ -741,9 +728,9 @@ pub fn check_combination(with: &[Capability], orm: Option<Orm>) -> Result<()> {
                 .into(),
         );
     }
-    for cap in with {
-        check_orm(*cap, orm.filter(|_| cap.takes_orm()))?;
-    }
+    // no per-entry `check_orm` here: the only thing it refuses is `--orm` on a
+    // capability that has no ORM, and on this path the flag belongs to the
+    // relational entry — the check above is what makes sure there is one
     // by feature, not by variant: `--with mysql,mariadb` is two names for one
     // cargo feature, and the second `add` would die with "already added" halfway
     // through a `new` that has already written the project
@@ -5199,6 +5186,79 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The Phase 6b path. MySQL and MariaDB are one cargo feature and one
+    /// adapter on this ORM exactly as they are on the other — what differs is
+    /// the column type (MySQL cannot index a bare `TEXT`) and the compose image.
+    #[test]
+    fn mysql_and_mariadb_on_seaorm_are_one_feature_and_differ_only_in_the_image() {
+        let mut generated = Vec::new();
+        for (tag, cap, image) in [
+            ("seaorm-mysql", Capability::Mysql, "image: mysql:8.4"),
+            ("seaorm-mariadb", Capability::Mariadb, "image: mariadb:11"),
+        ] {
+            let root = fixture(tag);
+            let dockerfile_before = fs::read_to_string(root.join("Dockerfile")).unwrap();
+            add(&root, cap, Some(Orm::Seaorm), false).unwrap();
+
+            let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+            assert!(toml.contains("default = [\"seaorm-mysql\"]"), "{tag}: {toml}");
+
+            let db = fs::read_to_string(root.join(SEA_DB)).unwrap();
+            // the dialect lesson from the Diesel path, repeated here because the
+            // startup DDL is a separate constant: `TEXT PRIMARY KEY` is rejected
+            // by MySQL at run time, and this path has no migration step to fail
+            // in first
+            assert!(
+                db.contains("CREATE TABLE IF NOT EXISTS users (id VARCHAR(64) PRIMARY KEY NOT NULL"),
+                "{tag}: the MySQL startup DDL must not index a bare TEXT: {db}"
+            );
+
+            // the upsert is the reason this phase exists: `ON DUPLICATE KEY
+            // UPDATE` reports 0 affected rows when the new values equal the old,
+            // and `exec` would call that `RecordNotInserted`
+            let repo = fs::read_to_string(root.join(SEA_REPO)).unwrap();
+            assert!(repo.contains("exec_without_returning"), "{tag}: {repo}");
+            assert!(
+                repo.contains("fn save_twice_identical_values_is_ok"),
+                "{tag}: {repo}"
+            );
+
+            // the payoff over `--orm diesel` on this backend is bigger than it is
+            // on postgres: no mysqlclient-sys, so no cmake either
+            assert_eq!(
+                dockerfile_before,
+                fs::read_to_string(root.join("Dockerfile")).unwrap(),
+                "{tag}: the SeaORM path adds no C driver, so the build stage is untouched"
+            );
+
+            let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+            assert!(compose.contains(image), "{tag}: {compose}");
+            generated.push((root, compose));
+        }
+
+        // one feature, one adapter, one set of generated Rust: apart from the
+        // name in the doc comments, only the compose service tells the two apart
+        // — which is what makes a CI row for mariadb a row that proves nothing
+        let [(mysql_root, mysql_compose), (maria_root, maria_compose)]: [_; 2] =
+            generated.try_into().unwrap();
+        for file in [SEA_DB, SEA_REPO, BOOTSTRAP, "Cargo.toml"] {
+            let maria = fs::read_to_string(maria_root.join(file))
+                .unwrap()
+                .replace("MariaDB", "MySQL")
+                .replace("mariadb", "mysql");
+            assert_eq!(
+                fs::read_to_string(mysql_root.join(file)).unwrap(),
+                maria,
+                "{file} differs between mysql and mariadb on SeaORM by more than the name"
+            );
+        }
+        assert_ne!(mysql_compose, maria_compose);
+
+        for dir in [mysql_root, maria_root] {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
     /// Every direction into the datastore slot, because a user can arrive from
     /// any of them and each one has to name what to put back.
     #[test]
@@ -5304,25 +5364,23 @@ mod tests {
         .to_string();
         assert!(err.contains("--orm applies only"), "{err}");
 
-        // MySQL on SeaORM is a phase, not a mistake, and says so
-        let err = add(&root, Capability::Mysql, Some(Orm::Seaorm), true)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("does not support 'mysql' yet"), "{err}");
-        assert!(
-            err.contains("0 affected rows"),
-            "must say why it is not shipped: {err}"
-        );
-        assert!(
-            err.contains("--orm diesel"),
-            "must say what to do today: {err}"
-        );
-        assert!(
-            add(&root, Capability::Mariadb, Some(Orm::Seaorm), true)
-                .unwrap_err()
-                .to_string()
-                .contains("does not support 'mariadb' yet")
-        );
+        // ...and every relational backend takes both ORMs, which is the other
+        // half of the same rule: the flag is refused where it means nothing, and
+        // accepted everywhere it means something
+        for cap in [
+            Capability::Postgres,
+            Capability::Timescaledb,
+            Capability::Mysql,
+            Capability::Mariadb,
+        ] {
+            for orm in [Orm::Diesel, Orm::Seaorm] {
+                assert!(
+                    check_orm(cap, Some(orm)).is_ok(),
+                    "{} must accept both ORMs",
+                    cap.name()
+                );
+            }
+        }
 
         // `new --with` takes the same flag, and it has to land on something
         let err = check_combination(&[Capability::Redis, Capability::S3], Some(Orm::Seaorm))
@@ -5337,7 +5395,7 @@ mod tests {
             .is_ok(),
             "the ORM belongs to the relational entry; the others must not be refused"
         );
-        assert!(check_combination(&[Capability::Mysql], Some(Orm::Seaorm)).is_err());
+        assert!(check_combination(&[Capability::Mysql], Some(Orm::Seaorm)).is_ok());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -5431,15 +5489,19 @@ mod tests {
 
     #[test]
     fn seaorm_dry_run_writes_nothing_but_plans_the_same_change() {
-        let root = fixture("seaorm-dry");
-        let before = snapshot(&root);
-        let planned = add(&root, Capability::Postgres, Some(Orm::Seaorm), true).unwrap();
-        assert_eq!(before, snapshot(&root), "dry run touched the tree");
-        assert_eq!(
-            planned,
-            add(&root, Capability::Postgres, Some(Orm::Seaorm), false).unwrap()
-        );
-        fs::remove_dir_all(&root).unwrap();
+        // both backends: they write the same four paths, and a plan that says so
+        // for one and not the other would be the first sign they had drifted
+        for (tag, cap) in [
+            ("seaorm-dry", Capability::Postgres),
+            ("seaorm-dry-mysql", Capability::Mysql),
+        ] {
+            let root = fixture(tag);
+            let before = snapshot(&root);
+            let planned = add(&root, cap, Some(Orm::Seaorm), true).unwrap();
+            assert_eq!(before, snapshot(&root), "{tag}: dry run touched the tree");
+            assert_eq!(planned, add(&root, cap, Some(Orm::Seaorm), false).unwrap());
+            fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// The whole reason the SeaORM handle is called `Db`: a builder scaffolded
@@ -5683,21 +5745,23 @@ mod tests {
             // `default = [...]`, so both of these have to already be declared
             "seaorm = [\"dep:sea-orm\"",
             "seaorm-postgres = [\"seaorm\"",
+            "seaorm-mysql = [\"seaorm\"",
         ] {
             assert!(toml.contains(feature), "template's [features] lost `{feature}`");
         }
-        // `--orm seaorm` on mysql/mariadb is refused by `check_orm`, so the
-        // feature has nowhere to be turned on from — and declaring it anyway is
-        // not free: `sea-orm/sqlx-mysql` pulls `rsa` (RUSTSEC-2023-0071, no
-        // fixed version) into Cargo.lock, and cargo-audit reads the lock without
-        // caring which features are on. One line here would fail the audit job
-        // of every generated project. It comes back with 6b.
-        // the declaration, not the word — the comment above it in the template
-        // says the same thing in prose
+        // `seaorm-mysql` is the one feature that costs an advisory to declare:
+        // `sea-orm/sqlx-mysql` pulls `rsa` (RUSTSEC-2023-0071, no fixed version)
+        // into Cargo.lock, and cargo-audit reads the lock without caring which
+        // features are on. Without this entry the audit job of *every* generated
+        // project fails, MySQL or not — so the two lines travel together.
+        // by line, not by substring: a commented-out entry still contains the id,
+        // and it is the live entry that keeps cargo-audit quiet
         assert!(
-            !toml.contains("\nseaorm-mysql = "),
-            "the template declares `seaorm-mysql` again — that puts `rsa` back in Cargo.lock and \
-             turns cargo-audit red in every generated project"
+            file("hexagonal/.cargo/audit.toml")
+                .lines()
+                .any(|l| l.trim() == "\"RUSTSEC-2023-0071\","),
+            "the template declares `seaorm-mysql` but does not ignore the `rsa` advisory it puts \
+             in Cargo.lock — that fails the audit job of every generated project"
         );
         // and the line that makes "one ORM per project" a compile error rather
         // than a convention — a project with both on links two ORMs

@@ -111,6 +111,7 @@ kodegen add clickhouse                   # an EventSink port + a ClickHouse adap
 kodegen add influxdb                     # the same port, over line protocol (InfluxDB v2/v3)
 kodegen add greptimedb                   # same adapter as influxdb, GreptimeDB image + URL
 kodegen add postgres --orm seaorm        # the same PostgreSQL, on SeaORM instead of Diesel
+kodegen add mysql --orm seaorm           # same again on MySQL/MariaDB — no C driver to build
 kodegen add postgres --path ~/svc        # run from outside the project
 kodegen add postgres --dry-run           # show the plan, write nothing
 kodegen add --list                       # what's supported + what this project has on
@@ -243,15 +244,25 @@ one `UserRepository`, so they share the datastore slot with each other and with
 ```bash
 kodegen add postgres --orm seaorm
 kodegen add timescaledb --orm seaorm     # same feature, plus an idempotent hypertable
+kodegen add mysql --orm seaorm           # no libmysqlclient, so no cmake in the build image
+kodegen add mariadb --orm seaorm         # = mysql, different compose image
 ```
 
-Available on `postgres` and `timescaledb` today. `mysql`/`mariadb` on SeaORM is
-refused with a message saying so rather than generated blind: MySQL is the one
-backend whose upsert differs at *runtime* (below), and it ships when CI runs it
-against a real MySQL server. The template does not even declare the feature —
-`sea-orm/sqlx-mysql` puts `rsa` in `Cargo.lock` (RUSTSEC-2023-0071, no fixed
-version), and `cargo audit` reads the lock whether or not the feature is on. The
-Diesel `mysql` backend is unaffected: libmysqlclient does its own auth in C.
+All four relational capabilities, on either ORM. MySQL is the backend that had
+to prove itself against a real server before it shipped, because its upsert
+differs at *runtime* rather than at compile time (below), and CI now runs a row
+that does exactly that — twice over the same database.
+
+One thing to know about the MySQL side: `seaorm-mysql` pulls `sqlx-mysql`, which
+pulls `rsa`, which carries **RUSTSEC-2023-0071 with no fixed version**. It is in
+`Cargo.lock` of every generated project whether or not the feature is on, so
+`.cargo/audit.toml` ignores it, with the reasoning in the file. The short
+version: the advisory is a timing sidechannel in RSA *decryption*, and
+`sqlx-mysql` only ever encrypts — with the public key the server hands over
+during `caching_sha2_password` auth, and not at all over TLS. There is no
+private key on the client side to attack. Delete the ignore the day `rsa` ships
+a fix. The Diesel `mysql` backend never had this: libmysqlclient does its auth
+in C.
 
 ```
 Cargo.toml                              default = ["sqlite"] -> ["seaorm-postgres"]

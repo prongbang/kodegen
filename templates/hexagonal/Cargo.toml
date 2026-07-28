@@ -177,15 +177,17 @@ document = ["dep:mongodb", "tokio/sync"]
 # a `compile_error!`, because cargo features are additive and would otherwise
 # happily build both.
 #
-# There is no `seaorm-mysql` here, and adding one is not free: `sea-orm/sqlx-mysql`
-# pulls `rsa` into Cargo.lock, and `rsa` carries RUSTSEC-2023-0071 with **no fixed
-# version available**. cargo-audit reads the lock and does not care which features
-# are on, so that one line turns the audit job red in every generated project,
-# whether or not anyone uses MySQL. The Diesel `mysql` feature above is unaffected
-# (libmysqlclient does its own auth in C). It comes back when there is somewhere
-# for it to go — see the plan's 6b.
+# `seaorm-mysql` costs one advisory to declare: `sea-orm/sqlx-mysql` pulls `rsa`
+# into Cargo.lock, and `rsa` carries RUSTSEC-2023-0071 with no fixed version.
+# cargo-audit reads the lock and does not care which features are on, so it fires
+# in every generated project. It is ignored in `.cargo/audit.toml`, with the
+# reasoning written out there — the short version is that the advisory is about
+# RSA *decryption* timing and sqlx-mysql only ever encrypts, with the server's
+# public key. The Diesel `mysql` feature above never had this (libmysqlclient
+# does its auth in C).
 seaorm = ["dep:sea-orm", "sqlx/tls-rustls-aws-lc-rs", "tokio/sync"]
 seaorm-postgres = ["seaorm", "sea-orm/sqlx-postgres"]
+seaorm-mysql = ["seaorm", "sea-orm/sqlx-mysql"]
 # Not a backend: `cache` sits alongside whichever relational feature is on.
 # Redis and Valkey speak the same protocol, so this one feature covers both.
 cache = ["dep:redis"]

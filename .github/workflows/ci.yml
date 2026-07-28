@@ -48,15 +48,24 @@ jobs:
   # of one slot: only one of them can ever be compiled in a single project, so a
   # job per capability is the only way either adapter is compiled at all.
   #
-  # `postgres --orm seaorm` is the second ORM's only row, and it earns it twice
-  # over: it is the first time a line of the SeaORM adapter meets a compiler, and
-  # the first time this matrix runs a datastore *live* — the schema arrives with
-  # the first connection, so unlike the Diesel rows there is nothing to apply
-  # first. It also compiles the state where Diesel is gated out of both
-  # `bootstrap.rs` and `infrastructure/mod.rs` while a `Db` handle still exists,
-  # which nothing else does. There is no `mysql --orm seaorm` row because there
-  # is no such capability yet: MySQL's upsert differs at runtime, not at compile
-  # time, so it ships with a row of its own or not at all.
+  # `postgres --orm seaorm` earns its row twice over: it is the first time a line
+  # of the SeaORM adapter meets a compiler, and the first time this matrix runs a
+  # datastore *live* — the schema arrives with the first connection, so unlike
+  # the Diesel rows there is nothing to apply first. It also compiles the state
+  # where Diesel is gated out of both `bootstrap.rs` and `infrastructure/mod.rs`
+  # while a `Db` handle still exists, which nothing else does.
+  #
+  # `mysql --orm seaorm` is the second ORM's other row, and it is a *runtime*
+  # row: the generated Rust is postgres's apart from one `VARCHAR(64)`, so
+  # compiling it again would prove almost nothing. What only a real MySQL server
+  # can answer is the upsert — `ON DUPLICATE KEY UPDATE` reports 0 affected rows
+  # when the new values equal the old, and sea-orm's `exec` turns that into
+  # `RecordNotInserted`, which would make `save` fail the contract the port
+  # documents. `exec_without_returning` is the fix and this row is the proof;
+  # `save_twice_identical_values_is_ok` is the test that fails without it, and
+  # the second Test step re-runs the whole suite over rows that already exist.
+  # mariadb has no row for the usual reason: same feature, same adapter, same
+  # DDL — only the compose image differs, and a unit test pins that.
   #
   # `greptimedb` writes byte-for-byte what `influxdb` does apart from the compose
   # service (a unit test pins that), so compiling it again would prove nothing.
@@ -83,14 +92,20 @@ jobs:
           - capability: clickhouse
           - capability: influxdb
           - capability: greptimedb
-          # The SeaORM path, and the first row in this matrix that runs its
+          # The SeaORM path, and the only rows in this matrix that run their
           # datastore live. That is not a bonus: it is the only way to prove the
           # startup DDL, because there is no migration step to apply and the
-          # schema arrives with the first connection. It boots the compose file
+          # schema arrives with the first connection. They boot the compose file
           # `add` just wrote — the same trick the influxdb row uses — and then
-          # runs the suite *twice* (see the second Test step).
+          # run the suite *twice* (see the second Test step). `db_url` is carried
+          # per row rather than branched on below: it is the same URL `kodegen
+          # add` prints for that backend.
           - capability: postgres
             orm: seaorm
+            db_url: postgres://app:app@127.0.0.1:5432/app
+          - capability: mysql
+            orm: seaorm
+            db_url: mysql://app:app@127.0.0.1:3306/app
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -132,6 +147,16 @@ jobs:
       # first order has to find and rewrite.
       - name: Scaffold another feature on top of the capability
         run: cargo run --locked -- feature notification --path "$RUNNER_TEMP/demo"
+
+      # The one place sqlx and the AWS SDK are compiled into the same binary.
+      # They are the two halves of the rustls provider question (`blob` can only
+      # take aws-lc-rs, so `seaorm` is pinned to it too), and no other job can
+      # put them together: `generated-all` runs mongodb in the datastore slot,
+      # which excludes both ORMs. One extra `add` on a project that already has
+      # its datastore — s3 is additive, so nothing is displaced.
+      - name: Add the object store on top, so sqlx and the AWS SDK link together
+        if: matrix.orm == 'seaorm'
+        run: cargo run --locked -- add s3 --path "$RUNNER_TEMP/demo"
 
       - name: new --with is the same thing in one command
         run: cargo run --locked -- new demo-with --with ${{ matrix.capability }} ${{ matrix.orm && format('--orm {0}', matrix.orm) || '' }} --output "$RUNNER_TEMP"
@@ -178,17 +203,19 @@ jobs:
             echo "INFLUX_BUCKET=public"
           } >> "$GITHUB_ENV"
 
-      # The SeaORM row, and the first datastore in this matrix that runs live.
-      # It can, because nothing has to be applied first: the adapter creates its
-      # own schema on the first connection. Booted from the compose file `add
-      # postgres --orm seaorm` just wrote — a check on that file too, and it is
-      # the *same* postgres service the Diesel row generates.
+      # The SeaORM rows, and the only datastores in this matrix that run live.
+      # They can, because nothing has to be applied first: the adapter creates
+      # its own schema on the first connection. Booted from the compose file
+      # `add <backend> --orm seaorm` just wrote — a check on that file too, and
+      # it is the *same* service the Diesel row for the backend generates.
       - name: Boot the database the compose file generated
         if: matrix.orm == 'seaorm'
         working-directory: ${{ runner.temp }}/demo
+        env:
+          DB_URL: ${{ matrix.db_url }}
         run: |
           docker compose -f docker-compose.dev.yml up -d --wait
-          echo "DATABASE_URL=postgres://app:app@127.0.0.1:5432/app" >> "$GITHUB_ENV"
+          echo "DATABASE_URL=$DB_URL" >> "$GITHUB_ENV"
 
       # no `cargo check` step: `clippy --all-targets` above already type-checks
       # everything `check` would, and compiling the AWS SDK twice is minutes.
@@ -349,3 +376,25 @@ jobs:
           CLICKHOUSE_DB: app
           CLICKHOUSE_USER: app
           CLICKHOUSE_PASSWORD: app
+
+  # The template's Cargo.lock is a file in *this* repo, so its advisories are
+  # this repo's problem: every project generated from it inherits the lock, and
+  # nothing else here reads it. The generated project's own CI has an audit job,
+  # but that only fires after somebody generates a project and pushes it — this
+  # is the copy that fires on every change to the template.
+  #
+  # `.cargo/audit.toml` next to it is what makes `rsa` (RUSTSEC-2023-0071, no
+  # fixed version, pulled in by `seaorm-mysql`) an ignore with a written reason
+  # rather than a permanently red job. Anything else that appears here is real:
+  # the fix is a lock bump, not another entry in that file.
+  audit-template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit the template's lock
+        run: cargo audit
+        working-directory: templates/hexagonal

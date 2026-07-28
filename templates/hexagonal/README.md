@@ -120,6 +120,7 @@ kodegen add mysql         # Diesel + MySQL
 kodegen add mariadb       # same driver as mysql; MariaDB image
 kodegen add timescaledb   # same driver as postgres; + a hypertable migration
 kodegen add postgres --orm seaorm   # the same PostgreSQL, on SeaORM (see below)
+kodegen add mysql --orm seaorm      # the same MySQL/MariaDB, on SeaORM — no C driver
 kodegen add mongodb       # the same UserRepository, on the Mongo driver
 kodegen add redis         # the Cache port + a Redis adapter (Valkey too)
 kodegen add s3            # the BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
@@ -178,12 +179,13 @@ migration time, not compile time.
 
 The relational capabilities take `--orm diesel` (the default, everything above)
 or `--orm seaorm`. Same backend, same `DATABASE_URL`, same compose service —
-different adapter, and a different set of trade-offs. PostgreSQL and TimescaleDB
-today; MySQL is refused with a message rather than generated untested.
+different adapter, and a different set of trade-offs. All four backends:
+PostgreSQL and TimescaleDB on `seaorm-postgres`, MySQL and MariaDB on
+`seaorm-mysql`.
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | `default = [...]` becomes `["seaorm-postgres"]` |
+| `Cargo.toml` | `default = [...]` becomes `["seaorm-postgres"]` (or `["seaorm-mysql"]`) |
 | `src/infrastructure/sea_db.rs` | **created** — the `Db` handle, a lazily opened connection, and the `SCHEMA` applied with it |
 | `src/infrastructure/sea_repo.rs` | **created** — the entity and the `UserRepository` adapter |
 | `src/infrastructure/mod.rs` | two `#[cfg(feature = "seaorm")] pub mod` lines appended; the Diesel modules stay on disk, gated off |
@@ -215,6 +217,14 @@ Two more things that follow from applying schema at startup:
 - **A database that is down costs a request 30 seconds** (sqlx's acquire timeout)
   before its 503, and the failure is not cached — the next request retries.
   `opts.acquire_timeout(...)` in `sea_db.rs` shortens it.
+
+And one thing that follows from MySQL being in the lock at all: `sqlx-mysql`
+depends on `rsa`, which carries **RUSTSEC-2023-0071 with no fixed version**.
+`Cargo.lock` pins it whether or not `seaorm-mysql` is the selected feature, so
+`.cargo/audit.toml` ignores that advisory — the full reasoning is in the file,
+and the short version is that the advisory is about RSA *decryption* timing
+while `sqlx-mysql` only encrypts, with the public key the server sends during
+`caching_sha2_password` auth. Delete the ignore when `rsa` publishes a fix.
 
 Both handles are called `Db`, deliberately: they can never be compiled together
 (`src/lib.rs` has a `compile_error!` for the additive-feature case), so sharing
