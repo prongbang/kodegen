@@ -37,6 +37,9 @@ enum Cmd {
         /// Capability to add right after generating (e.g. --with postgres)
         #[arg(long, value_delimiter = ',')]
         with: Vec<capability::Capability>,
+        /// ORM for the relational capability in --with (default: diesel)
+        #[arg(long, value_enum)]
+        orm: Option<capability::Orm>,
     },
     /// Add an infrastructure capability (relational backend, cache, object storage) to a generated project
     Add {
@@ -45,11 +48,18 @@ enum Cmd {
         /// Project root
         #[arg(short, long, default_value = ".")]
         path: PathBuf,
+        /// ORM for a relational capability: diesel (default) or seaorm
+        ///
+        /// Deliberately not `default_value = "diesel"`: `--orm diesel` next to
+        /// `redis` is a mistake worth an error, and "not given" is the only way
+        /// to tell it from a capability that simply has no ORM.
+        #[arg(long, value_enum)]
+        orm: Option<capability::Orm>,
         /// Print what would change, without writing anything
         #[arg(long)]
         dry_run: bool,
         /// List supported capabilities and the ones this project has on
-        #[arg(long, conflicts_with_all = ["capability", "dry_run"])]
+        #[arg(long, conflicts_with_all = ["capability", "dry_run", "orm"])]
         list: bool,
     },
     /// Scaffold a feature (domain/application/infrastructure/api + wiring) into a generated project
@@ -102,11 +112,12 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Cmd::New { name, template, output, with } => {
+        Cmd::New { name, template, output, with, orm } => {
             validate_name(&name)?;
             // checked before rendering: failing halfway through `--with` would
-            // leave a project on disk that the user did not ask for
-            capability::check_combination(&with)?;
+            // leave a project on disk that the user did not ask for — including
+            // an `--orm` that no entry in the list can take
+            capability::check_combination(&with, orm)?;
             let dest = output.join(&name);
             if dest.exists() {
                 return Err(format!("{} already exists", dest.display()).into());
@@ -119,7 +130,10 @@ fn run() -> Result<()> {
             // there is nothing here for `kodegen add` to drift away from
             let mut env: Vec<(&str, &str)> = Vec::new();
             for cap in with {
-                let (created, edited) = capability::add(&dest, cap, false)?;
+                // the ORM belongs to the one relational entry in the list; the
+                // others would be refused for taking a flag they have no use for
+                let (created, edited) =
+                    capability::add(&dest, cap, orm.filter(|_| cap.takes_orm()), false)?;
                 println!("Added capability '{}':", cap.name());
                 print_plan(&created, &edited);
                 env.extend_from_slice(cap.env());
@@ -134,12 +148,12 @@ fn run() -> Result<()> {
             };
             println!("  cd {name} && {run}");
         }
-        Cmd::Add { capability: cap, path, dry_run, list } => {
+        Cmd::Add { capability: cap, path, orm, dry_run, list } => {
             if list {
                 return capability::list(&path);
             }
             let cap = cap.ok_or("missing <CAPABILITY> — try `kodegen add --list`")?;
-            let (created, edited) = capability::add(&path, cap, dry_run)?;
+            let (created, edited) = capability::add(&path, cap, orm, dry_run)?;
             if dry_run {
                 println!("Dry run — capability '{}' would be added, nothing written:", cap.name());
             } else {

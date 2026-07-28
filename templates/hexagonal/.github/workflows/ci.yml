@@ -43,6 +43,12 @@ jobs:
       - name: Check mysql backend
         run: cargo check --locked --features mysql
 
+      # There is deliberately no `--features seaorm-postgres` row here: `default`
+      # is still `["sqlite"]`, so that state is `relational` + `seaorm` together,
+      # which src/lib.rs refuses with a `compile_error!` — one ORM per project.
+      # It is kodegen's own CI that compiles the SeaORM project, after
+      # `kodegen add postgres --orm seaorm` has taken the datastore slot.
+
       # The one backend that is not Diesel. Additive here like the two above —
       # `default = ["sqlite"]` is still on, so this proves the lock already pins
       # `mongodb` and resolves it, not that the project compiles with Diesel

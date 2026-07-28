@@ -80,13 +80,46 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 # releases (`compat-3-0-0`); `bson-3` + `compat-3-3-0` is the same driver on the
 # current bson and one whole dependency tree fewer. `dns-resolver` is what makes
 # a `mongodb+srv://` URI (Atlas, and every managed deployment) resolvable, and
-# `rustls-tls` is what lets it connect once it has.
+# `rustls-tls-aws-lc` is what lets it connect once it has.
+#
+# `rustls-tls-aws-lc` rather than plain `rustls-tls` (which selects ring): the
+# driver takes either, and `aws-sdk-s3` takes only aws-lc-rs, so this is the side
+# that can move. One provider across the whole graph is what keeps
+# `CryptoProvider::from_crate_features()` answering `Some` — see the `sqlx` note
+# below for why that matters — and it keeps ring out of the build entirely for a
+# project with `document` on and `blob` off.
 mongodb = { version = "3.8.0", default-features = false, features = [
     "bson-3",
     "compat-3-3-0",
-    "rustls-tls",
+    "rustls-tls-aws-lc",
     "dns-resolver",
 ], optional = true }
+# The datastore slot's second ORM, and its pure-Rust one: sqlx + rustls all the
+# way down, so the build stage needs no perl/make/cmake and the distroless/cc
+# runtime image needs nothing extra. Held at `"1"` **by MSRV**: sea-orm 2.0
+# declares `rust-version = 1.94` and this package declares 1.88, and semver "1"
+# is what keeps 2.0 out until that moves (the same wait `aws-sdk-s3` is in).
+# `default-features = false` because the defaults pull chrono, bigdecimal and
+# rust_decimal in for column types the `users` table (TEXT only) never uses.
+# `runtime-tokio` rather than `runtime-tokio-rustls`: the TLS provider is chosen
+# on sqlx below, for the reason written there.
+sea-orm = { version = "1", default-features = false, features = [
+    "macros",
+    "runtime-tokio",
+], optional = true }
+# Named directly even though sea-orm already brings it, for exactly one reason:
+# to pick rustls' crypto provider. sea-orm's own `runtime-tokio-rustls` selects
+# `tls-rustls-ring`, while `aws-sdk-s3` (the `blob` feature) and the Mongo driver
+# above select aws-lc-rs. Two providers in one graph do not break *these*
+# clients — every one of them installs its own explicitly — but they do make
+# `rustls::crypto::CryptoProvider::from_crate_features()` return `None`, so the
+# process has no default: any rustls code **you** write with a bare
+# `ClientConfig::builder()` panics, and the binary links both stacks for nothing.
+# One provider everywhere is the fix, and aws-lc-rs is the one `blob` cannot be
+# talked out of. sqlx's own default features (any/macros/migrate/json) are a
+# compile-time query checker, a second migration framework and runtime backend
+# dispatch — none of which this template uses.
+sqlx = { version = "0.8", default-features = false, optional = true }
 # The official ClickHouse client, held at 0.13 **by MSRV**: 0.14 and 0.15 declare
 # `rust-version = 1.89`, and this package declares 1.88. With `resolver = "3"`
 # cargo would still pick 0.15 (it warns and falls back when no compatible version
@@ -133,6 +166,26 @@ mysql = ["diesel/mysql", "dep:mysqlclient-sys", "dep:openssl-sys", "relational"]
 # adapter dials its client through — the driver's constructors are all async and
 # the composition root is a plain `fn`.
 document = ["dep:mongodb", "tokio/sync"]
+# The second ORM over the same relational databases, and a datastore all the
+# same: `seaorm` mirrors `relational` exactly — it is what
+# `infrastructure/mod.rs` gates the SeaORM modules on, and what the backend
+# below builds on. The runtime and the TLS provider are named *here* rather than
+# per backend because leaving them out is not a build error: sqlx panics at
+# runtime with "either the runtime-async-std or runtime-tokio feature must be
+# enabled". `tokio/sync` is for the `OnceCell` the handle dials through, exactly
+# like `document`. The two ORMs cannot be on together — `src/lib.rs` says so with
+# a `compile_error!`, because cargo features are additive and would otherwise
+# happily build both.
+#
+# There is no `seaorm-mysql` here, and adding one is not free: `sea-orm/sqlx-mysql`
+# pulls `rsa` into Cargo.lock, and `rsa` carries RUSTSEC-2023-0071 with **no fixed
+# version available**. cargo-audit reads the lock and does not care which features
+# are on, so that one line turns the audit job red in every generated project,
+# whether or not anyone uses MySQL. The Diesel `mysql` feature above is unaffected
+# (libmysqlclient does its own auth in C). It comes back when there is somewhere
+# for it to go — see the plan's 6b.
+seaorm = ["dep:sea-orm", "sqlx/tls-rustls-aws-lc-rs", "tokio/sync"]
+seaorm-postgres = ["seaorm", "sea-orm/sqlx-postgres"]
 # Not a backend: `cache` sits alongside whichever relational feature is on.
 # Redis and Valkey speak the same protocol, so this one feature covers both.
 cache = ["dep:redis"]

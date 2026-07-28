@@ -48,6 +48,16 @@ jobs:
   # of one slot: only one of them can ever be compiled in a single project, so a
   # job per capability is the only way either adapter is compiled at all.
   #
+  # `postgres --orm seaorm` is the second ORM's only row, and it earns it twice
+  # over: it is the first time a line of the SeaORM adapter meets a compiler, and
+  # the first time this matrix runs a datastore *live* — the schema arrives with
+  # the first connection, so unlike the Diesel rows there is nothing to apply
+  # first. It also compiles the state where Diesel is gated out of both
+  # `bootstrap.rs` and `infrastructure/mod.rs` while a `Db` handle still exists,
+  # which nothing else does. There is no `mysql --orm seaorm` row because there
+  # is no such capability yet: MySQL's upsert differs at runtime, not at compile
+  # time, so it ships with a row of its own or not at all.
+  #
   # `greptimedb` writes byte-for-byte what `influxdb` does apart from the compose
   # service (a unit test pins that), so compiling it again would prove nothing.
   # It is here for the *server*: the step below boots the image it just generated
@@ -58,8 +68,29 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # `include:` with no base dimension, so that the SeaORM row is a row of its
+      # own: an include entry whose `capability` matches an existing combination
+      # would be merged *into* it, and there would be no plain `postgres` job
+      # left. Every entry is one job, and `orm` is simply absent from the others.
       matrix:
-        capability: [postgres, mysql, timescaledb, mongodb, redis, s3, clickhouse, influxdb, greptimedb]
+        include:
+          - capability: postgres
+          - capability: mysql
+          - capability: timescaledb
+          - capability: mongodb
+          - capability: redis
+          - capability: s3
+          - capability: clickhouse
+          - capability: influxdb
+          - capability: greptimedb
+          # The SeaORM path, and the first row in this matrix that runs its
+          # datastore live. That is not a bonus: it is the only way to prove the
+          # startup DDL, because there is no migration step to apply and the
+          # schema arrives with the first connection. It boots the compose file
+          # `add` just wrote — the same trick the influxdb row uses — and then
+          # runs the suite *twice* (see the second Test step).
+          - capability: postgres
+            orm: seaorm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,7 +122,7 @@ jobs:
         run: |
           cargo run --locked -- new demo --output "$RUNNER_TEMP"
           cargo run --locked -- feature order --path "$RUNNER_TEMP/demo"
-          cargo run --locked -- add ${{ matrix.capability }} --path "$RUNNER_TEMP/demo"
+          cargo run --locked -- add ${{ matrix.capability }} ${{ matrix.orm && format('--orm {0}', matrix.orm) || '' }} --path "$RUNNER_TEMP/demo"
 
       # ...and then the other order, into the same project, because the two are
       # not symmetric: a feature scaffolded *after* `add mongodb` has to name the
@@ -103,7 +134,7 @@ jobs:
         run: cargo run --locked -- feature notification --path "$RUNNER_TEMP/demo"
 
       - name: new --with is the same thing in one command
-        run: cargo run --locked -- new demo-with --with ${{ matrix.capability }} --output "$RUNNER_TEMP"
+        run: cargo run --locked -- new demo-with --with ${{ matrix.capability }} ${{ matrix.orm && format('--orm {0}', matrix.orm) || '' }} --output "$RUNNER_TEMP"
 
       - name: Format check
         run: cargo fmt --check
@@ -147,16 +178,41 @@ jobs:
             echo "INFLUX_BUCKET=public"
           } >> "$GITHUB_ENV"
 
+      # The SeaORM row, and the first datastore in this matrix that runs live.
+      # It can, because nothing has to be applied first: the adapter creates its
+      # own schema on the first connection. Booted from the compose file `add
+      # postgres --orm seaorm` just wrote — a check on that file too, and it is
+      # the *same* postgres service the Diesel row generates.
+      - name: Boot the database the compose file generated
+        if: matrix.orm == 'seaorm'
+        working-directory: ${{ runner.temp }}/demo
+        run: |
+          docker compose -f docker-compose.dev.yml up -d --wait
+          echo "DATABASE_URL=postgres://app:app@127.0.0.1:5432/app" >> "$GITHUB_ENV"
+
       # no `cargo check` step: `clippy --all-targets` above already type-checks
       # everything `check` would, and compiling the AWS SDK twice is minutes.
       #
       # no DATABASE_URL and no REDIS_URL, so the adapter tests skip themselves
       # and the in-memory adapters are what run — the promise that a generated
-      # project is green without a server. The influxdb and greptimedb rows are the
-      # exception, and deliberately so: the steps above set INFLUX_* for them, so
-      # there the line-protocol adapter runs against a real server of each product
+      # project is green without a server. The influxdb, greptimedb and seaorm
+      # rows are the exception, and deliberately so: the steps above set INFLUX_*
+      # or DATABASE_URL for them, so there the adapter runs against a real server
       # instead of skipping.
       - name: Test
+        run: cargo test --locked
+        working-directory: ${{ runner.temp }}/demo
+
+      # The same suite again, over the database the run above left behind, in a
+      # new process. This is the whole gate for the startup DDL: run one proves
+      # it creates the schema, run two proves every statement is idempotent —
+      # `CREATE TABLE IF NOT EXISTS` and, on TimescaleDB, `create_hypertable(...,
+      # if_not_exists => TRUE)`, which is the one that fails on the *second* boot
+      # when it is missing. It also re-runs the upsert against rows that already
+      # exist, which is where `exec_without_returning` earns its place: a `save`
+      # of unchanged values affects 0 rows, and `exec` would call that an error.
+      - name: Test again over the same database (the DDL must be idempotent)
+        if: matrix.orm == 'seaorm'
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo
 

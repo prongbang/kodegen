@@ -57,6 +57,24 @@ pub enum Capability {
     Greptimedb,
 }
 
+/// Which ORM a relational capability is built on. Orthogonal to `Capability`
+/// the way `--transport rest|grpc` is orthogonal to a feature name, which is why
+/// it is a flag rather than four more capabilities: `mariadb` and `timescaledb`
+/// are already aliases, and pairing every one of them with an ORM would make
+/// them aliases squared.
+///
+/// Only the relational capabilities take one — `redis` has no ORM, and saying
+/// so is an error rather than a silently ignored flag (see `check_orm`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum Orm {
+    /// The default: a C driver, a blocking pool, and versioned migrations under
+    /// `migrations/`.
+    Diesel,
+    /// Pure Rust (sqlx + rustls), async all the way down, and the schema applied
+    /// at startup instead of a migration harness — see `add_seaorm`.
+    Seaorm,
+}
+
 /// The axis a capability sits on: datastores replace each other, event sinks
 /// replace each other, a cache and a blob store are additive. Every kind needs
 /// its own `add_*` function, its own env vars and its own feature, which is
@@ -114,7 +132,18 @@ impl Slot {
     /// `Capability::feature()` (see the test at the bottom).
     fn features(self) -> &'static [&'static str] {
         match self {
-            Slot::Datastore => &["sqlite", "postgres", "mysql", "document"],
+            // the SeaORM names are in this list and not in a second one: one ORM
+            // per project is the *same* rule as one datastore per project, so
+            // `add postgres` on a SeaORM project is refused by the code that
+            // already refuses it on a Mongo one — no new rule, no new if
+            Slot::Datastore => &[
+                "sqlite",
+                "postgres",
+                "mysql",
+                "document",
+                "seaorm-postgres",
+                "seaorm-mysql",
+            ],
             Slot::Events => &["analytics", "timeseries"],
         }
     }
@@ -187,6 +216,13 @@ const MONGO_URL: &str = "mongodb://127.0.0.1:27017";
 /// the adapter can stay on disk uncompiled — exactly the deal the Diesel modules
 /// get from `relational`.
 const MONGO_MOD: &str = "#[cfg(feature = \"document\")]\npub mod mongo_repo;\n";
+
+const SEA_DB: &str = "src/infrastructure/sea_db.rs";
+const SEA_REPO: &str = "src/infrastructure/sea_repo.rs";
+/// The SeaORM half of `MONGO_MOD`, and gated for the same reason: with `seaorm`
+/// off these two files stay on disk and stop compiling, so undoing the
+/// capability is one line in Cargo.toml plus `bootstrap.rs` — never a deletion.
+const SEA_MOD: &str = "#[cfg(feature = \"seaorm\")]\npub mod sea_db;\n#[cfg(feature = \"seaorm\")]\npub mod sea_repo;\n";
 
 const PORTS: &str = "src/domain/ports.rs";
 const IN_MEMORY_CACHE: &str = "src/infrastructure/in_memory_cache.rs";
@@ -308,11 +344,22 @@ impl Capability {
         }
     }
 
+    /// Whether `--orm` means anything here. Only the relational capabilities
+    /// have an ORM to choose; everything else is refused rather than ignored.
+    pub fn takes_orm(self) -> bool {
+        matches!(self.kind(), Kind::Relational(_))
+    }
+
     /// The cargo feature this capability turns on — also how "is it already
     /// added?" is answered, since `default = [...]` is the only state there is.
-    fn feature(self) -> &'static str {
+    ///
+    /// The ORM is part of the answer for a relational capability and irrelevant
+    /// to every other one, which is why it is a parameter rather than a second
+    /// method: `add`, `check_combination` and the slot rule all ask this one
+    /// question, and they must all get the ORM's answer.
+    fn feature(self, orm: Orm) -> &'static str {
         match self.kind() {
-            Kind::Relational(rel) => rel.feature(),
+            Kind::Relational(rel) => rel.feature(orm),
             // named for the shape, not the vendor, and deliberately not
             // "mongodb": it is the datastore slot's document option, the way
             // `sqlite`/`postgres` are its relational ones
@@ -453,10 +500,16 @@ impl Relational {
     /// differ. TimescaleDB is a PostgreSQL *extension*, so the same is true of it
     /// one column over: same driver, same connection type, same feature, and one
     /// extra migration.
-    fn feature(self) -> &'static str {
-        match self {
-            Relational::Postgres | Relational::Timescaledb => "postgres",
-            Relational::Mysql | Relational::Mariadb => "mysql",
+    ///
+    /// The SeaORM names mirror them one axis over — same backend, same slot,
+    /// different ORM — which is what makes "one datastore per project" cover
+    /// "one ORM per project" without a rule of its own.
+    fn feature(self, orm: Orm) -> &'static str {
+        match (orm, self) {
+            (Orm::Diesel, Relational::Postgres | Relational::Timescaledb) => "postgres",
+            (Orm::Diesel, Relational::Mysql | Relational::Mariadb) => "mysql",
+            (Orm::Seaorm, Relational::Postgres | Relational::Timescaledb) => "seaorm-postgres",
+            (Orm::Seaorm, Relational::Mysql | Relational::Mariadb) => "seaorm-mysql",
         }
     }
 
@@ -517,6 +570,43 @@ impl Relational {
         }
     }
 
+    /// What the SeaORM path applies on its first connection, in place of the
+    /// versioned migration the Diesel path runs at startup (see `add_seaorm`).
+    ///
+    /// Deliberately **not** `up_sql()` with `IF NOT EXISTS` bolted on: that one
+    /// is a versioned migration pinned by `KNOWN_SEEDS`, and hiding a conflict
+    /// inside it would hide a bug. These are three separate constants that owe
+    /// the other path nothing.
+    ///
+    /// One statement per entry rather than one string with semicolons: a
+    /// multi-statement round trip is not enabled by default on MySQL, and one
+    /// statement at a time is what behaves the same on every backend.
+    fn startup_ddl(self) -> &'static [&'static str] {
+        match self {
+            Relational::Postgres => &[USERS_DDL_PG],
+            Relational::Mysql | Relational::Mariadb => &[USERS_DDL_MYSQL],
+            // every statement idempotent, including the hypertable: a
+            // `create_hypertable` without `if_not_exists` fails on the *second*
+            // boot, not the first, which is the kind of bug that ships
+            Relational::Timescaledb => &[
+                "CREATE EXTENSION IF NOT EXISTS timescaledb",
+                USERS_DDL_PG,
+                "CREATE TABLE IF NOT EXISTS events (recorded_at TIMESTAMPTZ NOT NULL, name TEXT NOT NULL, value DOUBLE PRECISION NOT NULL)",
+                "SELECT create_hypertable('events', by_range('recorded_at'), if_not_exists => TRUE)",
+            ],
+        }
+    }
+
+    /// `startup_ddl()` as the body of the generated `SCHEMA` array. `{:?}` is
+    /// the escaping: these are Rust string literals, and the SQL above contains
+    /// the single quotes `create_hypertable` needs.
+    fn schema_literal(self) -> String {
+        self.startup_ddl()
+            .iter()
+            .map(|stmt| format!("    {stmt:?},\n"))
+            .collect()
+    }
+
     /// What `.on_conflict(...)` takes. Both dialects get a real upsert, so
     /// `save`'s documented "saving an existing id overwrites it" means the same
     /// thing whichever backend is on.
@@ -565,16 +655,20 @@ impl Relational {
             .replace("{{capability}}", self.name())
             .replace("{{conflict_target}}", self.conflict_target())
             .replace("{{upsert_note}}", self.upsert_note())
+            .replace("{{schema}}", &self.schema_literal())
     }
 }
 
 /// `kodegen add --list`: what is supported, and what this project already has on.
 pub fn list(project: &Path) -> Result<()> {
     println!("Supported capabilities:");
-    println!("  postgres     relational — Diesel + PostgreSQL");
-    println!("  mysql        relational — Diesel + MySQL");
-    println!("  mariadb      relational — Diesel + MariaDB (MySQL protocol: same driver, same adapter)");
-    println!("  timescaledb  relational — Diesel + TimescaleDB (a PostgreSQL extension: same driver, plus a hypertable migration)");
+    println!("  postgres     relational — PostgreSQL (--orm diesel [default] | seaorm)");
+    println!("  mysql        relational — MySQL (--orm diesel [default]; seaorm not implemented yet)");
+    println!(
+        "  mariadb      relational — MariaDB (MySQL protocol: same driver, same adapter) (--orm \
+         diesel [default]; seaorm not implemented yet)"
+    );
+    println!("  timescaledb  relational — TimescaleDB (a PostgreSQL extension: same driver, plus a hypertable) (--orm diesel [default] | seaorm)");
     println!("  mongodb      document — MongoDB behind the same `UserRepository`, in place of Diesel");
     println!("  redis        cache — the `Cache` port + a Redis adapter (Valkey speaks the same protocol)");
     println!("  s3           object storage — the `BlobStore` port + an S3 adapter (RustFS, MinIO, AWS)");
@@ -586,6 +680,12 @@ pub fn list(project: &Path) -> Result<()> {
         "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb) and one event sink \
          (clickhouse, influxdb, greptimedb) can be on at a time; redis and s3 sit alongside them."
     );
+    println!(
+        "Relational capabilities take --orm: `diesel` links a C driver and gives you versioned \
+         migrations under migrations/; `seaorm` is pure Rust (no perl/cmake in the build image) \
+         and applies its schema at startup instead, so there are no versioned migrations on that \
+         path. One ORM per project."
+    );
     match fs::read_to_string(project.join("Cargo.toml")).ok().as_deref().and_then(default_line) {
         // `default = [...]` is the only state there is — the features it lists
         // are exactly the dependencies that get compiled
@@ -595,20 +695,70 @@ pub fn list(project: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `--orm` on a capability that has no ORM, and `--orm seaorm` on a backend the
+/// SeaORM path does not generate yet. Both are refused *before* anything is
+/// read: an ignored flag is how a project ends up on the wrong ORM silently.
+fn check_orm(cap: Capability, orm: Option<Orm>) -> Result<()> {
+    let Some(orm) = orm else { return Ok(()) };
+    let Kind::Relational(rel) = cap.kind() else {
+        return Err(format!(
+            "--orm applies only to relational capabilities (postgres, mysql, mariadb, timescaledb) \
+             — '{}' has no ORM",
+            cap.name()
+        )
+        .into());
+    };
+    // matched, not `if`-ed: a third ORM has to answer this question for every
+    // backend rather than falling through to "fine, ship it"
+    match (orm, rel) {
+        (Orm::Diesel, _) => Ok(()),
+        (Orm::Seaorm, Relational::Postgres | Relational::Timescaledb) => Ok(()),
+        (Orm::Seaorm, Relational::Mysql | Relational::Mariadb) => Err(format!(
+            "`--orm seaorm` does not support '{}' yet — the SeaORM path ships PostgreSQL and \
+             TimescaleDB first. MySQL is the one backend where the upsert behaves differently at \
+             *runtime* (an `ON DUPLICATE KEY UPDATE` that changes nothing reports 0 affected rows, \
+             which sea-orm turns into an error), so it ships when there is a CI row running it \
+             against a real MySQL server — not before.\n\
+             Today: `kodegen add {} --orm diesel` (the default), or `kodegen add postgres --orm \
+             seaorm`.",
+            cap.name(),
+            cap.name()
+        )
+        .into()),
+    }
+}
+
 /// Rejects a `--with` list that cannot be applied, *before* `new` renders
 /// anything — half a project left on disk is worse than no project.
-pub fn check_combination(with: &[Capability]) -> Result<()> {
+pub fn check_combination(with: &[Capability], orm: Option<Orm>) -> Result<()> {
+    // `--orm` on `new` selects the ORM of the one relational entry in the list
+    // (the slot rule below guarantees there is at most one), so a list with none
+    // is a flag that would do nothing at all
+    if orm.is_some() && !with.iter().any(|c| c.takes_orm()) {
+        return Err(
+            "--orm needs a relational capability in --with (postgres, mysql, mariadb, \
+                    timescaledb) — nothing in this list has an ORM"
+                .into(),
+        );
+    }
+    for cap in with {
+        check_orm(*cap, orm.filter(|_| cap.takes_orm()))?;
+    }
     // by feature, not by variant: `--with mysql,mariadb` is two names for one
     // cargo feature, and the second `add` would die with "already added" halfway
     // through a `new` that has already written the project
+    let feature = |c: &Capability| c.feature(orm.filter(|_| c.takes_orm()).unwrap_or(Orm::Diesel));
     for (i, cap) in with.iter().enumerate() {
-        if let Some(first) = with[..i].iter().find(|earlier| earlier.feature() == cap.feature()) {
+        if let Some(first) = with[..i]
+            .iter()
+            .find(|earlier| feature(earlier) == feature(cap))
+        {
             return Err(format!(
                 "--with lists '{}' and '{}', which are the same capability (both enable the `{}` \
                  cargo feature)",
                 first.name(),
                 cap.name(),
-                cap.feature()
+                feature(cap)
             )
             .into());
         }
@@ -630,11 +780,23 @@ pub fn check_combination(with: &[Capability]) -> Result<()> {
 }
 
 /// Returns the plan as (files created, files edited) for the caller to report.
-pub fn add(project: &Path, cap: Capability, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+///
+/// `orm` is `None` when the flag was not given, which is not the same as
+/// `Some(Orm::Diesel)`: only the first of those may appear next to `redis`.
+pub fn add(
+    project: &Path,
+    cap: Capability,
+    orm: Option<Orm>,
+    dry_run: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
+    // before any file is read, including the manifest: a flag that does not
+    // apply is a mistake about the command, not about the project
+    check_orm(cap, orm)?;
+    let orm = orm.unwrap_or(Orm::Diesel);
     require_files(project, &["Cargo.toml"])?;
     let manifest = fs::read_to_string(project.join("Cargo.toml"))?;
     let enabled = parse_features(default_line(&manifest).ok_or_else(|| default_anchor_err(&manifest))?);
-    if enabled.iter().any(|f| f == cap.feature()) {
+    if enabled.iter().any(|f| f == cap.feature(orm)) {
         return Err(format!("capability '{}' already added", cap.name()).into());
     }
     // one occupant per slot, checked before any file is read: `add mongodb` on a
@@ -646,14 +808,18 @@ pub fn add(project: &Path, cap: Capability, dry_run: bool) -> Result<(Vec<String
             .iter()
             .find(|f| slot.features().contains(&f.as_str()) && Some(f.as_str()) != slot.shipped())
     {
-        return Err(slot_conflict(slot, other, cap).into());
+        return Err(slot_conflict(slot, other, cap, orm).into());
     }
-    match cap.kind() {
-        Kind::Relational(rel) => add_relational(project, rel, dry_run),
-        Kind::Document => add_mongodb(project, dry_run),
-        Kind::Cache => add_redis(project, dry_run),
-        Kind::Blob => add_s3(project, dry_run),
-        Kind::Events(backend) => add_event_sink(project, backend, dry_run),
+    // on the pair, not a guard on one of them: a third ORM must be a missing
+    // arm here — a `Kind::Relational(rel) if orm == Seaorm` guard would send it
+    // down the Diesel path without a word
+    match (cap.kind(), orm) {
+        (Kind::Relational(rel), Orm::Seaorm) => add_seaorm(project, rel, dry_run),
+        (Kind::Relational(rel), Orm::Diesel) => add_relational(project, rel, dry_run),
+        (Kind::Document, _) => add_mongodb(project, dry_run),
+        (Kind::Cache, _) => add_redis(project, dry_run),
+        (Kind::Blob, _) => add_s3(project, dry_run),
+        (Kind::Events(backend), _) => add_event_sink(project, backend, dry_run),
     }
 }
 
@@ -665,9 +831,9 @@ pub fn add(project: &Path, cap: Capability, dry_run: bool) -> Result<(Vec<String
 ///
 /// Only the middle step differs by slot, so only it is matched on: what to put
 /// back is a property of what the first `add` wrote.
-fn slot_conflict(slot: Slot, other: &str, cap: Capability) -> String {
+fn slot_conflict(slot: Slot, other: &str, cap: Capability, orm: Orm) -> String {
     match slot {
-        Slot::Datastore => datastore_conflict(other, cap),
+        Slot::Datastore => datastore_conflict(other, cap, orm),
         // an event sink is additive, so switching backends is undoing the whole
         // capability rather than swapping a file: the second `add` writes the port
         // and the wiring too, and would refuse every one of them as already there
@@ -701,31 +867,67 @@ fn slot_conflict(slot: Slot, other: &str, cap: Capability) -> String {
 
 /// The datastore slot's version of the above: `Db`/`Mongo` is built once and
 /// `UserRepository` gets one adapter.
-fn datastore_conflict(other: &str, cap: Capability) -> String {
-    let restore = if other == "document" {
-        // mongo_repo.rs is behind `#[cfg(feature = "document")]`, so step 1
-        // already stops it compiling — deleting it is optional housekeeping.
-        // The blocks are named individually because a project with scaffolded
-        // features cannot take a wholesale copy of a fresh bootstrap.rs: that
-        // would drop their wiring.
-        "src/bootstrap.rs: put the three Diesel blocks back from a fresh `kodegen new` (the \
-         infrastructure import list, the DATABASE_URL block, and fn build_user_service), and change \
-         any `_db: Option<&Mongo>` in a scaffolded builder back to `Option<&Db>`. \
-         src/infrastructure/mongo_repo.rs can stay — it is gated on the `document` feature step 1 \
-         just turned off"
-    } else {
-        "src/infrastructure/diesel_db.rs + diesel_repo.rs: restore the versions from a fresh \
-         `kodegen new`"
+/// Three occupants, three restores — but only two shapes: mongodb and SeaORM
+/// both took the slot by *swapping blocks* in `bootstrap.rs` and leaving their
+/// adapter on disk behind a `cfg`, so they share the sentence and differ in what
+/// to name. A Diesel occupant is the odd one out because it is the state the
+/// template ships in, so its restore is a file copy.
+fn datastore_conflict(other: &str, cap: Capability, orm: Orm) -> String {
+    // the blocks are named individually because a project with scaffolded
+    // features cannot take a wholesale copy of a fresh bootstrap.rs: that would
+    // drop their wiring
+    let blocks = |adapters: &str, builders: &str, feature: &str| {
+        format!(
+            "src/bootstrap.rs: put the three Diesel blocks back from a fresh `kodegen new` (the \
+             infrastructure import list, the DATABASE_URL block, and fn build_user_service){builders}. \
+             {adapters} can stay — gated on the `{feature}` feature step 1 just turned off"
+        )
+    };
+    let restore = match other {
+        "document" => blocks(
+            "src/infrastructure/mongo_repo.rs",
+            ", and change any `_db: Option<&Mongo>` in a scaffolded builder back to `Option<&Db>`",
+            "document",
+        ),
+        // both ORMs call the handle `Db`, so a scaffolded builder needs no edit
+        // in either direction — the only thing to put back is the three blocks
+        o if o.starts_with("seaorm-") => blocks(
+            "src/infrastructure/sea_db.rs + sea_repo.rs",
+            " — scaffolded builders need no change, since both ORMs call the handle `Db`",
+            "seaorm",
+        ),
+        _ => "src/infrastructure/diesel_db.rs + diesel_repo.rs: restore the versions from a fresh \
+              `kodegen new`"
+            .to_string(),
+    };
+    // the command to rerun has to be the one that was actually typed, or the
+    // last step of the undo puts the project on the other ORM
+    let (flag, orm_name) = match orm {
+        Orm::Diesel => ("", "diesel"),
+        Orm::Seaorm => (" --orm seaorm", "seaorm"),
+    };
+    // an ORM switch is a conflict between two spellings of one backend, and
+    // "'postgres' … to switch to 'postgres'" reads like a no-op — so each side
+    // says which ORM it is. `other` is a cargo feature: the `seaorm-` ones are
+    // the second ORM, the rest are Diesel (`document` has no ORM, and `sqlite`
+    // never reaches here — it is the slot's shipped occupant).
+    let occupant = match other.strip_prefix("seaorm-") {
+        Some(backend) => format!("{backend} (seaorm)"),
+        None if other == "document" => other.to_string(),
+        None => format!("{other} (diesel)"),
+    };
+    let target = match cap.takes_orm() {
+        true => format!("{} ({orm_name})", cap.name()),
+        false => cap.name().to_string(),
     };
     format!(
-        "capability '{other}' is already this project's datastore, and there can only be one (the \
-         `UserRepository` has a single adapter, and the handle behind it is built once in \
+        "capability '{occupant}' is already this project's datastore, and there can only be one \
+         (the `UserRepository` has a single adapter, and the handle behind it is built once in \
          bootstrap.rs).\n\
-         To switch to '{}', undo '{other}' first:\n  \
+         To switch to '{target}', undo '{occupant}' first:\n  \
          1. Cargo.toml: put `default = [\"sqlite\"]` back\n  \
          2. {restore}\n  \
-         3. rerun `kodegen add {}`",
-        cap.name(),
+         3. rerun `kodegen add {}{flag}`",
         cap.name()
     )
 }
@@ -746,7 +948,9 @@ fn add_relational(
         // the whole point of the optional-dependency layout: `add` flips one
         // list of feature names and never touches [dependencies], so Cargo.lock
         // stays valid and `--locked` keeps working
-        edit(project, "Cargo.toml", |c| enable_feature(&c, cap.feature(), Some(Slot::Datastore)))?,
+        edit(project, "Cargo.toml", |c| {
+            enable_feature(&c, cap.feature(Orm::Diesel), Some(Slot::Datastore))
+        })?,
         // whole-file comparison rather than a marker line: once the project name
         // is substituted back this file has no project-specific content, so
         // "identical to what `kodegen new` wrote" is both the strictest check
@@ -798,6 +1002,86 @@ fn add_relational(
     Ok((paths(&creates), paths(&edits)))
 }
 
+/// `kodegen add <relational> --orm seaorm` — the same backend as
+/// `add_relational`, behind the other ORM.
+///
+/// Structurally this is `add_mongodb`, not `add_relational`: it takes the
+/// datastore slot with a driver that is not Diesel, writes its own adapter next
+/// to the ones already on disk, and swaps the three blocks of `bootstrap.rs`
+/// rather than rewriting a file. Four files, and none of them overwritten —
+/// which is why `--orm seaorm` cannot destroy anything a user wrote, while
+/// `--orm diesel` replaces `diesel_db.rs` wholesale and has to compare it first.
+///
+/// What is *not* here is the point of the capability:
+/// - no `Dockerfile` edit. sqlx and rustls are pure Rust, so the build stage
+///   needs no perl/make/cmake and the distroless/cc runtime image needs nothing.
+/// - no `migrations/`. The schema is `startup_ddl()`, applied idempotently on
+///   the first connection (see `sea_db.rs`), which is the same deal
+///   `add mongodb`, `add clickhouse` and `add s3` already make. Whatever is left
+///   under `migrations/` is not deleted — it is not ours to delete, and it is
+///   exactly what a later `--orm diesel` would need back.
+fn add_seaorm(
+    project: &Path,
+    cap: Relational,
+    dry_run: bool,
+) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(project, &[INFRA_MOD, BOOTSTRAP])?;
+
+    let mut creates = vec![
+        (SEA_DB.to_string(), cap.render(SEA_DB_TPL)),
+        (SEA_REPO.to_string(), cap.render(SEA_REPO_TPL)),
+    ];
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(
+            format!("{rel} already exists — remove it first, or keep the one you have").into(),
+        );
+    }
+
+    let mut edits = vec![
+        // the SeaORM feature replaces the relational one rather than joining it:
+        // still one list of feature names, still never [dependencies]
+        edit(project, "Cargo.toml", |c| {
+            enable_feature(&c, cap.feature(Orm::Seaorm), Some(Slot::Datastore))
+        })?,
+        // gated and appended for the same reason `add mongodb` does it: with
+        // `seaorm` off these files stop compiling instead of failing to
+        edit(project, INFRA_MOD, |c| Ok(format!("{c}\n{SEA_MOD}")))?,
+        edit(project, BOOTSTRAP, |c| rewrite_bootstrap(&c, &SEA_SWAP))?,
+    ];
+
+    // the same compose service the Diesel path writes, from the same constant:
+    // it is the same server, and `DATABASE_URL` does not change either
+    if project.join(COMPOSE).is_file() {
+        edits.push(edit(project, COMPOSE, |c| {
+            add_compose_service(&c, cap.name(), cap.compose_service())
+        })?);
+    } else {
+        creates.push((
+            COMPOSE.to_string(),
+            format!("{COMPOSE_HEADER}{}", cap.compose_service()),
+        ));
+    }
+
+    // said once, here, rather than in the file nobody reads afterwards: this
+    // path never runs a migration, so a `migrations/` left over from `kodegen
+    // new` is dead weight that looks alive
+    if project.join("migrations").is_dir() {
+        eprintln!(
+            "warning: migrations/ is not used on the SeaORM path (the schema lives in {SEA_DB} and \
+             is applied on the first connection) — delete it, or wire up sea-orm-migration when \
+             your schema outgrows the startup DDL"
+        );
+    }
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    // everything above is pure, so this is the only side effect
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
 /// `kodegen add mongodb` — the datastore slot again, with a driver that is not
 /// Diesel.
 ///
@@ -837,7 +1121,7 @@ fn add_mongodb(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String
         // until the file was also deleted, which is not what this prints or what
         // the README promises.
         edit(project, INFRA_MOD, |c| Ok(format!("{c}\n{MONGO_MOD}")))?,
-        edit(project, BOOTSTRAP, |c| rewrite_bootstrap(&c))?,
+        edit(project, BOOTSTRAP, |c| rewrite_bootstrap(&c, &MONGO_SWAP))?,
     ];
 
     // whichever `add` runs first creates the compose file, the next one appends.
@@ -857,8 +1141,30 @@ fn add_mongodb(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String
     Ok((paths(&creates), paths(&edits)))
 }
 
-/// Swaps the three blocks of `bootstrap.rs` that name the Diesel handle for the
-/// Mongo one, and leaves everything else — including whatever `kodegen feature`
+/// What one datastore's `bootstrap.rs` swap replaces, and what must be gone
+/// afterwards. Two capabilities share this function because they do the same
+/// thing — take the datastore slot with a driver that is not Diesel — and
+/// differ only in the three blocks and in what "the Diesel wiring survived"
+/// looks like for each of them.
+struct Swap {
+    use_block: &'static str,
+    db_block: &'static str,
+    build_user: &'static str,
+    /// The handle type a `kodegen feature` builder asks for, if it changes.
+    /// `None` for SeaORM: its handle is *also* called `Db` (deliberately — see
+    /// `scaffold.rs`), so every scaffolded builder keeps compiling untouched.
+    builder_handle: Option<&'static str>,
+    /// Strings that must not survive the swap, and the sentence naming them.
+    /// The type the file used to name is gone once the old feature is off, so
+    /// anything still mentioning it would not compile.
+    leftovers: &'static [&'static str],
+    leftover_what: &'static str,
+    /// How this capability says "I am refusing" — the manual steps differ.
+    refusal: fn(&str) -> String,
+}
+
+/// Swaps the three blocks of `bootstrap.rs` that name the Diesel handle for
+/// `swap`'s, and leaves everything else — including whatever `kodegen feature`
 /// and the additive capabilities wired in — exactly where it is.
 ///
 /// Each block is matched verbatim against what `kodegen new` wrote. None of them
@@ -866,41 +1172,77 @@ fn add_mongodb(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String
 /// project nobody edited always matches however long its crate name is, and one
 /// that was edited is refused rather than silently half-rewritten.
 ///
-/// The Mongo handle keeps the binding name `db`, which is why the two
+/// Both replacements keep the binding name `db`, which is why the two
 /// `api::Services` literals need no edit at all: the slot is the same slot.
-fn rewrite_bootstrap(content: &str) -> Result<String> {
+fn rewrite_bootstrap(content: &str, swap: &Swap) -> Result<String> {
     let mut out = content.to_string();
     for (what, from, to) in [
-        ("the generated `infrastructure::{ ... }` import list", BOOTSTRAP_USE, BOOTSTRAP_USE_MONGO),
+        (
+            "the generated `infrastructure::{ ... }` import list",
+            BOOTSTRAP_USE,
+            swap.use_block,
+        ),
         (
             "the generated `DATABASE_URL` block in build_services_from_env()",
             BOOTSTRAP_DB,
-            BOOTSTRAP_DB_MONGO,
+            swap.db_block,
         ),
-        ("the generated `fn build_user_service`", BOOTSTRAP_BUILD_USER, BOOTSTRAP_BUILD_USER_MONGO),
+        (
+            "the generated `fn build_user_service`",
+            BOOTSTRAP_BUILD_USER,
+            swap.build_user,
+        ),
     ] {
         if !out.contains(from) {
-            return Err(mongo_refusal(what).into());
+            return Err((swap.refusal)(what).into());
         }
         out = out.replacen(from, to, 1);
     }
     // every builder `kodegen feature` scaffolded takes the handle it does not use
-    // yet, typed as the datastore's — `Db` is about to stop existing, so they
-    // move with it. `_db` (not `db`) is what makes this the scaffolded shape and
-    // not somebody's real adapter.
-    out = out.replace(FEATURE_BUILDER_DB, FEATURE_BUILDER_MONGO);
-    // and anything else naming the Diesel handle is code kodegen did not write.
-    // The type is gone once `relational` is off, so this project would not
-    // compile after the swap — refusing beats handing back a broken tree.
-    if out.contains("Db") {
-        return Err(mongo_refusal(
-            "no mention of the Diesel `Db` handle outside the blocks kodegen generated (yours is \
-             still there, and `Db` stops existing when the relational feature goes off)",
-        )
-        .into());
+    // yet, typed as the datastore's — if that type is about to stop existing,
+    // they move with it. `_db` (not `db`) is what makes this the scaffolded shape
+    // and not somebody's real adapter.
+    if let Some(handle) = swap.builder_handle {
+        out = out.replace(FEATURE_BUILDER_DB, handle);
+    }
+    // and anything still naming what the old ORM owned is code kodegen did not
+    // write: it stops compiling the moment the old feature goes off, so refusing
+    // beats handing back a broken tree.
+    if swap.leftovers.iter().any(|left| out.contains(left)) {
+        return Err((swap.refusal)(swap.leftover_what).into());
     }
     Ok(out)
 }
+
+const MONGO_SWAP: Swap = Swap {
+    use_block: BOOTSTRAP_USE_MONGO,
+    db_block: BOOTSTRAP_DB_MONGO,
+    build_user: BOOTSTRAP_BUILD_USER_MONGO,
+    builder_handle: Some(FEATURE_BUILDER_MONGO),
+    leftovers: &["Db"],
+    leftover_what: "no mention of the Diesel `Db` handle outside the blocks kodegen generated \
+                    (yours is still there, and `Db` stops existing when the relational feature \
+                    goes off)",
+    refusal: mongo_refusal,
+};
+
+/// The SeaORM handle is a `Db` too, so "did the swap take?" cannot be answered
+/// by looking for that name — it is `diesel`/`Diesel` that must be gone. Which
+/// is the stricter check of the two: the type keeps its name but none of its
+/// API, so a call to `db.run(...)` kodegen did not write would compile-error
+/// after the swap rather than disappear with the type.
+const SEA_SWAP: Swap = Swap {
+    use_block: BOOTSTRAP_USE_SEA,
+    db_block: BOOTSTRAP_DB_SEA,
+    build_user: BOOTSTRAP_BUILD_USER_SEA,
+    builder_handle: None,
+    leftovers: &["diesel", "Diesel"],
+    leftover_what: "no mention of Diesel outside the blocks kodegen generated (yours is still \
+                    there — the SeaORM handle is called `Db` as well, but it has none of the same \
+                    API, and the Diesel modules stop compiling when the relational feature goes \
+                    off)",
+    refusal: sea_refusal,
+};
 
 fn mongo_refusal(what: &str) -> String {
     format!(
@@ -914,6 +1256,25 @@ fn mongo_refusal(what: &str) -> String {
          3. src/bootstrap.rs: build a `Mongo` from MONGODB_URL/MONGODB_DB where the `Db` is built, \
          and hand it to build_user_service instead\n  \
          4. run with MONGODB_URL={MONGO_URL}"
+    )
+}
+
+/// The same, one ORM over. Step 3 is shorter than Mongo's because the handle
+/// keeps its name and its binding: what changes is what is behind it.
+fn sea_refusal(what: &str) -> String {
+    format!(
+        "no longer matches what kodegen generated (expected {what}) — refusing to overwrite your \
+         changes.\nSwitch to SeaORM by hand instead:\n  \
+         1. Cargo.toml: `default = [\"seaorm-postgres\"]` — dropping the relational feature is what \
+         stops the Diesel modules compiling, and `src/lib.rs` refuses to build both ORMs at once\n  \
+         2. src/infrastructure/sea_db.rs + sea_repo.rs: the handle and the adapter, plus \
+         `#[cfg(feature = \"seaorm\")] pub mod sea_db;` and the same for `sea_repo` in \
+         infrastructure/mod.rs (generate a throwaway `kodegen new tmp --with postgres --orm seaorm` \
+         and copy the files across)\n  \
+         3. src/bootstrap.rs: build the handle with `Db::new(url)` where the pool was built — no \
+         pool, no migration step — and hand it to build_user_service, which now constructs a \
+         `SeaUserRepository`\n  \
+         4. run with DATABASE_URL={PG_URL}"
     )
 }
 
@@ -1454,7 +1815,9 @@ fn refusal(rel: &str, signature: &str, cap: Relational) -> String {
          3. migrations/*_create_users/up.sql: `{}`\n  \
          4. run with DATABASE_URL={}",
         cap.dialect(),
-        cap.feature(),
+        // this refusal only ever comes from the Diesel path: it is about
+        // `diesel_db.rs`, which the SeaORM path does not touch at all
+        cap.feature(Orm::Diesel),
         cap.connection(),
         cap.up_sql().trim(),
         cap.database_url()
@@ -1482,6 +1845,16 @@ const KNOWN_SEEDS: &[&str] = &[
 const KNOWN_DOWNS: &[&str] = &[USERS_DOWN_SQL, TIMESCALE_DOWN_SQL];
 
 const USERS_DOWN_SQL: &str = "DROP TABLE users;\n";
+
+/// The `users` table as the SeaORM path creates it — the migration's `CREATE
+/// TABLE` with `IF NOT EXISTS` and no trailing semicolon, because these are
+/// executed one statement at a time rather than read by a migration harness.
+/// Same column types as the Diesel path, for the same reasons: MySQL cannot
+/// index a `TEXT` column without a prefix length.
+const USERS_DDL_PG: &str =
+    "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL)";
+const USERS_DDL_MYSQL: &str =
+    "CREATE TABLE IF NOT EXISTS users (id VARCHAR(64) PRIMARY KEY NOT NULL, name TEXT NOT NULL)";
 
 /// TimescaleDB is PostgreSQL plus an extension, so the users half is the
 /// PostgreSQL migration verbatim — same driver, same types, same upsert. What
@@ -1880,6 +2253,361 @@ mod tests {
             .await
             .expect("saving an existing id must update it");
         assert_eq!(repo.get("u1").await.expect("get").name, "Alicia");
+    }
+
+    #[tokio::test]
+    async fn get_missing_is_not_found() {
+        let Some(repo) = repo() else {
+            return;
+        };
+
+        let err = repo.get("no-such-user").await.unwrap_err();
+        assert!(matches!(err, DomainError::NotFound));
+    }
+}
+"##;
+
+/// The SeaORM half of the three swapped blocks. `sea_db`/`sea_repo` come last
+/// because the list is sorted and `cargo fmt --check` runs in the generated
+/// project's CI.
+///
+/// Nothing in these three constants may contain the word "diesel" in any case:
+/// that is exactly what `SEA_SWAP.leftovers` looks for once the swap is done,
+/// so a comment mentioning the other ORM would make the command refuse its own
+/// output.
+const BOOTSTRAP_USE_SEA: &str = r##"        grpc_greeter::GrpcGreeter,
+        in_memory_repo::InMemoryUserRepository,
+        sea_db::Db,
+        sea_repo::SeaUserRepository,
+"##;
+
+/// Still called `db`, still resolved in the same place, still `DATABASE_URL`:
+/// the datastore slot is one slot and this is the same server, so both
+/// `api::Services` literals keep working untouched.
+const BOOTSTRAP_DB_SEA: &str = r##"    // no pool to build and no migration step: the connection is opened on first
+    // use and the schema applied with it (see sea_db.rs), so a database that is
+    // not up yet cannot stop the service booting — the same property the lazy
+    // Redis connection has
+    let db = std::env::var("DATABASE_URL").ok().map(Db::new);"##;
+
+const BOOTSTRAP_BUILD_USER_SEA: &str = r##"fn build_user_service(db: Option<&Db>) -> Arc<dyn UserService> {
+    let repo: Arc<dyn UserRepository> = match db {
+        Some(db) => Arc::new(SeaUserRepository::new(db.clone())),
+        None => Arc::new(InMemoryUserRepository::new()),
+    };
+    Arc::new(UserServiceImpl::new(repo))
+}"##;
+
+const SEA_DB_TPL: &str = r##"//! Shared SeaORM/{{Dialect}} plumbing for every repository: one connection
+//! pool, one schema, one error mapping. A new repository only needs a `Db`
+//! clone and its own queries.
+//!
+//! Written by `kodegen add {{capability}} --orm seaorm`.
+//!
+//! **This handle is called `Db` deliberately.** The Diesel one is called `Db`
+//! too, and the two can never be compiled together (`src/lib.rs` refuses it), so
+//! sharing the name is what makes switching ORMs cost nothing above this layer:
+//! the composition root's binding keeps its name and every builder `kodegen
+//! feature` scaffolded (`_db: Option<&Db>`) keeps compiling in both directions.
+//! Two types, two modules, one at a time — say
+//! `use crate::infrastructure::sea_db::Db;` (rather than the Diesel module's)
+//! when a file has to name which one it means. Only the name is shared: there is
+//! no `Db::run` here, because nothing blocks.
+//!
+//! **There are no versioned migrations on this path.** `SCHEMA` below is applied
+//! on the first connection, every statement idempotent, and `migrations/` is not
+//! read at all — the same deal the Mongo, ClickHouse and S3 adapters already
+//! make. That is fine while the schema is the seed. The first time you change a
+//! table that already holds production data, move to versioned migrations
+//! (`sea-orm-migration = "1.1"`, pinned: its 2.x needs rustc 1.94) and delete
+//! this constant — `CREATE TABLE IF NOT EXISTS` cannot express an `ALTER`, and a
+//! startup that silently does nothing is worse than one that fails.
+//!
+//! **The role in `DATABASE_URL` must be allowed to create tables**, and that is
+//! not softened by the tables already existing: PostgreSQL checks `CREATE` on
+//! the schema *before* it checks whether the object is there, so
+//! `CREATE TABLE IF NOT EXISTS users` answers `permission denied for schema
+//! public` to a role without it even when `users` has existed for a year
+//! (measured, not assumed). What that looks like is a failing *request*, never a
+//! failing boot — the connection is opened lazily, the schema goes with it, and
+//! the error is a 500 (the server answered; only an unreachable server is the
+//! 503 case) repeated on every request forever, because a failed init is not
+//! cached.
+//!
+//! So in an environment where the application role does not own the schema,
+//! pick one: `GRANT CREATE ON SCHEMA public TO <role>` (it creates nothing after
+//! the first boot — the grant is what lets it *ask*), or empty `SCHEMA` here and
+//! own the schema out of band, which is the same move as going to versioned
+//! migrations and is one edit in this file.
+//!
+//! **A database that is down costs the request 30 seconds** — sqlx's default
+//! acquire timeout — before the 503, and every request until it is back. Add
+//! `opts.acquire_timeout(Duration::from_secs(2));` below to find out sooner.
+//!
+//! **`CREATE TABLE IF NOT EXISTS` is idempotent, not atomic.** Inside one
+//! process that does not matter — there is one handle, so the `OnceCell` below
+//! runs the schema exactly once. Across processes it does: two instances whose
+//! *first* connection lands at the same moment on a database that has neither
+//! table yet can collide, and PostgreSQL answers one of them with a duplicate
+//! key on `pg_type` rather than "it exists now". That is what the retry in
+//! `conn()` is for, and it is the cheapest thing that turns a startup race into
+//! a no-op. It retries only what the server answered — a connection error is
+//! returned as it is, so a database that is down still costs one acquire
+//! timeout and not two. It is not a substitute for migrations once the schema is
+//! worth versioning.
+
+use crate::domain::DomainError;
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr};
+use std::sync::Arc;
+use tokio::sync::OnceCell;
+
+/// The schema this adapter needs, applied once when the connection is opened.
+///
+/// One statement per entry rather than one string with semicolons: multiple
+/// statements in a single round trip are not enabled by default on every
+/// backend, and one at a time behaves the same everywhere. Every statement is
+/// idempotent, which is what makes running this on every boot a no-op rather
+/// than an error on the second one.
+const SCHEMA: &[&str] = &[
+{{schema}}];
+
+/// Cheap-to-clone handle every repository here shares.
+///
+/// The connection is opened on **first use**, not at startup:
+/// `Database::connect` is async and `build_services_from_env()` is a plain
+/// `fn`. Deferring it costs one `OnceCell` and means a database that is still
+/// coming up cannot stop the process from booting — the request that arrives
+/// first pays for the connection, and a `DomainError::Unavailable` answers 503
+/// until it succeeds.
+#[derive(Clone)]
+pub struct Db(Arc<Inner>);
+
+struct Inner {
+    url: String,
+    conn: OnceCell<DatabaseConnection>,
+}
+
+impl Db {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self(Arc::new(Inner {
+            url: url.into(),
+            conn: OnceCell::new(),
+        }))
+    }
+
+    /// The shared connection, dialing and applying `SCHEMA` on the first call.
+    /// `DatabaseConnection` owns its own pool, so every caller must get the
+    /// *same* one — that is what the `OnceCell` behind the `Arc` is for, rather
+    /// than a connection per clone.
+    ///
+    /// A failure here is not cached: `get_or_try_init` leaves the cell empty, so
+    /// a server that was down when the first request arrived is retried on the
+    /// next one instead of poisoning the process.
+    pub async fn conn(&self) -> Result<&DatabaseConnection, DomainError> {
+        self.0
+            .conn
+            .get_or_try_init(|| async {
+                let mut opts = ConnectOptions::new(self.0.url.as_str());
+                // every statement at INFO otherwise, which is the application's
+                // log budget spent on its own SQL
+                opts.sqlx_logging(false);
+                let conn = Database::connect(opts).await?;
+                // `IF NOT EXISTS` is idempotent but **not atomic**: two
+                // processes whose first connection lands at the same moment on a
+                // database that does not have these objects yet can collide, and
+                // PostgreSQL answers one of them with a duplicate key on
+                // `pg_type` rather than "it exists now". The loser retries once,
+                // by which time the statement is a no-op — and a second failure
+                // is a real one, so it is returned rather than swallowed.
+                //
+                // Only for errors the *server* answered. A dead connection or an
+                // exhausted pool will not have healed by the next line: the retry
+                // would just pay the acquire timeout a second time (30s by
+                // default, so 60 before the caller hears anything) and fail the
+                // same way. A permission error is the same story — `CREATE` that
+                // is not granted stays not granted.
+                for stmt in SCHEMA {
+                    if let Err(e) = conn.execute_unprepared(stmt).await {
+                        if matches!(e, DbErr::Conn(_) | DbErr::ConnectionAcquire(_)) {
+                            return Err(e);
+                        }
+                        conn.execute_unprepared(stmt).await?;
+                    }
+                }
+                Ok(conn)
+            })
+            .await
+            .map_err(infra)
+    }
+}
+
+/// A server that cannot be reached is `Unavailable`, which `api::to_http_err`
+/// turns into a 503 — the same treatment `GrpcGreeter` gives a dead upstream.
+/// Anything the server itself answered (a rejected statement, a constraint, a
+/// permission) is a real `Other` and a 500: the dependency is up, the request or
+/// the schema is wrong, and dressing that up as "try again later" would hide it.
+pub fn infra(e: DbErr) -> DomainError {
+    match e {
+        DbErr::Conn(_) | DbErr::ConnectionAcquire(_) => DomainError::Unavailable,
+        _ => DomainError::Other(Box::new(e)),
+    }
+}
+"##;
+
+const SEA_REPO_TPL: &str = r##"//! `UserRepository` adapter over SeaORM/{{Dialect}}. Written by
+//! `kodegen add {{capability}} --orm seaorm`.
+//!
+//! No new port: this is another adapter of the port the template already ships,
+//! which is why the application service, the routes and `tests/api.rs` are
+//! untouched — and why the port's contract (`save` is an upsert, `get` on a
+//! missing id is `NotFound`) is what this file has to honor rather than
+//! reinterpret.
+//!
+//! The entity lives here next to the queries, the way `diesel::table!` does in
+//! the other adapter. The handle is owned by the composition root
+//! (`bootstrap.rs`) and handed in: a repository never reads `DATABASE_URL`.
+//!
+//! Nothing here blocks and nothing is spawned: sqlx is async to the socket, so
+//! there is no `spawn_blocking`, no second pool and no closure to hand work to.
+
+use crate::domain::{DomainError, User, UserRepository};
+use crate::infrastructure::sea_db::{infra, Db};
+use async_trait::async_trait;
+use sea_orm::entity::prelude::*;
+use sea_orm::sea_query::OnConflict;
+use sea_orm::{ActiveValue::Set, EntityTrait};
+
+/// The stored row. `id` is the user's own id rather than a generated key: it is
+/// already unique and is what the port looks users up by, which is also what
+/// makes the upsert below a single write.
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[sea_orm(table_name = "users")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: String,
+    pub name: String,
+}
+
+/// No foreign keys in the seed schema, so there is nothing to relate to yet —
+/// the enum still has to exist for `EntityTrait`.
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}
+
+pub struct SeaUserRepository {
+    db: Db,
+}
+
+impl SeaUserRepository {
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl UserRepository for SeaUserRepository {
+    async fn save(&self, user: User) -> Result<(), DomainError> {
+        let row = ActiveModel {
+            id: Set(user.id),
+            name: Set(user.name),
+        };
+        // upsert, because that is what the port documents `save` as: an id that
+        // is already there is overwritten, never answered with a duplicate-key
+        // error. `update_column`, not `do_nothing` — ignoring the new value
+        // would be a different contract (and MySQL has no `DO NOTHING` to begin
+        // with).
+        //
+        // `exec_without_returning` rather than `exec`: an upsert whose new
+        // values equal the old ones reports 0 affected rows on some backends,
+        // and `exec` turns that into `DbErr::RecordNotInserted` — an error for a
+        // `save` the port says must return `Ok(())`. This one returns the count
+        // and leaves the judgment here, where the contract is known.
+        Entity::insert(row)
+            .on_conflict(
+                OnConflict::column(Column::Id)
+                    .update_column(Column::Name)
+                    .to_owned(),
+            )
+            .exec_without_returning(self.db.conn().await?)
+            .await
+            .map(|_| ())
+            .map_err(infra)
+    }
+
+    async fn get(&self, id: &str) -> Result<User, DomainError> {
+        Entity::find_by_id(id)
+            .one(self.db.conn().await?)
+            .await
+            .map_err(infra)?
+            .map(|row| User {
+                id: row.id,
+                name: row.name,
+            })
+            .ok_or(DomainError::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// {{Dialect}} needs a server, so these are gated on `DATABASE_URL` rather
+    /// than `#[ignore]`: `docker compose -f docker-compose.dev.yml up -d` plus
+    /// the env var is all it takes to run them, and CI stays green without one
+    /// (the in-memory adapter is what runs when `DATABASE_URL` is unset —
+    /// exactly how the app itself picks its adapter).
+    ///
+    /// A handle **per test**, not one shared by the binary the way the Diesel
+    /// adapter shares its pool: `#[tokio::test]` builds a runtime per test and
+    /// drops it at the end, and a sqlx pool belongs to the runtime that created
+    /// it — shared, the second test to use it waits out the acquire timeout on
+    /// connections whose runtime is gone. Which leaves these tests applying the
+    /// schema concurrently on an empty database, and that is handled where it
+    /// has to be for real deployments too: the retry in `sea_db.rs`.
+    fn repo() -> Option<SeaUserRepository> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        Some(SeaUserRepository::new(Db::new(url)))
+    }
+
+    #[tokio::test]
+    async fn save_then_get_roundtrips() {
+        let Some(repo) = repo() else {
+            eprintln!("DATABASE_URL unset — skipping the {{Dialect}} roundtrip test");
+            return;
+        };
+
+        // save is an upsert, so re-running this against a live database must not
+        // fail on the row the previous run left behind
+        let user = User::new("u1", "Alice").expect("valid user");
+        repo.save(user).await.expect("save");
+        assert_eq!(repo.get("u1").await.expect("get").name, "Alice");
+
+        repo.save(User::new("u1", "Alicia").expect("valid user"))
+            .await
+            .expect("saving an existing id must update it");
+        assert_eq!(repo.get("u1").await.expect("get").name, "Alicia");
+    }
+
+    /// The case that is a *runtime* difference between backends rather than a
+    /// compile-time one: an upsert whose values are unchanged affects 0 rows on
+    /// MySQL, which sea-orm's `exec` reports as `RecordNotInserted`. The port
+    /// says `save` returns `Ok(())`, so this test is the contract — and the
+    /// reason `save` uses `exec_without_returning`. Both writes are in one test
+    /// on purpose: split across two, a stale row from an earlier run would make
+    /// the second one pass for the wrong reason.
+    #[tokio::test]
+    async fn save_twice_identical_values_is_ok() {
+        let Some(repo) = repo() else {
+            return;
+        };
+
+        let user = User::new("u2", "Bob").expect("valid user");
+        repo.save(user.clone()).await.expect("save");
+        repo.save(user)
+            .await
+            .expect("saving identical values again must still be Ok");
+        assert_eq!(repo.get("u2").await.expect("get").name, "Bob");
     }
 
     #[tokio::test]
@@ -3562,7 +4290,7 @@ mod tests {
     fn flips_default_without_touching_dependencies() {
         let root = fixture("flip");
         let before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-        add(&root, Capability::Postgres, false).unwrap();
+        add(&root, Capability::Postgres, None, false).unwrap();
         let after = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(after.contains("default = [\"postgres\"]"), "{after}");
         // the lock stays valid only as long as `add` never adds a dependency:
@@ -3577,7 +4305,7 @@ mod tests {
     #[test]
     fn mariadb_uses_the_mysql_backend() {
         let root = fixture("mariadb");
-        add(&root, Capability::Mariadb, false).unwrap();
+        add(&root, Capability::Mariadb, None, false).unwrap();
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"mysql\"]"), "{toml}");
         let db = fs::read_to_string(root.join(DIESEL_DB)).unwrap();
@@ -3590,8 +4318,9 @@ mod tests {
     #[test]
     fn mysql_migration_avoids_a_text_primary_key() {
         let root = fixture("mysql-migration");
-        add(&root, Capability::Mysql, false).unwrap();
-        let up = fs::read_to_string(root.join("migrations/2026-07-26-000000_create_users/up.sql")).unwrap();
+        add(&root, Capability::Mysql, None, false).unwrap();
+        let up = fs::read_to_string(root.join("migrations/2026-07-26-000000_create_users/up.sql"))
+            .unwrap();
         // MySQL cannot index TEXT without a prefix length — this one fails at
         // migration time, not compile time
         assert!(up.contains("VARCHAR(64) PRIMARY KEY"), "{up}");
@@ -3608,7 +4337,7 @@ mod tests {
             ("mysql-upsert", Capability::Mysql, "diesel::dsl::DuplicatedKeys"),
         ] {
             let root = fixture(tag);
-            add(&root, cap, false).unwrap();
+            add(&root, cap, None, false).unwrap();
             let repo = fs::read_to_string(root.join(DIESEL_REPO)).unwrap();
             assert!(!repo.contains("replace_into"), "{tag}: {repo}");
             assert!(repo.contains(&format!(".on_conflict({target})")), "{tag}: {repo}");
@@ -3622,7 +4351,7 @@ mod tests {
     #[test]
     fn redis_writes_the_cache_port_and_wires_both_composition_roots() {
         let root = fixture("redis");
-        add(&root, Capability::Redis, false).unwrap();
+        add(&root, Capability::Redis, None, false).unwrap();
 
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"sqlite\", \"cache\"]"), "{toml}");
@@ -3662,8 +4391,8 @@ mod tests {
     #[test]
     fn redis_coexists_with_a_relational_backend() {
         let root = fixture("redis-and-pg");
-        add(&root, Capability::Postgres, false).unwrap();
-        add(&root, Capability::Redis, false).unwrap();
+        add(&root, Capability::Postgres, None, false).unwrap();
+        add(&root, Capability::Redis, None, false).unwrap();
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"postgres\", \"cache\"]"), "{toml}");
         let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
@@ -3674,8 +4403,10 @@ mod tests {
     #[test]
     fn adding_redis_twice_fails() {
         let root = fixture("redis-twice");
-        add(&root, Capability::Redis, false).unwrap();
-        let err = add(&root, Capability::Redis, true).unwrap_err().to_string();
+        add(&root, Capability::Redis, None, false).unwrap();
+        let err = add(&root, Capability::Redis, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("capability 'redis' already added"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -3684,9 +4415,9 @@ mod tests {
     fn redis_dry_run_writes_nothing_but_plans_the_same_change() {
         let root = fixture("redis-dry");
         let before = snapshot(&root);
-        let planned = add(&root, Capability::Redis, true).unwrap();
+        let planned = add(&root, Capability::Redis, None, true).unwrap();
         assert_eq!(before, snapshot(&root), "dry run touched the tree");
-        assert_eq!(planned, add(&root, Capability::Redis, false).unwrap());
+        assert_eq!(planned, add(&root, Capability::Redis, None, false).unwrap());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3696,8 +4427,14 @@ mod tests {
     fn redis_names_the_missing_resources_marker() {
         let root = fixture("redis-no-marker");
         let bootstrap = fs::read_to_string(root.join("src/bootstrap.rs")).unwrap();
-        fs::write(root.join("src/bootstrap.rs"), bootstrap.replace(RESOURCES_MARKER, "")).unwrap();
-        let err = add(&root, Capability::Redis, true).unwrap_err().to_string();
+        fs::write(
+            root.join("src/bootstrap.rs"),
+            bootstrap.replace(RESOURCES_MARKER, ""),
+        )
+        .unwrap();
+        let err = add(&root, Capability::Redis, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(RESOURCES_MARKER), "{err}");
         assert!(err.contains("build_services_from_env"), "{err}");
         fs::remove_dir_all(&root).unwrap();
@@ -3725,7 +4462,7 @@ mod tests {
         )
         .unwrap();
         for cap in [Capability::Postgres, Capability::Redis] {
-            let err = add(&root, cap, true).unwrap_err().to_string();
+            let err = add(&root, cap, None, true).unwrap_err().to_string();
             assert!(err.contains("split across lines"), "{}: {err}", cap.name());
         }
         fs::remove_dir_all(&root).unwrap();
@@ -3739,11 +4476,15 @@ mod tests {
         let ports = fs::read_to_string(root.join(PORTS)).unwrap();
 
         fs::write(root.join(PORTS), format!("{ports}\npub trait Cache {{}}\n")).unwrap();
-        let err = add(&root, Capability::Redis, true).unwrap_err().to_string();
+        let err = add(&root, Capability::Redis, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("already declares a `Cache` trait"), "{err}");
 
         fs::write(root.join(PORTS), ports.replace(ASYNC_TRAIT_USE, "")).unwrap();
-        let err = add(&root, Capability::Redis, true).unwrap_err().to_string();
+        let err = add(&root, Capability::Redis, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(ASYNC_TRAIT_USE), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -3753,7 +4494,7 @@ mod tests {
     #[test]
     fn s3_writes_the_blob_port_and_wires_both_composition_roots() {
         let root = fixture("s3");
-        add(&root, Capability::S3, false).unwrap();
+        add(&root, Capability::S3, None, false).unwrap();
 
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"sqlite\", \"blob\"]"), "{toml}");
@@ -3799,9 +4540,9 @@ mod tests {
     #[test]
     fn s3_coexists_with_a_backend_and_a_cache() {
         let root = fixture("s3-and-friends");
-        add(&root, Capability::Postgres, false).unwrap();
-        add(&root, Capability::Redis, false).unwrap();
-        add(&root, Capability::S3, false).unwrap();
+        add(&root, Capability::Postgres, None, false).unwrap();
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::S3, None, false).unwrap();
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"postgres\", \"cache\", \"blob\"]"), "{toml}");
         let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
@@ -3816,8 +4557,10 @@ mod tests {
     #[test]
     fn adding_s3_twice_fails() {
         let root = fixture("s3-twice");
-        add(&root, Capability::S3, false).unwrap();
-        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        add(&root, Capability::S3, None, false).unwrap();
+        let err = add(&root, Capability::S3, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("capability 's3' already added"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -3826,9 +4569,9 @@ mod tests {
     fn s3_dry_run_writes_nothing_but_plans_the_same_change() {
         let root = fixture("s3-dry");
         let before = snapshot(&root);
-        let planned = add(&root, Capability::S3, true).unwrap();
+        let planned = add(&root, Capability::S3, None, true).unwrap();
         assert_eq!(before, snapshot(&root), "dry run touched the tree");
-        assert_eq!(planned, add(&root, Capability::S3, false).unwrap());
+        assert_eq!(planned, add(&root, Capability::S3, None, false).unwrap());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3836,8 +4579,14 @@ mod tests {
     fn s3_names_the_missing_resources_marker() {
         let root = fixture("s3-no-marker");
         let bootstrap = fs::read_to_string(root.join("src/bootstrap.rs")).unwrap();
-        fs::write(root.join("src/bootstrap.rs"), bootstrap.replace(RESOURCES_MARKER, "")).unwrap();
-        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        fs::write(
+            root.join("src/bootstrap.rs"),
+            bootstrap.replace(RESOURCES_MARKER, ""),
+        )
+        .unwrap();
+        let err = add(&root, Capability::S3, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(RESOURCES_MARKER), "{err}");
         assert!(err.contains("build_services_from_env"), "{err}");
         fs::remove_dir_all(&root).unwrap();
@@ -3851,16 +4600,33 @@ mod tests {
         let root = fixture("s3-ports-guard");
         let ports = fs::read_to_string(root.join(PORTS)).unwrap();
 
-        fs::write(root.join(PORTS), format!("{ports}\npub trait BlobStore {{}}\n")).unwrap();
-        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
-        assert!(err.contains("already declares a `BlobStore` trait"), "{err}");
+        fs::write(
+            root.join(PORTS),
+            format!("{ports}\npub trait BlobStore {{}}\n"),
+        )
+        .unwrap();
+        let err = add(&root, Capability::S3, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("already declares a `BlobStore` trait"),
+            "{err}"
+        );
 
-        fs::write(root.join(PORTS), format!("{ports}\npub fn check_blob_key() {{}}\n")).unwrap();
-        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        fs::write(
+            root.join(PORTS),
+            format!("{ports}\npub fn check_blob_key() {{}}\n"),
+        )
+        .unwrap();
+        let err = add(&root, Capability::S3, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("already declares `check_blob_key`"), "{err}");
 
         fs::write(root.join(PORTS), ports.replace(ASYNC_TRAIT_USE, "")).unwrap();
-        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
+        let err = add(&root, Capability::S3, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(ASYNC_TRAIT_USE), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -3871,8 +4637,13 @@ mod tests {
     fn s3_refuses_to_overwrite_an_existing_adapter() {
         let root = fixture("s3-existing-adapter");
         fs::write(root.join(S3_BLOBS), "// mine now\n").unwrap();
-        let err = add(&root, Capability::S3, true).unwrap_err().to_string();
-        assert!(err.contains(S3_BLOBS) && err.contains("already exists"), "{err}");
+        let err = add(&root, Capability::S3, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(S3_BLOBS) && err.contains("already exists"),
+            "{err}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3900,8 +4671,10 @@ mod tests {
     #[test]
     fn adding_the_same_capability_twice_fails() {
         let root = fixture("twice");
-        add(&root, Capability::Postgres, false).unwrap();
-        let err = add(&root, Capability::Postgres, true).unwrap_err().to_string();
+        add(&root, Capability::Postgres, None, false).unwrap();
+        let err = add(&root, Capability::Postgres, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("already added"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -3909,8 +4682,10 @@ mod tests {
     #[test]
     fn a_second_relational_backend_fails_with_instructions() {
         let root = fixture("second");
-        add(&root, Capability::Postgres, false).unwrap();
-        let err = add(&root, Capability::Mysql, true).unwrap_err().to_string();
+        add(&root, Capability::Postgres, None, false).unwrap();
+        let err = add(&root, Capability::Mysql, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("already this project's datastore"), "{err}");
         assert!(err.contains("default = [\"sqlite\"]"), "must say how to undo it: {err}");
         assert!(err.contains("diesel_db.rs"), "must name the files to restore: {err}");
@@ -3919,28 +4694,39 @@ mod tests {
 
     #[test]
     fn with_more_than_one_relational_backend_is_refused() {
-        let err = check_combination(&[Capability::Postgres, Capability::Mysql]).unwrap_err().to_string();
+        let err = check_combination(&[Capability::Postgres, Capability::Mysql], None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("at most one datastore"), "{err}");
         // deduped by cargo feature, not by variant: these are one capability
-        let err = check_combination(&[Capability::Mysql, Capability::Mariadb]).unwrap_err().to_string();
+        let err = check_combination(&[Capability::Mysql, Capability::Mariadb], None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("the same capability"), "{err}");
         assert!(err.contains("`mysql` cargo feature"), "{err}");
-        let err = check_combination(&[Capability::Redis, Capability::Redis]).unwrap_err().to_string();
+        let err = check_combination(&[Capability::Redis, Capability::Redis], None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("the same capability"), "{err}");
         // mongodb is not relational, but it is the same slot: `Db` or `Mongo`,
         // one adapter behind one `UserRepository`
-        let err =
-            check_combination(&[Capability::Postgres, Capability::Mongodb]).unwrap_err().to_string();
+        let err = check_combination(&[Capability::Postgres, Capability::Mongodb], None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("at most one datastore"), "{err}");
         assert!(err.contains("postgres, mongodb"), "must name both: {err}");
-        assert!(check_combination(&[Capability::Postgres]).is_ok());
+        assert!(check_combination(&[Capability::Postgres], None).is_ok());
         // redis is not a backend, so it rides along with one
-        assert!(check_combination(&[Capability::Postgres, Capability::Redis]).is_ok());
+        assert!(check_combination(&[Capability::Postgres, Capability::Redis], None).is_ok());
         assert!(
-            check_combination(&[Capability::Mongodb, Capability::Redis, Capability::S3]).is_ok(),
+            check_combination(
+                &[Capability::Mongodb, Capability::Redis, Capability::S3],
+                None
+            )
+            .is_ok(),
             "the additive capabilities must ride along with mongodb too"
         );
-        assert!(check_combination(&[]).is_ok());
+        assert!(check_combination(&[], None).is_ok());
     }
 
     /// The Phase 4 path: a second adapter of a port the template already has, so
@@ -3949,7 +4735,7 @@ mod tests {
     #[test]
     fn mongodb_takes_the_datastore_slot_and_leaves_diesel_on_disk() {
         let root = fixture("mongodb");
-        add(&root, Capability::Mongodb, false).unwrap();
+        add(&root, Capability::Mongodb, None, false).unwrap();
 
         // the slot, not a second entry beside it: sqlite is gone
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
@@ -3997,15 +4783,28 @@ mod tests {
     #[test]
     fn a_relational_backend_on_top_of_mongodb_fails_with_instructions() {
         let root = fixture("mongo-then-pg");
-        add(&root, Capability::Mongodb, false).unwrap();
-        let err = add(&root, Capability::Postgres, true).unwrap_err().to_string();
-        assert!(err.contains("'document' is already this project's datastore"), "{err}");
-        assert!(err.contains("mongo_repo.rs"), "must name the file to remove: {err}");
+        add(&root, Capability::Mongodb, None, false).unwrap();
+        let err = add(&root, Capability::Postgres, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'document' is already this project's datastore"),
+            "{err}"
+        );
+        assert!(
+            err.contains("mongo_repo.rs"),
+            "must name the file to remove: {err}"
+        );
         // and the other direction
         let root2 = fixture("pg-then-mongo");
-        add(&root2, Capability::Postgres, false).unwrap();
-        let err = add(&root2, Capability::Mongodb, true).unwrap_err().to_string();
-        assert!(err.contains("'postgres' is already this project's datastore"), "{err}");
+        add(&root2, Capability::Postgres, None, false).unwrap();
+        let err = add(&root2, Capability::Mongodb, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'postgres (diesel)' is already this project's datastore"),
+            "{err}"
+        );
         assert!(err.contains("rerun `kodegen add mongodb`"), "{err}");
         fs::remove_dir_all(&root).unwrap();
         fs::remove_dir_all(&root2).unwrap();
@@ -4014,8 +4813,10 @@ mod tests {
     #[test]
     fn adding_mongodb_twice_fails() {
         let root = fixture("mongo-twice");
-        add(&root, Capability::Mongodb, false).unwrap();
-        let err = add(&root, Capability::Mongodb, true).unwrap_err().to_string();
+        add(&root, Capability::Mongodb, None, false).unwrap();
+        let err = add(&root, Capability::Mongodb, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("capability 'mongodb' already added"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -4026,9 +4827,9 @@ mod tests {
     #[test]
     fn mongodb_coexists_with_a_cache_and_a_blob_store() {
         let root = fixture("mongo-and-friends");
-        add(&root, Capability::Mongodb, false).unwrap();
-        add(&root, Capability::Redis, false).unwrap();
-        add(&root, Capability::S3, false).unwrap();
+        add(&root, Capability::Mongodb, None, false).unwrap();
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::S3, None, false).unwrap();
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"document\", \"cache\", \"blob\"]"), "{toml}");
         let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
@@ -4050,8 +4851,8 @@ mod tests {
     #[test]
     fn a_cache_added_before_mongodb_survives_the_rewrite() {
         let root = fixture("redis-then-mongo");
-        add(&root, Capability::Redis, false).unwrap();
-        add(&root, Capability::Mongodb, false).unwrap();
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::Mongodb, None, false).unwrap();
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"cache\", \"document\"]"), "{toml}");
         let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
@@ -4069,9 +4870,14 @@ mod tests {
     #[test]
     fn a_feature_scaffolded_after_mongodb_takes_the_mongo_handle() {
         let root = fixture("mongo-then-feature");
-        add(&root, Capability::Mongodb, false).unwrap();
-        crate::scaffold::add_feature(&root, "notification", crate::scaffold::Transport::Rest, false)
-            .unwrap();
+        add(&root, Capability::Mongodb, None, false).unwrap();
+        crate::scaffold::add_feature(
+            &root,
+            "notification",
+            crate::scaffold::Transport::Rest,
+            false,
+        )
+        .unwrap();
         let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
         assert!(bootstrap.contains("_db: Option<&Mongo>"), "{bootstrap}");
         assert!(!bootstrap.contains("Db"), "a builder asked for a type that is gone: {bootstrap}");
@@ -4093,7 +4899,7 @@ mod tests {
             !before.contains("(_db: Option<&Db>)"),
             "expected rustfmt to wrap the long signature: {before}"
         );
-        add(&root, Capability::Mongodb, false).unwrap();
+        add(&root, Capability::Mongodb, None, false).unwrap();
         let after = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
         assert!(after.contains("_db: Option<&Mongo>"), "the wrapped builder was missed: {after}");
         assert!(!after.contains("Db"), "{after}");
@@ -4108,16 +4914,21 @@ mod tests {
     #[test]
     fn every_slot_lists_the_features_of_the_capabilities_that_fill_it() {
         use clap::ValueEnum;
+        // both ORMs, because both put a name in the datastore slot's list: a
+        // `seaorm-*` feature missing from it would be added on top of whatever
+        // is already there rather than refused
         for cap in Capability::value_variants() {
-            for slot in Slot::ALL {
-                assert_eq!(
-                    cap.kind().slot() == Some(slot),
-                    slot.features().contains(&cap.feature()),
-                    "'{}' (feature `{}`) disagrees with the {} slot",
-                    cap.name(),
-                    cap.feature(),
-                    slot.what()
-                );
+            for orm in [Orm::Diesel, Orm::Seaorm] {
+                for slot in Slot::ALL {
+                    assert_eq!(
+                        cap.kind().slot() == Some(slot),
+                        slot.features().contains(&cap.feature(orm)),
+                        "'{}' (feature `{}`, {orm:?}) disagrees with the {} slot",
+                        cap.name(),
+                        cap.feature(orm),
+                        slot.what()
+                    );
+                }
             }
         }
         // not reachable through any capability — it is what the template ships
@@ -4145,9 +4956,12 @@ mod tests {
     fn mongodb_dry_run_writes_nothing_but_plans_the_same_change() {
         let root = fixture("mongo-dry");
         let before = snapshot(&root);
-        let planned = add(&root, Capability::Mongodb, true).unwrap();
+        let planned = add(&root, Capability::Mongodb, None, true).unwrap();
         assert_eq!(before, snapshot(&root), "dry run touched the tree");
-        assert_eq!(planned, add(&root, Capability::Mongodb, false).unwrap());
+        assert_eq!(
+            planned,
+            add(&root, Capability::Mongodb, None, false).unwrap()
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4166,7 +4980,9 @@ mod tests {
             let spiked = bootstrap.replace(spike, "// mine now");
             fs::write(root.join(BOOTSTRAP), &spiked).unwrap();
 
-            let err = add(&root, Capability::Mongodb, false).unwrap_err().to_string();
+            let err = add(&root, Capability::Mongodb, None, false)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("refusing to overwrite"), "{tag}: {err}");
             assert!(err.contains("MONGODB_URL"), "{tag}: must list the manual steps: {err}");
             assert_eq!(
@@ -4185,8 +5001,9 @@ mod tests {
     #[test]
     fn scaffolded_feature_builders_move_to_the_mongo_handle() {
         let root = fixture("mongo-after-feature");
-        crate::scaffold::add_feature(&root, "order", crate::scaffold::Transport::Rest, false).unwrap();
-        add(&root, Capability::Mongodb, false).unwrap();
+        crate::scaffold::add_feature(&root, "order", crate::scaffold::Transport::Rest, false)
+            .unwrap();
+        add(&root, Capability::Mongodb, None, false).unwrap();
 
         let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
         assert!(bootstrap.contains("fn build_order_service(_db: Option<&Mongo>)"), "{bootstrap}");
@@ -4201,8 +5018,14 @@ mod tests {
     fn refuses_a_bootstrap_that_uses_the_db_handle_elsewhere() {
         let root = fixture("mongo-custom-db");
         let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
-        fs::write(root.join(BOOTSTRAP), format!("{bootstrap}\nfn mine(db: &Db) -> &Db {{ db }}\n")).unwrap();
-        let err = add(&root, Capability::Mongodb, true).unwrap_err().to_string();
+        fs::write(
+            root.join(BOOTSTRAP),
+            format!("{bootstrap}\nfn mine(db: &Db) -> &Db {{ db }}\n"),
+        )
+        .unwrap();
+        let err = add(&root, Capability::Mongodb, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Diesel `Db` handle"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -4211,8 +5034,484 @@ mod tests {
     fn mongodb_refuses_to_overwrite_an_existing_adapter() {
         let root = fixture("mongo-existing-adapter");
         fs::write(root.join(MONGO_REPO), "// mine now\n").unwrap();
-        let err = add(&root, Capability::Mongodb, true).unwrap_err().to_string();
-        assert!(err.contains(MONGO_REPO) && err.contains("already exists"), "{err}");
+        let err = add(&root, Capability::Mongodb, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(MONGO_REPO) && err.contains("already exists"),
+            "{err}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The Phase 6a path: the same backend as `add postgres`, behind the other
+    /// ORM. Everything asserted here is either "the slot behaved like the slot"
+    /// or "the Diesel-only work did not happen" — the second half is the payoff
+    /// the capability exists for.
+    #[test]
+    fn seaorm_takes_the_datastore_slot_and_leaves_the_diesel_path_alone() {
+        let root = fixture("seaorm-pg");
+        let manifest_before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let dockerfile_before = fs::read_to_string(root.join("Dockerfile")).unwrap();
+        let seed = "migrations/2026-07-26-000000_create_users/up.sql";
+        let seed_before = fs::read_to_string(root.join(seed)).unwrap();
+
+        add(&root, Capability::Postgres, Some(Orm::Seaorm), false).unwrap();
+
+        // the slot, not a second entry beside it: sqlite is gone, and the lock
+        // stays valid because nothing but that one line moved
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"seaorm-postgres\"]"), "{toml}");
+        let strip = |s: &str| {
+            s.lines()
+                .filter(|l| !l.starts_with("default = ["))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip(&manifest_before), strip(&toml));
+
+        let db = fs::read_to_string(root.join(SEA_DB)).unwrap();
+        assert!(
+            db.contains("pub struct Db("),
+            "the handle must be `Db`: {db}"
+        );
+        assert!(
+            db.contains("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY NOT NULL"),
+            "the schema must be the startup DDL, idempotent: {db}"
+        );
+        assert!(!db.contains("build_pool"), "{db}");
+        // the startup-DDL race fix, and its limit: one retry, and not for an
+        // error that says the server was never reached — retrying that pays the
+        // acquire timeout twice for the same failure
+        assert!(
+            db.contains("if matches!(e, DbErr::Conn(_) | DbErr::ConnectionAcquire(_))"),
+            "the schema loop must retry once, and never on a connection error: {db}"
+        );
+
+        let repo = fs::read_to_string(root.join(SEA_REPO)).unwrap();
+        assert!(
+            repo.contains("impl UserRepository for SeaUserRepository"),
+            "{repo}"
+        );
+        // the port documents save as an upsert, and these two lines are what
+        // keep that true against a server that answers 0 affected rows
+        assert!(repo.contains(".update_column(Column::Name)"), "{repo}");
+        assert!(repo.contains("exec_without_returning"), "{repo}");
+        assert!(
+            repo.contains("fn save_twice_identical_values_is_ok"),
+            "{repo}"
+        );
+        assert!(
+            repo.contains("DATABASE_URL"),
+            "the adapter test must be env-gated: {repo}"
+        );
+
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(
+            bootstrap.contains("sea_repo::SeaUserRepository"),
+            "{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("DATABASE_URL"),
+            "the env var does not change: {bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("fn build_user_service(db: Option<&Db>)"),
+            "{bootstrap}"
+        );
+        for gone in ["diesel", "Diesel", "build_pool"] {
+            assert!(
+                !bootstrap.contains(gone),
+                "'{gone}' survived the swap: {bootstrap}"
+            );
+        }
+        // the `Services` literals are untouched — same slot, same binding name
+        assert!(
+            bootstrap.contains("user: build_user_service(db.as_ref()),"),
+            "{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("user: build_user_service(None),"),
+            "{bootstrap}"
+        );
+        for marker in [
+            RESOURCES_MARKER,
+            "// kodegen:services:env",
+            "// kodegen:services:default",
+        ] {
+            assert!(
+                bootstrap.contains(marker),
+                "marker '{marker}' was consumed: {bootstrap}"
+            );
+        }
+
+        // undo has to be possible: nothing is deleted, both sides are gated
+        assert!(root.join(DIESEL_DB).is_file() && root.join(DIESEL_REPO).is_file());
+        let infra = fs::read_to_string(root.join(INFRA_MOD)).unwrap();
+        assert!(
+            infra.contains(SEA_MOD),
+            "the SeaORM modules must be cfg-gated: {infra}"
+        );
+        assert_eq!(
+            infra.matches("#[cfg(feature = \"relational\")]").count(),
+            2,
+            "both Diesel modules must stay behind the relational gate: {infra}"
+        );
+
+        // and the two things this path exists to *not* do
+        assert_eq!(
+            dockerfile_before,
+            fs::read_to_string(root.join("Dockerfile")).unwrap(),
+            "the SeaORM path is pure Rust — the Dockerfile must not be touched"
+        );
+        assert_eq!(
+            seed_before,
+            fs::read_to_string(root.join(seed)).unwrap(),
+            "migrations/ is not used on this path, and not ours to rewrite either"
+        );
+
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        assert!(compose.contains("image: postgres:17-alpine"), "{compose}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// TimescaleDB's startup DDL is the one place an idempotency bug hides
+    /// until the *second* boot: `create_hypertable` without `if_not_exists`
+    /// works once and then fails forever.
+    #[test]
+    fn timescaledb_on_seaorm_ships_an_idempotent_hypertable() {
+        let root = fixture("seaorm-timescale");
+        add(&root, Capability::Timescaledb, Some(Orm::Seaorm), false).unwrap();
+        let db = fs::read_to_string(root.join(SEA_DB)).unwrap();
+        for stmt in [
+            "CREATE EXTENSION IF NOT EXISTS timescaledb",
+            "CREATE TABLE IF NOT EXISTS users",
+            "CREATE TABLE IF NOT EXISTS events",
+            "if_not_exists => TRUE",
+        ] {
+            assert!(db.contains(stmt), "startup DDL is missing `{stmt}`: {db}");
+        }
+        // same feature as postgres on this ORM too, the way it is on the other
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"seaorm-postgres\"]"), "{toml}");
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        assert!(compose.contains("timescale/timescaledb"), "{compose}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Every direction into the datastore slot, because a user can arrive from
+    /// any of them and each one has to name what to put back.
+    #[test]
+    fn the_two_orms_refuse_each_other_from_every_direction() {
+        // Diesel first, SeaORM second
+        let root = fixture("pg-then-seaorm");
+        add(&root, Capability::Postgres, None, false).unwrap();
+        let err = add(&root, Capability::Postgres, Some(Orm::Seaorm), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'postgres (diesel)' is already this project's datastore"),
+            "{err}"
+        );
+        assert!(
+            err.contains("diesel_db.rs"),
+            "must name the files to restore: {err}"
+        );
+        assert!(
+            err.contains("rerun `kodegen add postgres --orm seaorm`"),
+            "the last step must be the command that was typed: {err}"
+        );
+
+        // SeaORM first, Diesel second
+        let root2 = fixture("seaorm-then-pg");
+        add(&root2, Capability::Postgres, Some(Orm::Seaorm), false).unwrap();
+        let err = add(&root2, Capability::Mysql, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'postgres (seaorm)' is already this project's datastore"),
+            "{err}"
+        );
+        assert!(
+            err.contains("sea_db.rs + sea_repo.rs"),
+            "must name what can stay: {err}"
+        );
+        assert!(err.contains("rerun `kodegen add mysql`"), "{err}");
+
+        // and the third occupant, both ways
+        let err = add(&root2, Capability::Mongodb, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'postgres (seaorm)' is already this project's datastore"),
+            "{err}"
+        );
+        let root3 = fixture("mongo-then-seaorm");
+        add(&root3, Capability::Mongodb, None, false).unwrap();
+        let err = add(&root3, Capability::Postgres, Some(Orm::Seaorm), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("'document' is already this project's datastore"),
+            "{err}"
+        );
+
+        // the same capability on the same ORM twice is the other error
+        let err = add(&root2, Capability::Timescaledb, Some(Orm::Seaorm), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("capability 'timescaledb' already added"),
+            "{err}"
+        );
+
+        for dir in [root, root2, root3] {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// `--orm` is a flag about *this* command, so it is checked before anything
+    /// is read — an ignored flag is how a project ends up on an ORM nobody
+    /// asked for.
+    #[test]
+    fn the_orm_flag_is_refused_where_it_means_nothing() {
+        let root = fixture("orm-flag");
+        for cap in [
+            Capability::Redis,
+            Capability::S3,
+            Capability::Mongodb,
+            Capability::Clickhouse,
+            Capability::Influxdb,
+        ] {
+            for orm in [Orm::Diesel, Orm::Seaorm] {
+                let err = add(&root, cap, Some(orm), true).unwrap_err().to_string();
+                assert!(
+                    err.contains("--orm applies only to relational capabilities")
+                        && err.contains(cap.name()),
+                    "{}: {err}",
+                    cap.name()
+                );
+            }
+        }
+        // and it is refused before the project is even looked at
+        let err = add(
+            Path::new("/nonexistent-project"),
+            Capability::Redis,
+            Some(Orm::Seaorm),
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--orm applies only"), "{err}");
+
+        // MySQL on SeaORM is a phase, not a mistake, and says so
+        let err = add(&root, Capability::Mysql, Some(Orm::Seaorm), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not support 'mysql' yet"), "{err}");
+        assert!(
+            err.contains("0 affected rows"),
+            "must say why it is not shipped: {err}"
+        );
+        assert!(
+            err.contains("--orm diesel"),
+            "must say what to do today: {err}"
+        );
+        assert!(
+            add(&root, Capability::Mariadb, Some(Orm::Seaorm), true)
+                .unwrap_err()
+                .to_string()
+                .contains("does not support 'mariadb' yet")
+        );
+
+        // `new --with` takes the same flag, and it has to land on something
+        let err = check_combination(&[Capability::Redis, Capability::S3], Some(Orm::Seaorm))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--orm needs a relational capability"), "{err}");
+        assert!(
+            check_combination(
+                &[Capability::Postgres, Capability::Redis],
+                Some(Orm::Seaorm)
+            )
+            .is_ok(),
+            "the ORM belongs to the relational entry; the others must not be refused"
+        );
+        assert!(check_combination(&[Capability::Mysql], Some(Orm::Seaorm)).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The guard has to *pass* on the file kodegen itself writes, not only
+    /// refuse a hand-edited one: the three replacement blocks are the output it
+    /// then inspects, so one stray "Diesel" in a comment inside them would make
+    /// the command refuse its own work — on every project, forever.
+    #[test]
+    fn the_seaorm_guard_passes_on_a_fresh_bootstrap_and_refuses_a_spiked_one() {
+        let fresh = crate::TEMPLATES
+            .get_file("hexagonal/src/bootstrap.rs")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        let out =
+            rewrite_bootstrap(fresh, &SEA_SWAP).expect("the swap must succeed on the template");
+        for word in SEA_SWAP.leftovers {
+            assert!(
+                !out.contains(word),
+                "the replacement blocks mention '{word}': {out}"
+            );
+        }
+        assert!(out.contains("sea_db::Db,"), "{out}");
+
+        // ...and a hand-written call to the old handle is the refusal case: the
+        // type keeps its name across the swap, so only this catches it
+        let spiked = format!(
+            "{fresh}\nfn mine(db: &Db) {{ let _ = db.run(|_| diesel::result::QueryResult::Ok(())); }}\n"
+        );
+        let err = rewrite_bootstrap(&spiked, &SEA_SWAP)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no mention of Diesel"), "{err}");
+        assert!(
+            err.contains("DATABASE_URL="),
+            "must list the manual steps: {err}"
+        );
+    }
+
+    /// The three blocks are signatures on this path too, and a refusal must not
+    /// leave half a swap or a stray adapter behind.
+    #[test]
+    fn seaorm_refuses_a_hand_edited_bootstrap() {
+        for (tag, spike) in [
+            ("sea-edited-use", "diesel_repo::DieselUserRepository,"),
+            ("sea-edited-db", "expect(\"diesel pool init failed\")"),
+            (
+                "sea-edited-builder",
+                "fn build_user_service(db: Option<&Db>)",
+            ),
+        ] {
+            let root = fixture(tag);
+            let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+            let spiked = bootstrap.replace(spike, "// mine now");
+            fs::write(root.join(BOOTSTRAP), &spiked).unwrap();
+
+            let err = add(&root, Capability::Postgres, Some(Orm::Seaorm), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("refusing to overwrite"), "{tag}: {err}");
+            assert!(
+                err.contains("sea_db.rs"),
+                "{tag}: must list the manual steps: {err}"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join(BOOTSTRAP)).unwrap(),
+                spiked,
+                "{tag}: a refusal must not write"
+            );
+            assert!(
+                !root.join(SEA_DB).exists(),
+                "{tag}: a refusal must not write"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn seaorm_refuses_to_overwrite_an_existing_adapter() {
+        let root = fixture("seaorm-existing-adapter");
+        fs::write(root.join(SEA_REPO), "// mine now\n").unwrap();
+        let err = add(&root, Capability::Postgres, Some(Orm::Seaorm), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(SEA_REPO) && err.contains("already exists"),
+            "{err}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn seaorm_dry_run_writes_nothing_but_plans_the_same_change() {
+        let root = fixture("seaorm-dry");
+        let before = snapshot(&root);
+        let planned = add(&root, Capability::Postgres, Some(Orm::Seaorm), true).unwrap();
+        assert_eq!(before, snapshot(&root), "dry run touched the tree");
+        assert_eq!(
+            planned,
+            add(&root, Capability::Postgres, Some(Orm::Seaorm), false).unwrap()
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The whole reason the SeaORM handle is called `Db`: a builder scaffolded
+    /// on either side of the switch asks for a type that exists on both, so
+    /// neither order needs a rewrite — and `scaffold.rs` needs no third state.
+    #[test]
+    fn scaffolded_builders_survive_the_switch_in_both_orders() {
+        let root = fixture("seaorm-then-feature");
+        add(&root, Capability::Postgres, Some(Orm::Seaorm), false).unwrap();
+        crate::scaffold::add_feature(
+            &root,
+            "notification",
+            crate::scaffold::Transport::Rest,
+            false,
+        )
+        .unwrap();
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("_db: Option<&Db>"), "{bootstrap}");
+        assert!(!bootstrap.contains("Diesel"), "{bootstrap}");
+
+        // and the other order, where `cargo fmt` has already wrapped the
+        // generated signature by the time `add` runs
+        let root2 = fixture("feature-then-seaorm");
+        crate::scaffold::add_feature(
+            &root2,
+            "notification",
+            crate::scaffold::Transport::Rest,
+            false,
+        )
+        .unwrap();
+        add(&root2, Capability::Postgres, Some(Orm::Seaorm), false).unwrap();
+        let after = fs::read_to_string(root2.join(BOOTSTRAP)).unwrap();
+        assert!(after.contains("_db: Option<&Db>"), "{after}");
+        assert!(!after.contains("diesel"), "{after}");
+        fs::remove_dir_all(&root).unwrap();
+        fs::remove_dir_all(&root2).unwrap();
+    }
+
+    /// The additive capabilities wire into the same `bootstrap.rs` this path
+    /// rewrites, from both sides.
+    #[test]
+    fn seaorm_coexists_with_a_cache_a_blob_store_and_an_event_sink() {
+        let root = fixture("seaorm-and-friends");
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::Postgres, Some(Orm::Seaorm), false).unwrap();
+        add(&root, Capability::S3, None, false).unwrap();
+        add(&root, Capability::Clickhouse, None, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(
+            toml.contains("default = [\"cache\", \"seaorm-postgres\", \"blob\", \"analytics\"]"),
+            "{toml}"
+        );
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("SeaUserRepository"), "{bootstrap}");
+        assert!(
+            bootstrap.contains("cache: build_cache(redis.as_ref()),"),
+            "{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("blobs: build_blob_store(s3.as_ref()),"),
+            "{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("events: build_event_sink(clickhouse.as_ref()),"),
+            "{bootstrap}"
+        );
+        assert!(!bootstrap.contains("diesel"), "{bootstrap}");
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        for service in ["  postgres:", "  redis:", "  s3:", "  clickhouse:"] {
+            assert!(compose.contains(service), "{service} missing: {compose}");
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4220,7 +5519,9 @@ mod tests {
     fn refuses_to_clobber_a_hand_edited_diesel_db() {
         let root = fixture("handedited");
         fs::write(root.join(DIESEL_DB), "// mine now\n").unwrap();
-        let err = add(&root, Capability::Postgres, true).unwrap_err().to_string();
+        let err = add(&root, Capability::Postgres, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("refusing to overwrite"), "{err}");
         assert!(err.contains("PgConnection"), "must list the manual steps: {err}");
         fs::remove_dir_all(&root).unwrap();
@@ -4241,7 +5542,7 @@ mod tests {
         )
         .unwrap();
 
-        add(&root, Capability::Postgres, false).unwrap();
+        add(&root, Capability::Postgres, None, false).unwrap();
         let out = fs::read_to_string(root.join(DIESEL_REPO)).unwrap();
         assert!(out.contains("use std::sync::Arc;"), "the stray cfg(test) item was eaten: {out}");
         assert!(out.contains("impl UserRepository for DieselUserRepository"), "the impl was eaten: {out}");
@@ -4259,7 +5560,9 @@ mod tests {
         let spiked = repo.replace("fn temp_repo(tag: &str)", "fn temp_repo(tag: &'static str)");
         fs::write(root.join(DIESEL_REPO), &spiked).unwrap();
 
-        let err = add(&root, Capability::Postgres, false).unwrap_err().to_string();
+        let err = add(&root, Capability::Postgres, None, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("refusing to overwrite"), "{err}");
         assert_eq!(fs::read_to_string(root.join(DIESEL_REPO)).unwrap(), spiked, "a refusal must not write");
         fs::remove_dir_all(&root).unwrap();
@@ -4278,7 +5581,7 @@ mod tests {
         )
         .unwrap();
 
-        add(&root, Capability::Postgres, false).unwrap();
+        add(&root, Capability::Postgres, None, false).unwrap();
         let out = fs::read_to_string(root.join(DIESEL_REPO)).unwrap();
         assert!(out.contains("pub fn count_users()"), "{out}");
         fs::remove_dir_all(&root).unwrap();
@@ -4288,7 +5591,9 @@ mod tests {
     fn refuses_a_dockerfile_without_the_apt_anchor() {
         let root = fixture("no-apt");
         fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
-        let err = add(&root, Capability::Postgres, true).unwrap_err().to_string();
+        let err = add(&root, Capability::Postgres, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(APT_ANCHOR), "{err}");
         assert!(err.contains("perl make"), "must name the packages to add: {err}");
         fs::remove_dir_all(&root).unwrap();
@@ -4316,9 +5621,12 @@ mod tests {
     fn dry_run_writes_nothing_but_plans_the_same_change() {
         let root = fixture("dry");
         let before = snapshot(&root);
-        let planned = add(&root, Capability::Postgres, true).unwrap();
+        let planned = add(&root, Capability::Postgres, None, true).unwrap();
         assert_eq!(before, snapshot(&root), "dry run touched the tree");
-        assert_eq!(planned, add(&root, Capability::Postgres, false).unwrap());
+        assert_eq!(
+            planned,
+            add(&root, Capability::Postgres, None, false).unwrap()
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4326,7 +5634,9 @@ mod tests {
     fn dry_run_still_validates_the_manifest() {
         let root = fixture("no-anchor");
         fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo-svc\"\n").unwrap();
-        let err = add(&root, Capability::Postgres, true).unwrap_err().to_string();
+        let err = add(&root, Capability::Postgres, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("default = ["), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -4366,9 +5676,36 @@ mod tests {
         // `relational` carries the Diesel deps themselves, so turning it off is
         // what keeps them out of a Mongo project's build, not just out of its
         // module tree
-        for feature in ["relational = [\"dep:diesel\", \"dep:diesel_migrations\"]", "document = [\"dep:mongodb\""] {
+        for feature in [
+            "relational = [\"dep:diesel\", \"dep:diesel_migrations\"]",
+            "document = [\"dep:mongodb\"",
+            // the SeaORM half of the same contract: `add_seaorm` only rewrites
+            // `default = [...]`, so both of these have to already be declared
+            "seaorm = [\"dep:sea-orm\"",
+            "seaorm-postgres = [\"seaorm\"",
+        ] {
             assert!(toml.contains(feature), "template's [features] lost `{feature}`");
         }
+        // `--orm seaorm` on mysql/mariadb is refused by `check_orm`, so the
+        // feature has nowhere to be turned on from — and declaring it anyway is
+        // not free: `sea-orm/sqlx-mysql` pulls `rsa` (RUSTSEC-2023-0071, no
+        // fixed version) into Cargo.lock, and cargo-audit reads the lock without
+        // caring which features are on. One line here would fail the audit job
+        // of every generated project. It comes back with 6b.
+        // the declaration, not the word — the comment above it in the template
+        // says the same thing in prose
+        assert!(
+            !toml.contains("\nseaorm-mysql = "),
+            "the template declares `seaorm-mysql` again — that puts `rsa` back in Cargo.lock and \
+             turns cargo-audit red in every generated project"
+        );
+        // and the line that makes "one ORM per project" a compile error rather
+        // than a convention — a project with both on links two ORMs
+        assert!(
+            file("hexagonal/src/lib.rs")
+                .contains("#[cfg(all(feature = \"relational\", feature = \"seaorm\"))]"),
+            "template's lib.rs lost the one-ORM-per-project compile_error!"
+        );
         assert!(
             crate::TEMPLATES
                 .get_dir("hexagonal/migrations")
@@ -4404,7 +5741,7 @@ mod tests {
     #[test]
     fn clickhouse_writes_the_event_port_and_wires_both_composition_roots() {
         let root = fixture("clickhouse");
-        add(&root, Capability::Clickhouse, false).unwrap();
+        add(&root, Capability::Clickhouse, None, false).unwrap();
 
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         // additive: the datastore it arrived with is untouched
@@ -4464,7 +5801,7 @@ mod tests {
     #[test]
     fn influxdb_writes_the_same_port_with_the_line_protocol_adapter() {
         let root = fixture("influxdb");
-        add(&root, Capability::Influxdb, false).unwrap();
+        add(&root, Capability::Influxdb, None, false).unwrap();
 
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"sqlite\", \"timeseries\"]"), "{toml}");
@@ -4500,8 +5837,11 @@ mod tests {
     fn greptimedb_is_the_influxdb_capability_with_its_own_service() {
         let influx = fixture("greptime-parity-influx");
         let greptime = fixture("greptime-parity");
-        let planned_influx = add(&influx, Capability::Influxdb, false).unwrap();
-        assert_eq!(planned_influx, add(&greptime, Capability::Greptimedb, false).unwrap());
+        let planned_influx = add(&influx, Capability::Influxdb, None, false).unwrap();
+        assert_eq!(
+            planned_influx,
+            add(&greptime, Capability::Greptimedb, None, false).unwrap()
+        );
 
         // one cargo feature, one adapter, one composition root: the only file
         // that may differ is the compose one
@@ -4530,7 +5870,7 @@ mod tests {
     /// both sides — the same answer `mysql` and `mariadb` give.
     #[test]
     fn greptimedb_and_influxdb_are_the_same_capability() {
-        let err = check_combination(&[Capability::Influxdb, Capability::Greptimedb])
+        let err = check_combination(&[Capability::Influxdb, Capability::Greptimedb], None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("the same capability"), "{err}");
@@ -4541,8 +5881,8 @@ mod tests {
             ("influx-on-greptime", Capability::Greptimedb, Capability::Influxdb),
         ] {
             let root = fixture(tag);
-            add(&root, first, false).unwrap();
-            let err = add(&root, second, true).unwrap_err().to_string();
+            add(&root, first, None, false).unwrap();
+            let err = add(&root, second, None, true).unwrap_err().to_string();
             assert!(
                 err.contains(&format!("capability '{}' already added", second.name())),
                 "{tag}: {err}"
@@ -4553,9 +5893,14 @@ mod tests {
         // and the other occupant of the slot still refuses it as a *different*
         // capability, with the undo steps
         let root = fixture("greptime-on-clickhouse");
-        add(&root, Capability::Clickhouse, false).unwrap();
-        let err = add(&root, Capability::Greptimedb, true).unwrap_err().to_string();
-        assert!(err.contains("the `analytics` event sink (kodegen add clickhouse)"), "{err}");
+        add(&root, Capability::Clickhouse, None, false).unwrap();
+        let err = add(&root, Capability::Greptimedb, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the `analytics` event sink (kodegen add clickhouse)"),
+            "{err}"
+        );
         assert!(err.contains("rerun `kodegen add greptimedb`"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -4566,17 +5911,27 @@ mod tests {
     #[test]
     fn a_second_event_sink_fails_with_instructions() {
         let root = fixture("clickhouse-then-influx");
-        add(&root, Capability::Clickhouse, false).unwrap();
-        let err = add(&root, Capability::Influxdb, true).unwrap_err().to_string();
-        assert!(err.contains("the `analytics` event sink (kodegen add clickhouse)"), "{err}");
-        assert!(err.contains("clickhouse_events.rs"), "must name the file to remove: {err}");
+        add(&root, Capability::Clickhouse, None, false).unwrap();
+        let err = add(&root, Capability::Influxdb, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("the `analytics` event sink (kodegen add clickhouse)"),
+            "{err}"
+        );
+        assert!(
+            err.contains("clickhouse_events.rs"),
+            "must name the file to remove: {err}"
+        );
         assert!(err.contains("rerun `kodegen add influxdb`"), "{err}");
         // nothing was written by the refusal
         assert!(!root.join(LINE_PROTOCOL_EVENTS).exists());
 
         let root2 = fixture("influx-then-clickhouse");
-        add(&root2, Capability::Influxdb, false).unwrap();
-        let err = add(&root2, Capability::Clickhouse, true).unwrap_err().to_string();
+        add(&root2, Capability::Influxdb, None, false).unwrap();
+        let err = add(&root2, Capability::Clickhouse, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("the `timeseries` event sink (kodegen add influxdb / greptimedb)"),
             "{err}"
@@ -4594,9 +5949,12 @@ mod tests {
             ("greptime-twice", Capability::Greptimedb),
         ] {
             let root = fixture(tag);
-            add(&root, cap, false).unwrap();
-            let err = add(&root, cap, true).unwrap_err().to_string();
-            assert!(err.contains(&format!("capability '{}' already added", cap.name())), "{err}");
+            add(&root, cap, None, false).unwrap();
+            let err = add(&root, cap, None, true).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("capability '{}' already added", cap.name())),
+                "{err}"
+            );
             fs::remove_dir_all(&root).unwrap();
         }
     }
@@ -4610,9 +5968,9 @@ mod tests {
         ] {
             let root = fixture(tag);
             let before = snapshot(&root);
-            let planned = add(&root, cap, true).unwrap();
+            let planned = add(&root, cap, None, true).unwrap();
             assert_eq!(before, snapshot(&root), "dry run touched the tree");
-            assert_eq!(planned, add(&root, cap, false).unwrap());
+            assert_eq!(planned, add(&root, cap, None, false).unwrap());
             fs::remove_dir_all(&root).unwrap();
         }
     }
@@ -4621,8 +5979,14 @@ mod tests {
     fn an_event_sink_names_the_missing_resources_marker() {
         let root = fixture("ch-no-marker");
         let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
-        fs::write(root.join(BOOTSTRAP), bootstrap.replace(RESOURCES_MARKER, "")).unwrap();
-        let err = add(&root, Capability::Clickhouse, true).unwrap_err().to_string();
+        fs::write(
+            root.join(BOOTSTRAP),
+            bootstrap.replace(RESOURCES_MARKER, ""),
+        )
+        .unwrap();
+        let err = add(&root, Capability::Clickhouse, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(RESOURCES_MARKER), "{err}");
         assert!(err.contains("build_services_from_env"), "{err}");
         // the variable to resolve by hand is the one that selects the adapter
@@ -4643,16 +6007,28 @@ mod tests {
             ("pub fn check_event() {}", "`check_event`"),
         ] {
             fs::write(root.join(PORTS), format!("{ports}\n{spike}\n")).unwrap();
-            let err = add(&root, Capability::Clickhouse, true).unwrap_err().to_string();
+            let err = add(&root, Capability::Clickhouse, None, true)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(expected), "{spike}: {err}");
             // the second half names a command to skip, so it has to be one that
             // exists — `line_protocol_events` is a file, not a capability
-            assert!(err.contains("skip `kodegen add clickhouse`"), "{spike}: {err}");
-            let err = add(&root, Capability::Greptimedb, true).unwrap_err().to_string();
-            assert!(err.contains("skip `kodegen add greptimedb`"), "{spike}: {err}");
+            assert!(
+                err.contains("skip `kodegen add clickhouse`"),
+                "{spike}: {err}"
+            );
+            let err = add(&root, Capability::Greptimedb, None, true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("skip `kodegen add greptimedb`"),
+                "{spike}: {err}"
+            );
         }
         fs::write(root.join(PORTS), ports.replace(ASYNC_TRAIT_USE, "")).unwrap();
-        let err = add(&root, Capability::Influxdb, true).unwrap_err().to_string();
+        let err = add(&root, Capability::Influxdb, None, true)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(ASYNC_TRAIT_USE), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -4661,8 +6037,13 @@ mod tests {
     fn an_event_sink_refuses_to_overwrite_an_existing_adapter() {
         let root = fixture("events-existing-adapter");
         fs::write(root.join(LOG_EVENTS), "// mine now\n").unwrap();
-        let err = add(&root, Capability::Clickhouse, true).unwrap_err().to_string();
-        assert!(err.contains(LOG_EVENTS) && err.contains("already exists"), "{err}");
+        let err = add(&root, Capability::Clickhouse, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(LOG_EVENTS) && err.contains("already exists"),
+            "{err}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4671,10 +6052,10 @@ mod tests {
     #[test]
     fn an_event_sink_coexists_with_a_datastore_a_cache_and_a_blob_store() {
         let root = fixture("all-four-slots");
-        add(&root, Capability::Mongodb, false).unwrap();
-        add(&root, Capability::Redis, false).unwrap();
-        add(&root, Capability::S3, false).unwrap();
-        add(&root, Capability::Clickhouse, false).unwrap();
+        add(&root, Capability::Mongodb, None, false).unwrap();
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::S3, None, false).unwrap();
+        add(&root, Capability::Clickhouse, None, false).unwrap();
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"document\", \"cache\", \"blob\", \"analytics\"]"), "{toml}");
         let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
@@ -4707,8 +6088,8 @@ mod tests {
             ("ch-then-mongo", Capability::Clickhouse, "analytics", "CLICKHOUSE_URL", "clickhouse"),
         ] {
             let root = fixture(tag);
-            add(&root, cap, false).unwrap();
-            add(&root, Capability::Mongodb, false).unwrap();
+            add(&root, cap, None, false).unwrap();
+            add(&root, Capability::Mongodb, None, false).unwrap();
             let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
             assert!(toml.contains(&format!("default = [\"{feature}\", \"document\"]")), "{toml}");
             let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
@@ -4731,7 +6112,7 @@ mod tests {
     #[test]
     fn timescaledb_is_postgres_plus_a_hypertable_migration() {
         let root = fixture("timescale");
-        add(&root, Capability::Timescaledb, false).unwrap();
+        add(&root, Capability::Timescaledb, None, false).unwrap();
 
         let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
         assert!(toml.contains("default = [\"postgres\"]"), "the ORM feature is postgres's: {toml}");
@@ -4773,7 +6154,7 @@ mod tests {
             ("plan-timescale", Capability::Timescaledb, true, true),
         ] {
             let root = fixture(tag);
-            let (_, edited) = add(&root, cap, true).unwrap();
+            let (_, edited) = add(&root, cap, None, true).unwrap();
             let has = |f: &str| edited.iter().any(|e| e.ends_with(f));
             assert_eq!(has("up.sql"), up, "{tag}: up.sql in {edited:?}");
             assert_eq!(has("down.sql"), down, "{tag}: down.sql in {edited:?}");
@@ -4786,16 +6167,21 @@ mod tests {
     /// has with mysql, and it has to be refused the same way.
     #[test]
     fn timescaledb_and_postgres_are_the_same_capability() {
-        let err = check_combination(&[Capability::Postgres, Capability::Timescaledb])
+        let err = check_combination(&[Capability::Postgres, Capability::Timescaledb], None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("the same capability"), "{err}");
         assert!(err.contains("`postgres` cargo feature"), "{err}");
 
         let root = fixture("timescale-on-pg");
-        add(&root, Capability::Postgres, false).unwrap();
-        let err = add(&root, Capability::Timescaledb, true).unwrap_err().to_string();
-        assert!(err.contains("capability 'timescaledb' already added"), "{err}");
+        add(&root, Capability::Postgres, None, false).unwrap();
+        let err = add(&root, Capability::Timescaledb, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("capability 'timescaledb' already added"),
+            "{err}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -4803,27 +6189,33 @@ mod tests {
     /// renders anything.
     #[test]
     fn with_more_than_one_event_sink_is_refused() {
-        let err = check_combination(&[Capability::Clickhouse, Capability::Influxdb])
+        let err = check_combination(&[Capability::Clickhouse, Capability::Influxdb], None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("at most one event sink"), "{err}");
-        assert!(err.contains("clickhouse, influxdb"), "must name both: {err}");
-        let err = check_combination(&[Capability::Clickhouse, Capability::Greptimedb])
+        assert!(
+            err.contains("clickhouse, influxdb"),
+            "must name both: {err}"
+        );
+        let err = check_combination(&[Capability::Clickhouse, Capability::Greptimedb], None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("at most one event sink"), "{err}");
         // one of each slot, plus the two additive ones, is the arrangement that
         // has to keep working
         assert!(
-            check_combination(&[
-                Capability::Mongodb,
-                Capability::Redis,
-                Capability::S3,
-                Capability::Clickhouse
-            ])
+            check_combination(
+                &[
+                    Capability::Mongodb,
+                    Capability::Redis,
+                    Capability::S3,
+                    Capability::Clickhouse
+                ],
+                None
+            )
             .is_ok()
         );
-        assert!(check_combination(&[Capability::Timescaledb, Capability::Influxdb]).is_ok());
+        assert!(check_combination(&[Capability::Timescaledb, Capability::Influxdb], None).is_ok());
     }
 
     #[test]

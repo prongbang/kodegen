@@ -119,6 +119,7 @@ kodegen add postgres      # Diesel + PostgreSQL
 kodegen add mysql         # Diesel + MySQL
 kodegen add mariadb       # same driver as mysql; MariaDB image
 kodegen add timescaledb   # same driver as postgres; + a hypertable migration
+kodegen add postgres --orm seaorm   # the same PostgreSQL, on SeaORM (see below)
 kodegen add mongodb       # the same UserRepository, on the Mongo driver
 kodegen add redis         # the Cache port + a Redis adapter (Valkey too)
 kodegen add s3            # the BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
@@ -172,6 +173,55 @@ Doing it by hand instead: set the feature in `[features] default`, swap
 in particular **cannot** use `TEXT PRIMARY KEY` — indexing a `TEXT` column needs
 a prefix length, so the users table uses `VARCHAR(64)` there. That one fails at
 migration time, not compile time.
+
+### The other ORM (`kodegen add <backend> --orm seaorm`)
+
+The relational capabilities take `--orm diesel` (the default, everything above)
+or `--orm seaorm`. Same backend, same `DATABASE_URL`, same compose service —
+different adapter, and a different set of trade-offs. PostgreSQL and TimescaleDB
+today; MySQL is refused with a message rather than generated untested.
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | `default = [...]` becomes `["seaorm-postgres"]` |
+| `src/infrastructure/sea_db.rs` | **created** — the `Db` handle, a lazily opened connection, and the `SCHEMA` applied with it |
+| `src/infrastructure/sea_repo.rs` | **created** — the entity and the `UserRepository` adapter |
+| `src/infrastructure/mod.rs` | two `#[cfg(feature = "seaorm")] pub mod` lines appended; the Diesel modules stay on disk, gated off |
+| `src/bootstrap.rs` | the same three blocks `add mongodb` swaps — the binding stays `db`, and so does its type name |
+| `Dockerfile` | **not touched** — sqlx and rustls are pure Rust, so there is no C driver to build |
+
+What you get: no `spawn_blocking`, no r2d2, no blocking pool — sqlx is async to
+the socket, so the repository awaits its queries directly. And a build that needs
+no `perl`/`make`/`cmake`.
+
+What you give up: **versioned migrations**. `sea_db.rs` carries a `SCHEMA` of
+idempotent statements (`CREATE TABLE IF NOT EXISTS`, and on TimescaleDB
+`create_hypertable(..., if_not_exists => TRUE)`) applied when the first
+connection is opened; `migrations/` is not read on this path. That is fine for a
+seed schema. **The first time you change a table that already holds production
+data, move to `sea-orm-migration = "1.1"`** (pinned: its 2.x needs sea-orm 2.0
+and rustc 1.94), put the statements in the first migration and empty `SCHEMA` —
+`CREATE TABLE IF NOT EXISTS` cannot express an `ALTER`, and a startup step that
+silently does nothing is worse than one that fails.
+
+Two more things that follow from applying schema at startup:
+
+- **The role in `DATABASE_URL` must be allowed to create tables**, and the tables
+  already existing does not excuse it — PostgreSQL checks `CREATE` on the schema
+  before it checks whether the object is there. Without it every request fails
+  with a 500 (the connection is lazy, so the process still boots), forever. Fix
+  it with `GRANT CREATE ON SCHEMA public TO <role>`, or empty `SCHEMA` and own the
+  schema out of band.
+- **A database that is down costs a request 30 seconds** (sqlx's acquire timeout)
+  before its 503, and the failure is not cached — the next request retries.
+  `opts.acquire_timeout(...)` in `sea_db.rs` shortens it.
+
+Both handles are called `Db`, deliberately: they can never be compiled together
+(`src/lib.rs` has a `compile_error!` for the additive-feature case), so sharing
+the name is what lets `kodegen feature` builders — `_db: Option<&Db>` — survive a
+switch in either direction. When a file has to say which, import it:
+`use crate::infrastructure::sea_db::Db;` or `...::diesel_db::Db`. Only the name
+is shared — there is no `Db::run` on the SeaORM side.
 
 ### TimescaleDB (`kodegen add timescaledb`)
 
@@ -481,6 +531,7 @@ Allocations per request (`alloc_bench`):
 - Every pooled connection also sets `PRAGMA busy_timeout` and `PRAGMA synchronous = NORMAL` on acquire: SQLite allows only one writer at a time, so without WAL + `busy_timeout` concurrent writers fail immediately with `SQLITE_BUSY` instead of waiting their turn. **This paragraph and the one above describe the default SQLite backend** — on PostgreSQL or MySQL (see [Capabilities](#capabilities)) `diesel_db.rs` has no pragma customizer at all, because neither has SQLite's single-writer problem; `Db`, `Db::run` and every repository stay exactly the same.
 - The composition root (`bootstrap.rs`) is the only place that builds the pool and constructs `DieselUserRepository`; repositories never see `DATABASE_URL` or the pool directly.
 - Moving to Postgres/MySQL later swaps the `diesel` backend feature and the connection type inside `diesel_db.rs` — the port, the repositories and every call site stay as they are. `kodegen add postgres` does it for you; see [Capabilities](#capabilities).
+- After `kodegen add <backend> --orm seaorm` the same two paragraphs describe `sea_db.rs` instead, with two differences that matter: there is no pool to build at startup (the connection is opened on the first query, and the schema in `SCHEMA` goes with it) and there is no `Db::run`, because sqlx is async to the socket — `SeaUserRepository` awaits its queries directly, with no `spawn_blocking` and no blocking pool. The handle is still called `Db` and is still built only by the composition root, so everything above `infrastructure/` reads the same on either ORM.
 
 ## Dependency Direction
 

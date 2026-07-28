@@ -110,10 +110,12 @@ kodegen add s3                           # a BlobStore port + an S3 adapter (Rus
 kodegen add clickhouse                   # an EventSink port + a ClickHouse adapter
 kodegen add influxdb                     # the same port, over line protocol (InfluxDB v2/v3)
 kodegen add greptimedb                   # same adapter as influxdb, GreptimeDB image + URL
+kodegen add postgres --orm seaorm        # the same PostgreSQL, on SeaORM instead of Diesel
 kodegen add postgres --path ~/svc        # run from outside the project
 kodegen add postgres --dry-run           # show the plan, write nothing
 kodegen add --list                       # what's supported + what this project has on
 kodegen new svc --with postgres,redis,s3 # generate, then add, in one command
+kodegen new svc --with postgres,redis --orm seaorm
 ```
 
 | Capability | Slot | Port | Default adapter (no server) | Env |
@@ -128,6 +130,10 @@ kodegen new svc --with postgres,redis,s3 # generate, then add, in one command
 | `clickhouse` | event sink | **`EventSink`** (new) | the tracing log | `CLICKHOUSE_URL` (+ `_DB`/`_USER`/`_PASSWORD`) |
 | `influxdb` | event sink | **`EventSink`** (same) | the tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`/`_ORG`/`_TOKEN`) |
 | `greptimedb` | event sink | **`EventSink`** (same) | the tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`) |
+
+The four relational rows take `--orm diesel` (default) or `--orm seaorm`; the ORM
+changes the adapter and the cargo feature, never the port or `DATABASE_URL` (see
+[`--orm seaorm`](#--orm-seaorm)).
 
 A **slot** holds exactly one adapter, so the capabilities in it are alternatives:
 the four relational backends and `mongodb` are all adapters of the same
@@ -223,6 +229,97 @@ one capability named twice.
 An app-side `EventSink` (`add clickhouse` / `influxdb` / `greptimedb`) is a
 different thing and can be added alongside: the hypertable is schema in *this*
 project's database, the event sink is a port to somebody else's.
+
+#### `--orm seaorm`
+
+The relational capabilities take an ORM: `--orm diesel` (the default, and what
+every example above uses) or `--orm seaorm`. It is a flag rather than four more
+capability names because the ORM is orthogonal to the backend — the same axis
+`--transport rest|grpc` sits on. One ORM per project: they are two adapters of
+one `UserRepository`, so they share the datastore slot with each other and with
+`mongodb`, and `src/lib.rs` carries a `compile_error!` in case a stray
+`--features` ever turns both on anyway.
+
+```bash
+kodegen add postgres --orm seaorm
+kodegen add timescaledb --orm seaorm     # same feature, plus an idempotent hypertable
+```
+
+Available on `postgres` and `timescaledb` today. `mysql`/`mariadb` on SeaORM is
+refused with a message saying so rather than generated blind: MySQL is the one
+backend whose upsert differs at *runtime* (below), and it ships when CI runs it
+against a real MySQL server. The template does not even declare the feature —
+`sea-orm/sqlx-mysql` puts `rsa` in `Cargo.lock` (RUSTSEC-2023-0071, no fixed
+version), and `cargo audit` reads the lock whether or not the feature is on. The
+Diesel `mysql` backend is unaffected: libmysqlclient does its own auth in C.
+
+```
+Cargo.toml                              default = ["sqlite"] -> ["seaorm-postgres"]
+src/infrastructure/sea_db.rs            the Db handle + the startup schema
+src/infrastructure/sea_repo.rs          the entity + the UserRepository adapter
+src/infrastructure/mod.rs               two cfg-gated `pub mod` lines appended
+src/bootstrap.rs                        the same three blocks `add mongodb` swaps
+docker-compose.dev.yml                  the same postgres service as the Diesel path
+```
+
+`DATABASE_URL` does not change, the compose service does not change, and
+**`Dockerfile` is not touched at all** — that is the payoff: sqlx and rustls are
+pure Rust, so the build stage needs no perl/make/cmake and the distroless/cc
+runtime image needs nothing new. Nothing is overwritten either: `diesel_db.rs`
+and `diesel_repo.rs` stay on disk, gated off, so undo is
+`default = ["sqlite"]` plus the three `bootstrap.rs` blocks.
+
+What you give up is versioned migrations:
+
+> **The schema is applied at startup, not by a migration.** `sea_db.rs` holds a
+> `SCHEMA` constant of idempotent statements (`CREATE TABLE IF NOT EXISTS`, and
+> for TimescaleDB `create_hypertable(..., if_not_exists => TRUE)`), run once when
+> the first connection is opened. `migrations/` is not read on this path, and
+> `add` says so rather than deleting it — it is exactly what a later
+> `--orm diesel` needs back.
+>
+> **Where that stops being enough:** the first schema change on a database that
+> already holds production data. `CREATE TABLE IF NOT EXISTS` cannot express an
+> `ALTER`, and a startup step that silently does nothing is worse than one that
+> fails. At that point add `sea-orm-migration = "1.1"` (pinned — its 2.x needs
+> sea-orm 2.0 and rustc 1.94, and MSRV-aware resolution will otherwise hand you a
+> lock that does not build), move the statements into the first migration, and
+> empty `SCHEMA`. Before that point — a seed schema, a fresh database — the
+> startup DDL is the same deal `add mongodb`, `add clickhouse` and `add s3`
+> already make, and it costs one constant.
+>
+> **The app role must be allowed to create tables**, and existing tables do not
+> excuse it: PostgreSQL checks `CREATE` on the schema *before* it checks whether
+> the object exists, so a role without it gets `permission denied for schema
+> public` even when `users` has been there for a year. That surfaces as a failing
+> **request**, never a failing boot (the connection is lazy) — a 500 on every
+> request, forever, since a failed init is not cached. In an environment where
+> the app role does not own the schema, either
+> `GRANT CREATE ON SCHEMA public TO <role>` or empty `SCHEMA` and manage the
+> schema out of band.
+
+Two `Db` types, one at a time. The SeaORM handle is *also* called `Db` — that is
+deliberate, and it is why `kodegen feature` needs no third state and why builders
+scaffolded before or after the switch keep compiling in both directions. They
+live in different modules and can never be compiled together, so a file that has
+to say which one it means writes
+`use crate::infrastructure::sea_db::Db;` (or `diesel_db::Db`). Only the name is
+shared: there is no `Db::run` on the SeaORM side, because nothing blocks — no
+`spawn_blocking`, no r2d2, no second pool.
+
+`save` is an upsert on both ORMs, and on SeaORM it is
+`.on_conflict(...).update_column(...).exec_without_returning(...)`. The last part
+is not a style choice: an upsert whose new values equal the old ones affects 0
+rows, and `exec` reports that as `DbErr::RecordNotInserted` — an error for a call
+the port documents as `Ok(())`. The generated `save_twice_identical_values_is_ok`
+test is that contract, and CI runs it twice against the same database.
+
+The two adapter test modules also reach for their handle differently, and copying
+one pattern into the other file is a 30-second hang, not a compile error: the
+Diesel tests share one handle from a `OnceLock`, while the SeaORM tests build a
+`Db` **per test**, because its pool belongs to the `#[tokio::test]` runtime that
+opened it and does not outlive it — the next test would sit on a dead pool until
+sqlx's acquire timeout gives up.
 
 #### `add mongodb`
 
