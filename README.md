@@ -3,13 +3,45 @@
 CLI for generating Rust starter projects, scaffolding features into them, and
 switching their infrastructure capabilities.
 
-| Command | What it does |
-|---|---|
-| `kodegen new <name>` | Generate a project from a template |
-| `kodegen feature <name>` | Scaffold one feature across every layer and wire it up |
-| `kodegen add <capability>` | Add infrastructure: a datastore (postgres/mysql/mariadb/timescaledb/mongodb/mssql), a cache (redis), object storage (s3) or an event sink (clickhouse/influxdb/greptimedb) |
-| `kodegen list` | List built-in and cached templates |
-| `kodegen update <template>` | Re-clone a cached remote template |
+## Command reference
+
+| Command | Flags | What it does |
+|---|---|---|
+| `kodegen new <name>` | `-t, --template <TEMPLATE>` (default `hexagonal`) · `-o, --output <PATH>` (default `.`) · `--with <cap,cap,...>` — capabilities to add right after generating · `--orm <diesel\|seaorm>` (optional; applies to the one relational entry in `--with`, error if none) | Generate a project from a template |
+| `kodegen feature <name>` | `-t, --transport <rest\|grpc>` (default `rest`) · `-p, --path <PATH>` (default `.`) · `--dry-run` — print the plan, write nothing | Scaffold a feature (domain/application/infrastructure/api + wiring) into a generated project |
+| `kodegen add [<capability>]` | `-p, --path <PATH>` (default `.`) · `--orm <diesel\|seaorm>` (optional, no default; error on a capability with no ORM) · `--dry-run` — print the plan, write nothing · `--list` — list supported capabilities and what the project has on (conflicts with `<capability>`, `--orm`, `--dry-run`) | Add an infrastructure capability to a generated project |
+| `kodegen update <template>` | — | Re-clone a cached template (registry name, owner/repo, or git URL) in `~/.kodegen/templates` |
+| `kodegen list` | — | List built-in and cached templates |
+
+`kodegen new`'s `--with` takes a comma-separated list of capability names
+(e.g. `--with postgres,redis,s3`) and is a loop over `kodegen add`, so the two
+never drift apart. Built-in templates ship inside the binary and local paths
+are used in place, so `kodegen update` refuses on either — see
+[Update a cached template](#update-a-cached-template).
+
+### Capabilities
+
+All 11 supported by `kodegen add <capability>` / `kodegen new --with`:
+
+| Capability | Slot | `--orm` | Default adapter (capability off / env unset) | Main env |
+|---|---|---|---|---|
+| `postgres` | datastore | `diesel` (default) or `seaorm` | in-memory repo | `DATABASE_URL` |
+| `mysql` | datastore | `diesel` (default) or `seaorm` | in-memory repo | `DATABASE_URL` |
+| `mariadb` | datastore — alias of `mysql` (same driver, same cargo feature) | `diesel` (default) or `seaorm` | in-memory repo | `DATABASE_URL` |
+| `timescaledb` | datastore — alias of `postgres` (same driver, + a hypertable migration) | `diesel` (default) or `seaorm` | in-memory repo | `DATABASE_URL` |
+| `mongodb` | datastore | not supported (no ORM to choose — the driver isn't Diesel) | in-memory repo | `MONGODB_URL` (+ `MONGODB_DB`) |
+| `mssql` | datastore | **not accepted** — `--orm` is an error (no open-source ORM for SQL Server) | in-memory repo | `DATABASE_URL` (an ADO.NET connection string, not a URL) |
+| `redis` | — (additive) | not applicable | in-memory cache | `REDIS_URL` |
+| `s3` | — (additive) | not applicable | filesystem (`./data/blobs`, `BLOB_DIR` overrides) | `S3_BUCKET` (+ endpoint/credentials) |
+| `clickhouse` | event sink | not applicable | tracing log | `CLICKHOUSE_URL` (+ `_DB`/`_USER`/`_PASSWORD`) |
+| `influxdb` | event sink | not applicable | tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`/`_ORG`/`_TOKEN`) |
+| `greptimedb` | event sink — alias of `influxdb` (same adapter, GreptimeDB image + `INFLUX_URL` path) | not applicable | tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`) |
+
+A **slot** holds exactly one adapter: `postgres`/`mysql`/`mariadb`/`timescaledb`/`mongodb`/`mssql`
+are all adapters of the datastore slot (`UserRepository`), and `clickhouse`/`influxdb`/`greptimedb`
+are all adapters of the event-sink slot (`EventSink`) — one occupant per slot, `redis` and `s3` fill
+no slot and sit alongside anything. Usage and per-capability details are in
+[Add a capability](#add-a-capability) below.
 
 ## Install
 
@@ -120,25 +152,13 @@ kodegen new svc --with postgres,redis,s3 # generate, then add, in one command
 kodegen new svc --with postgres,redis --orm seaorm
 ```
 
-| Capability | Slot | Port | Default adapter (no server) | Env |
-|---|---|---|---|---|
-| `postgres` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
-| `mysql` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
-| `mariadb` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
-| `timescaledb` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
-| `mongodb` | datastore | the existing `UserRepository` | in-memory repo | `MONGODB_URL` (+ `MONGODB_DB`) |
-| `mssql` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` (an ADO.NET string, not a URL) |
-| `redis` | — (additive) | **`Cache`** (new) | in-memory cache | `REDIS_URL` |
-| `s3` | — (additive) | **`BlobStore`** (new) | files under `./data/blobs` | `S3_BUCKET` (+ endpoint/credentials) |
-| `clickhouse` | event sink | **`EventSink`** (new) | the tracing log | `CLICKHOUSE_URL` (+ `_DB`/`_USER`/`_PASSWORD`) |
-| `influxdb` | event sink | **`EventSink`** (same) | the tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`/`_ORG`/`_TOKEN`) |
-| `greptimedb` | event sink | **`EventSink`** (same) | the tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`) |
-
-The four relational rows take `--orm diesel` (default) or `--orm seaorm`; the ORM
-changes the adapter and the cargo feature, never the port or `DATABASE_URL` (see
-[`--orm seaorm`](#--orm-seaorm)). `mssql` is relational too and takes neither —
-there is no open-source ORM for SQL Server, so `--orm` on it is an error that
-says why (see [`add mssql`](#add-mssql)).
+See the [capability table](#capabilities) above for each one's slot, `--orm`
+support and default (server-less) adapter. The four relational capabilities
+take `--orm diesel` (default) or `--orm seaorm`; the ORM changes the adapter
+and the cargo feature, never `DATABASE_URL` (see
+[`--orm seaorm`](#--orm-seaorm)). `mssql` is relational too and takes
+neither — there is no open-source ORM for SQL Server, so `--orm` on it is an
+error that says why (see [`add mssql`](#add-mssql)).
 
 A **slot** holds exactly one adapter, so the capabilities in it are alternatives:
 the four relational backends, `mongodb` and `mssql` are all adapters of the same
