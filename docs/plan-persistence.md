@@ -1,8 +1,29 @@
 # Implementation Plan — Persistence & Infrastructure Capabilities
 
-สถานะ: **plan เท่านั้น ยังไม่ implement**
+สถานะ: **ship ครบทุก phase แล้ว (1a–7)** — 101 tests, CI 12-row matrix
 ขอบเขต: ให้ผู้ใช้เลือก ORM / relational DB / document-analytics / cache / time-series / object storage
 ได้ โดย **ไม่แตก template ใหม่ต่อ combination**
+
+## Ship status (2026-07-29)
+
+| Phase | ขอบเขต | commit |
+|---|---|---|
+| 1a | รากฐาน (anchors, `[features]`, lock) | `562db7d` |
+| 1b | relational Diesel (`add postgres/mysql/mariadb/sqlite`) | `4c5265a` |
+| 2 | redis (+ Valkey) | `07e5e5d` |
+| 3 | s3 (RustFS/MinIO/AWS) | `ae7079c` |
+| 4 | mongodb | `693c17d` |
+| 5 | event sinks (clickhouse + line-protocol timeseries) | `7ca7829` |
+| 5+ | greptimedb | `49f4186` |
+| 6a | seaorm — postgres/timescaledb | `44b26bc` |
+| 6b | seaorm — mysql/mariadb | `8b871a4` |
+| 7 | mssql ผ่าน tiberius | `5020775` |
+
+Phase 6 และ 7 มี design doc แยกที่ลงรายละเอียดการตัดสินใจ + ผลวัดจริงระหว่าง implement:
+`plan-seaorm.md`, `plan-mssql.md` — อ่านต่อที่นั่นถ้าต้องการรายละเอียดของสองก้อนนี้
+
+ตาราง phasing ใน §6 ด้านล่างเป็น**บันทึกประวัติศาสตร์ตอนวางแผน** (ก่อน implement) จุดที่ผลวัดจริง
+หักล้างคำทำนายมี annotate ไว้ในตารางตรงจุดนั้น ไม่ได้ลบของเดิมทิ้ง
 
 ---
 
@@ -355,8 +376,8 @@ let Ok(url) = std::env::var("REDIS_URL") else {
 | **3** | `add s3` (RustFS/MinIO/AWS) — port `BlobStore` + fs default + aws-sdk-s3 | **M** | ระวัง compile time ของ aws-sdk; ถ้าเจ็บเกินไปค่อยพิจารณา `opendal` |
 | **4** | `add mongodb` — adapter ตัวที่สองของ `UserRepository` เดิม | **M** | ได้ test เดิมคุ้มฟรี ไม่มี port ใหม่ |
 | **5** | analytics/time-series — port `EventSink` + `clickhouse` + `line_protocol` (Influx v2/v3 + Greptime) + `timescaledb` = pg + hypertable migration | **M** | 4 ตัวเลือกของผู้ใช้ จบด้วย 2 adapter |
-| **6** | SeaORM เป็นทางเลือก ORM | **L** | **รอ signal** — เป็นการ implement ทุกอย่างใน Phase 1 ซ้ำอีกรอบ (repo/pool/migration คนละแบบ, async ไม่ต้อง spawn_blocking) จะทำเมื่อ (ก) มีคนขอ ≥2 ราย หรือ (ข) ภาษี C lib ของ Diesel+pg ทำให้ build จริงเจ็บ |
-| **7** | MSSQL ผ่าน tiberius | **L** | **รอ signal** — ไม่มี ORM ให้ใช้เลย ต้องเขียน SQL เอง + migration เอง + TLS stack คนละตัว + image ทดสอบ 1.5GB ติด EULA รัน CI ฟรีไม่ได้ ต้นทุนสูงสุด reuse ต่ำสุด |
+| **6** | SeaORM เป็นทางเลือก ORM | ~~**L**~~ **[หักล้างแล้ว — จริง M/S, ดู plan-seaorm.md §0: 6a=M, 6b=S]** | ~~**รอ signal**~~ **[หักล้างแล้ว — owner สั่งเปิด phase และ ship 6a `44b26bc` / 6b `8b871a4`]** — เป็นการ implement ทุกอย่างใน Phase 1 ซ้ำอีกรอบ (repo/pool/migration คนละแบบ, async ไม่ต้อง spawn_blocking) จะทำเมื่อ (ก) มีคนขอ ≥2 ราย หรือ (ข) ภาษี C lib ของ Diesel+pg ทำให้ build จริงเจ็บ |
+| **7** | MSSQL ผ่าน tiberius | ~~**L**~~ **[หักล้างแล้ว — จริง M ก้อนเดียว, ดู plan-mssql.md §0]** | ~~**รอ signal**~~ **[หักล้างแล้ว — owner สั่งเปิด phase 2026-07-28/29 และ ship `5020775`]** — ไม่มี ORM ให้ใช้เลย ต้องเขียน SQL เอง + migration เอง + TLS stack คนละตัว + ~~image ทดสอบ 1.5GB ติด EULA รัน CI ฟรีไม่ได้~~ **[หักล้างแล้ว — จริง 596 MiB ตอนดึง (1.58GiB คือขนาดหลังคลาย), Developer edition license อนุญาตใช้บน CI/shared devices ตรง ๆ, รันอยู่ใน CI ทุกวันนี้ — ดู plan-mssql.md §7]** ต้นทุนสูงสุด reuse ต่ำสุด |
 
 ### สิ่งที่จะ *ไม่* ทำ (ตั้งใจ)
 

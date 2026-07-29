@@ -1,6 +1,6 @@
 # Implementation Plan — Phase 7: MSSQL ผ่าน tiberius
 
-สถานะ: **plan เท่านั้น ยังไม่ implement** (เจ้าของสั่งเปิด phase และรับเงื่อนไข "ไม่มี ORM,
+สถานะ: **ship แล้ว `5020775`** (เจ้าของสั่งเปิด phase และรับเงื่อนไข "ไม่มี ORM,
 raw SQL, image ติด EULA" แล้ว)
 ขอบเขต: `kodegen add mssql` — datastore slot ตัวที่สาม ที่ไม่มี ORM อยู่ข้างหลังเลย
 โดยไม่แตะ port, ไม่แตะ `kodegen feature`, และไม่แตะ composition root ที่เป็น `fn`
@@ -481,8 +481,8 @@ postgres/mongo/seaorm → refuse พร้อมสามขั้นตอน (
 
 ## 13. CTO amendments (approve-with-changes) และผลตรวจจริงตอน implement
 
-สถานะ: **implement แล้ว** บน branch `feat/kodegen-add-capability-foundations`
-(ยังไม่ commit) ทุกตัวเลขในหัวข้อนี้ **วัดจริง 2026-07-29** ไม่ใช่การประมาณ
+สถานะ: **implement แล้ว, ship ที่ commit `5020775`** (branch `feat/kodegen-add-capability-foundations`)
+ทุกตัวเลขในหัวข้อนี้ **วัดจริง 2026-07-29** ไม่ใช่การประมาณ
 
 ### 13.1 ข้อบังคับที่ CTO เพิ่ม และสถานะ
 

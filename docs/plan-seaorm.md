@@ -1,12 +1,13 @@
 # Implementation Plan — Phase 6: SeaORM as a second ORM
 
-สถานะ: **ship ครบทั้ง 6a และ 6b แล้ว** (6a = `44b26bc`, 6b = commit ถัดไป)
+สถานะ: **ship ครบทั้ง 6a และ 6b แล้ว** (6a = `44b26bc`, 6b = `8b871a4`)
 เอกสารนี้เก็บไว้เป็นบันทึกการตัดสินใจ + §12/§13 ที่บันทึกว่าอะไรขัดกับความจริงตอนรัน
 ขอบเขต: ให้ผู้ใช้เลือก ORM ได้บน capability กลุ่ม relational โดยไม่แตะ port,
 ไม่แตะ `kodegen feature`, และไม่แตะ composition root ที่เป็น `fn`
 
-> หมายเหตุ: เขียนเป็น logical ล้วน ไม่อ้าง line number — งาน `add greptimedb`
-> กำลังแตะ `capability.rs` อยู่ และแผนนี้จะถูก implement หลังงานนั้น commit
+> หมายเหตุ (ตอนเขียนแผนนี้ — ปัจจุบันทั้งสองงาน ship แล้ว): เขียนเป็น logical ล้วน ไม่อ้าง line number
+> — งาน `add greptimedb` กำลังแตะ `capability.rs` อยู่ และแผนนี้จะถูก implement หลังงานนั้น commit
+> (ลำดับจริง: greptimedb `49f4186` ก่อน, seaorm 6a `44b26bc` ตามหลัง — ตรงตามที่ตั้งใจไว้)
 
 ---
 
