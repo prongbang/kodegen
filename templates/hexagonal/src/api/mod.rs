@@ -40,7 +40,15 @@ fn to_http_err(e: DomainError) -> (StatusCode, Json<ErrorRes>) {
             StatusCode::SERVICE_UNAVAILABLE,
             "service unavailable".into(),
         ),
-        DomainError::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into()),
+        // logged here because this is the only arm whose cause is not already in
+        // the response: the other three say what went wrong, this one deliberately
+        // does not (an adapter's error text can carry a connection string, a
+        // query, or a row). Dropping it entirely, though, is how a 500 becomes
+        // unexplainable — so the operator gets it and the caller does not.
+        DomainError::Other(e) => {
+            tracing::error!(error = %e, "internal error");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        }
     };
     (code, Json(ErrorRes { error: msg }))
 }

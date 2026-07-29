@@ -120,6 +120,30 @@ sea-orm = { version = "1", default-features = false, features = [
 # compile-time query checker, a second migration framework and runtime backend
 # dispatch — none of which this template uses.
 sqlx = { version = "0.8", default-features = false, optional = true }
+# SQL Server, and the one capability with no ORM behind it: neither Diesel nor
+# SeaORM speaks TDS in open source, so `mssql` is raw SQL over tiberius — the
+# only maintained TDS implementation Rust has.
+#
+# `default-features = false` drops `winauth` (Windows-only SSPI, meaningless on
+# a Linux runtime image) and keeps the two that matter: `tds73` is the protocol
+# version SQL Server 2008+ speaks, and `native-tls` is the TLS backend. Not
+# `rustls`: tiberius pins `tokio-rustls 0.24` -> rustls 0.21, a major behind the
+# rest of this graph, with no provider system (so `ring` comes back) and three
+# unfixable advisories in `rustls-webpki 0.101` that sit squarely in certificate
+# validation. See the README.
+tiberius = { version = "0.12.3", default-features = false, features = [
+    "tds73",
+    "native-tls",
+], optional = true }
+# tiberius has no pool of its own — `Client` is one connection and every query
+# takes `&mut self` — so the pool is a crate. bb8 is the async one this driver
+# has an adapter for; `with-tokio` is that adapter, and the default features
+# (chrono, sql-browser, winauth) are column types and a discovery protocol this
+# template does not use.
+bb8 = { version = "0.9", optional = true }
+bb8-tiberius = { version = "0.16", default-features = false, features = [
+    "with-tokio",
+], optional = true }
 # The official ClickHouse client, held at 0.13 **by MSRV**: 0.14 and 0.15 declare
 # `rust-version = 1.89`, and this package declares 1.88. With `resolver = "3"`
 # cargo would still pick 0.15 (it warns and falls back when no compatible version
@@ -201,6 +225,13 @@ blob = ["dep:aws-sdk-s3", "tokio/fs"]
 # same line protocol over the same kind of endpoint.
 # `tokio/sync` is for the `OnceCell` the ClickHouse adapter creates its table
 # through — the composition root is a plain `fn`, so the DDL cannot run there.
+# The datastore slot's third occupant, and the only one with no ORM: `dep:openssl-sys`
+# is not optional here — `native-tls` links the system libssl by default and the
+# distroless/cc runtime image has none, so `vendored` (declared above for the
+# Diesel backends) is what static-links it, at the cost of perl/make in the build
+# stage. `tokio/sync` is for the `OnceCell` the handle builds its pool through,
+# exactly like `document` and `seaorm`.
+mssql = ["dep:tiberius", "dep:bb8", "dep:bb8-tiberius", "dep:openssl-sys", "tokio/sync"]
 analytics = ["dep:clickhouse", "tokio/sync"]
 timeseries = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 

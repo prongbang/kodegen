@@ -67,6 +67,15 @@ jobs:
   # mariadb has no row for the usual reason: same feature, same adapter, same
   # DDL — only the compose image differs, and a unit test pins that.
   #
+  # `mssql` is the third row that runs its datastore live, and the only one that
+  # has to, because none of its SQL is checked by anything else: no ORM builds a
+  # query here, so `MERGE ... WITH (HOLDLOCK)` and `IF OBJECT_ID(...) IS NULL`
+  # are strings until a server parses them. `CREATE TABLE IF NOT EXISTS` — which
+  # every other backend here uses — is a *runtime* syntax error on SQL Server, so
+  # a compile-only row would prove nothing at all. It runs the suite twice like
+  # the SeaORM rows, and it is also the only row that builds the Docker image,
+  # for the reason in that step.
+  #
   # `greptimedb` writes byte-for-byte what `influxdb` does apart from the compose
   # service (a unit test pins that), so compiling it again would prove nothing.
   # It is here for the *server*: the step below boots the image it just generated
@@ -106,6 +115,11 @@ jobs:
           - capability: mysql
             orm: seaorm
             db_url: mysql://app:app@127.0.0.1:3306/app
+          # No `orm:` — `--orm` on this one is an error, which is the point of
+          # the capability. `db_url` is an ADO.NET connection string rather than
+          # a URL, and it is what `kodegen add mssql` prints.
+          - capability: mssql
+            db_url: server=tcp:127.0.0.1,1433;user id=sa;password=kodeGen!2026;database=app;encrypt=true;TrustServerCertificate=true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -217,6 +231,29 @@ jobs:
           docker compose -f docker-compose.dev.yml up -d --wait
           echo "DATABASE_URL=$DB_URL" >> "$GITHUB_ENV"
 
+      # The same idea one backend over, in two commands instead of one — and the
+      # two commands are not a style choice. `up -d --wait` over the whole file
+      # exits **1** here even when everything worked: `mssql-init` is a one-shot
+      # service that runs `CREATE DATABASE app` and exits 0, and `--wait` reads a
+      # container that is no longer running as a failed dependency. Measured, not
+      # assumed. Naming the long-running service and then running the init one is
+      # what makes both steps report what actually happened.
+      #
+      # The init service exists because this image, unlike postgres and mysql,
+      # creates no database of its own: it boots with master/tempdb/model/msdb,
+      # and `database=app` in the connection string resolves to nothing until
+      # somebody runs that statement. The same is true of a real deployment,
+      # which is why it is a compose service rather than something the app does.
+      - name: Boot SQL Server and create the database
+        if: matrix.capability == 'mssql'
+        working-directory: ${{ runner.temp }}/demo
+        env:
+          DB_URL: ${{ matrix.db_url }}
+        run: |
+          docker compose -f docker-compose.dev.yml up -d --wait mssql
+          docker compose -f docker-compose.dev.yml run --rm mssql-init
+          echo "DATABASE_URL=$DB_URL" >> "$GITHUB_ENV"
+
       # no `cargo check` step: `clippy --all-targets` above already type-checks
       # everything `check` would, and compiling the AWS SDK twice is minutes.
       #
@@ -239,9 +276,52 @@ jobs:
       # exist, which is where `exec_without_returning` earns its place: a `save`
       # of unchanged values affects 0 rows, and `exec` would call that an error.
       - name: Test again over the same database (the DDL must be idempotent)
-        if: matrix.orm == 'seaorm'
+        if: matrix.orm == 'seaorm' || matrix.capability == 'mssql'
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo
+
+      # The one thing a green test run here cannot tell you, and the reason this
+      # step is permanent rather than a one-off check before merge.
+      #
+      # `mssql` links OpenSSL statically (`openssl-sys` with `vendored`, because
+      # native-tls would otherwise want a system libssl the distroless/cc runtime
+      # image does not have). A vendored OpenSSL compiles in an `OPENSSLDIR`
+      # pointing at its own build directory, which does not exist in the runtime
+      # image — so without `ENV SSL_CERT_FILE` it cannot verify **any**
+      # certificate, and the first thing to notice would be a production
+      # deployment failing to reach Azure SQL. Everything above stays green
+      # regardless, because the compose file connects with
+      # `TrustServerCertificate=true` and never validates anything. Same class of
+      # bug as a missing rustls provider: all tests pass, the product does not
+      # work.
+      #
+      # `docker run --entrypoint` cannot do this check: distroless has no shell
+      # and no coreutils, so there is nothing to exec. `docker create` +
+      # `docker cp` reads the file out of the image without running it, which is
+      # the assertion the image can actually answer.
+      #
+      # And it reads it out of the **base** image named by the runtime `FROM`
+      # rather than out of a built one. Building the project's image here would
+      # cost 8-15 minutes to prove two things, and only one of them needs a build:
+      # that `ENV SSL_CERT_FILE` is in the Dockerfile (a property of the text, and
+      # `docker build` cannot lose a line it was given) and that the base image
+      # actually contains that file (a property of the base image, which the build
+      # does not change). Pulling the base directly answers the second in about
+      # ten seconds. The scratch file goes to RUNNER_TEMP, not here, so it cannot
+      # end up in a build context.
+      - name: The runtime image must carry a CA store for the static OpenSSL
+        if: matrix.capability == 'mssql'
+        working-directory: ${{ runner.temp }}/demo
+        run: |
+          grep -q '^ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt$' Dockerfile
+          base=$(awk '/^FROM /{ last = $2 } END { print last }' Dockerfile)
+          echo "runtime base image: $base"
+          docker pull "$base"
+          cid=$(docker create "$base" /nonexistent)
+          trap 'docker rm -f "$cid" >/dev/null' EXIT
+          docker cp "$cid":/etc/ssl/certs/ca-certificates.crt "$RUNNER_TEMP/image-ca.crt"
+          test -s "$RUNNER_TEMP/image-ca.crt"
+          test "$(grep -c 'BEGIN CERTIFICATE' "$RUNNER_TEMP/image-ca.crt")" -gt 100
 
   # One job with one occupant of every slot plus both additive capabilities. Two
   # things only exist here: cargo feature unification across the whole

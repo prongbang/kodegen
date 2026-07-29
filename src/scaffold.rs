@@ -561,7 +561,13 @@ fn to_status(e: DomainError) -> Status {
         DomainError::NotFound => Status::not_found("not found"),
         DomainError::Validation(m) => Status::invalid_argument(m),
         DomainError::Unavailable => Status::unavailable("service unavailable"),
-        DomainError::Other(_) => Status::internal("internal error"),
+        // logged for the same reason `api::to_http_err` logs it: this is the one
+        // arm whose cause is deliberately kept out of the response, and dropping
+        // it as well is how a 500 becomes unexplainable.
+        DomainError::Other(e) => {
+            tracing::error!(error = %e, "internal error");
+            Status::internal("internal error")
+        }
     }
 }
 "##;

@@ -38,7 +38,7 @@ GRPC_PORT=50052 cargo run       # + inbound gRPC features on 0.0.0.0:50052
 cargo test
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `document`, `cache`, `blob`, `analytics`, `timeseries`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `document`, `mssql`, `cache`, `blob`, `analytics`, `timeseries`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
 
 ### Examples
 
@@ -82,7 +82,7 @@ curl localhost:8080/hello/world
 | `GREETER_ADDR` | `http://localhost:50051` | gRPC address of the upstream Greeter service |
 | `GRPC_PORT` | unset | Optional. When set, inbound gRPC features (`bootstrap::grpc_routes`) are served on this port alongside HTTP. |
 | `RUST_LOG` | `info` | Tracing log filter (`EnvFilter`) |
-| `DATABASE_URL` | unset (in-memory repo) | Optional. Connection string for the Diesel-backed `UserRepository`; the format depends on which backend is enabled (see [Capabilities](#capabilities)). Unset falls back to the in-memory adapter. |
+| `DATABASE_URL` | unset (in-memory repo) | Optional. Connection string for the Diesel-backed `UserRepository`; the format depends on which backend is enabled (see [Capabilities](#capabilities)) — after `kodegen add mssql` it is an ADO.NET connection string rather than a URL. Unset falls back to the in-memory adapter. |
 | `MONGODB_URL` / `MONGODB_DB` | unset (in-memory repo) | Optional, and only meaningful after `kodegen add mongodb`, which replaces `DATABASE_URL` with these: e.g. `mongodb://127.0.0.1:27017` and the database name (`app` if unset). Unset falls back to the in-memory adapter. |
 | `REDIS_URL` | unset (in-memory cache) | Optional, and only meaningful after `kodegen add redis`. Redis/Valkey connection string for the `Cache` port, e.g. `redis://127.0.0.1:6379`. Unset falls back to the in-memory adapter. |
 | `S3_BUCKET` | unset (files on disk) | Optional, and only meaningful after `kodegen add s3`. The bucket the `BlobStore` port writes to, and the switch that selects the S3 adapter. Unset falls back to the filesystem adapter. |
@@ -103,6 +103,7 @@ curl localhost:8080/hello/world
 | SQLite (default) | `app.db` or `/data/app.db` — a file path, not a URL |
 | PostgreSQL | `postgres://app:app@127.0.0.1:5432/app` |
 | MySQL / MariaDB | `mysql://app:app@127.0.0.1:3306/app` |
+| SQL Server (`mssql`) | not a URL — an ADO.NET connection string: `server=tcp:127.0.0.1,1433;user id=sa;password=…;database=app;encrypt=true;TrustServerCertificate=true` |
 
 Use `127.0.0.1`, not `localhost`, for MySQL/MariaDB: libmysqlclient reads
 `localhost` as "connect over the unix socket" and ignores the port, which fails
@@ -122,6 +123,7 @@ kodegen add timescaledb   # same driver as postgres; + a hypertable migration
 kodegen add postgres --orm seaorm   # the same PostgreSQL, on SeaORM (see below)
 kodegen add mysql --orm seaorm      # the same MySQL/MariaDB, on SeaORM — no C driver
 kodegen add mongodb       # the same UserRepository, on the Mongo driver
+kodegen add mssql         # SQL Server / Azure SQL, raw SQL over tiberius (no ORM)
 kodegen add redis         # the Cache port + a Redis adapter (Valkey too)
 kodegen add s3            # the BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
 kodegen add clickhouse    # the EventSink port + a ClickHouse adapter
@@ -133,7 +135,8 @@ kodegen add --list        # what's supported + what this project has on
 Two of these are **slots**, and a slot holds one adapter:
 
 - the **datastore** — `postgres`, `mysql`, `mariadb`, `timescaledb`, `mongodb`
-  are all adapters of the same `UserRepository`, so they replace each other;
+  and `mssql` are all adapters of the same `UserRepository`, so they replace each
+  other;
 - the **event sink** — `clickhouse`, `influxdb` and `greptimedb` are all
   adapters of the same `EventSink`, so they replace each other (`influxdb` and
   `greptimedb` are two names for one of them: same feature, same adapter file).
@@ -293,6 +296,81 @@ in `bootstrap.rs`. Nothing has to be deleted: `mongo_repo.rs` is gated on
 one is off is simply not compiled. `relational` also carries the Diesel
 dependencies, so with `document` selected the ORM is not in the build graph at
 all — `cargo tree -e normal | grep diesel` is empty.
+
+### SQL Server (`kodegen add mssql`)
+
+The datastore slot again, on a driver with **no ORM behind it**: neither Diesel
+nor SeaORM supports SQL Server in open source, so this adapter is SQL text with
+bound parameters. `UserRepository` is unchanged, so nothing above
+`infrastructure/` learns about it.
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | `default = [...]` loses the datastore feature it had and gains `mssql` |
+| `src/infrastructure/mssql_db.rs` | the `Db` handle, the bb8 pool, the startup schema |
+| `src/infrastructure/mssql_repo.rs` | the `UserRepository` adapter (`MERGE` + `SELECT`) |
+| `src/infrastructure/mod.rs` | two `#[cfg(feature = "mssql")] pub mod` lines appended |
+| `src/bootstrap.rs` | the three blocks that named the Diesel handle; `DATABASE_URL` stays |
+| `Dockerfile` | `perl make` for vendored OpenSSL, and `ENV SSL_CERT_FILE` in the runtime stage |
+| `docker-compose.dev.yml` | a SQL Server 2022 service **and** a one-shot init service |
+
+```bash
+docker compose -f docker-compose.dev.yml up -d --wait mssql
+docker compose -f docker-compose.dev.yml run --rm mssql-init
+DATABASE_URL='server=tcp:127.0.0.1,1433;user id=sa;password=kodeGen!2026;database=app;encrypt=true;TrustServerCertificate=true' cargo run
+```
+
+Two commands, not one: `up -d --wait` over the whole file exits **1** even when
+everything worked, because `mssql-init` finishes and `--wait` treats a container
+that is no longer running as a failed dependency.
+
+`DATABASE_URL` keeps its name — same slot, same switch — but its value is an
+**ADO.NET connection string**, not a URL. That is the only shape
+`tiberius::Config::from_ado_string` parses, and the shape SSMS and the Azure
+portal print.
+
+What the backend forces, none of which is taste:
+
+- **The database is not created by the app.** This image has no `POSTGRES_DB`
+  equivalent, so `mssql-init` runs `CREATE DATABASE app` once, and a real
+  deployment does the same in its deployment step — an application role is almost
+  never granted `CREATE DATABASE`. Without it the first request answers 500 with
+  SQL Server's own message in the log ("Cannot open database 'app' requested by
+  the login"), immediately rather than after a pool timeout.
+- **The schema is applied at startup, not by a migration.** `SCHEMA` in
+  `mssql_db.rs` is idempotent — and SQL Server has **no** `CREATE TABLE IF NOT
+  EXISTS`, so it is spelled `IF OBJECT_ID(N'dbo.users', N'U') IS NULL CREATE TABLE
+  …`. `migrations/` is not read on this path. Columns are `NVARCHAR`, never
+  `VARCHAR`: tiberius sends every Rust string as `NVARCHAR`, and the mismatch
+  silently costs you the index.
+- **`save` is a single `MERGE … WITH (HOLDLOCK);`** — atomic in autocommit, so
+  there is no transaction to manage. Both `HOLDLOCK` and the trailing semicolon
+  are required; the comment above the constant says what to replace it with if
+  `users` ever gains a trigger, a foreign key, a filtered index or an `OUTPUT`
+  clause.
+- **`ENV SSL_CERT_FILE` is load-bearing.** OpenSSL is linked statically here (the
+  runtime image has no libssl), and a vendored build compiles in a certificate
+  directory that does not exist at runtime — so without that variable the binary
+  cannot verify any certificate, while dev and CI stay green because they connect
+  with `TrustServerCertificate=true`. Drop `TrustServerCertificate` in production
+  and use a real CA.
+- **Host caveats.** There is no arm64 image, so the compose service pins
+  `platform: linux/amd64` and is slow on Apple Silicon. And an app built **on
+  macOS** cannot reach that container with `TrustServerCertificate=true` at all:
+  `native-tls` is Apple's Secure Transport there, tiberius's trust-everything path
+  turns SNI off, and Secure Transport refuses the handshake. Use
+  `encrypt=DANGER_PLAINTEXT` against your own local container, or run the service
+  in a container. On Linux — the runtime image, and CI — it works as written.
+- **The driver is the thinnest dependency in this project.** tiberius 0.12.3 was
+  released in July 2024 with no release since, and it is the only usable TDS
+  implementation in Rust. `cargo audit` runs over `Cargo.lock` in this project's
+  CI; if an advisory ever lands on tiberius or on something it pins that a lock
+  bump cannot move off, the honest answer is to move off SQL Server, not to add an
+  entry to `.cargo/audit.toml`.
+
+Going back is `default = ["sqlite"]` plus the three Diesel blocks in
+`bootstrap.rs`. Nothing has to be deleted: both adapters stay on disk behind
+their own `cfg`.
 
 ### Cache (`kodegen add redis`)
 
@@ -461,6 +539,7 @@ is around and skip quietly otherwise:
 ```bash
 cargo test                                                   # in-memory, no server needed
 DATABASE_URL=postgres://app:app@127.0.0.1:5432/app cargo test # + the real adapter
+DATABASE_URL='server=tcp:127.0.0.1,1433;user id=sa;password=kodeGen!2026;database=app;encrypt=true;TrustServerCertificate=true' cargo test # + SQL Server
 REDIS_URL=redis://127.0.0.1:6379 cargo test                  # + the real cache
 S3_BUCKET=app S3_ENDPOINT=http://127.0.0.1:9000 \
   AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin cargo test  # + real object storage

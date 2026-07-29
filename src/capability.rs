@@ -50,6 +50,7 @@ pub enum Capability {
     Mariadb,
     Timescaledb,
     Mongodb,
+    Mssql,
     Redis,
     S3,
     Clickhouse,
@@ -87,9 +88,20 @@ pub enum Orm {
 /// keeps both enums total — `Relational` never has to invent an answer, and a
 /// new kind is a compile error at every match below rather than a capability
 /// quietly taking the Diesel path.
+///
+/// SQL Server is its own kind for the *same* reason, and it is the sharper case:
+/// it really is a relational database, and `Relational` still has no answer for
+/// it. There is no Diesel backend (diesel#2201, open since 2019), no open-source
+/// SeaORM backend (SQL Server lives in the commercial SeaORM X), so no
+/// `feature(orm)`, no `DieselConnection`, no `migrations/`, and no `ON CONFLICT`
+/// of any spelling — `Mssql` in that enum would make every method on it start
+/// inventing. Named for the vendor rather than the wire protocol (`Tds`) because
+/// there is exactly one: Azure SQL Database and Azure SQL Managed Instance are
+/// the same server at the other end of the same driver, the way Valkey is redis.
 enum Kind {
     Relational(Relational),
     Document,
+    Mssql,
     Cache,
     Blob,
     Events(EventBackend),
@@ -104,7 +116,7 @@ impl Kind {
     /// slot and sit alongside whatever is on.
     fn slot(&self) -> Option<Slot> {
         match self {
-            Kind::Relational(_) | Kind::Document => Some(Slot::Datastore),
+            Kind::Relational(_) | Kind::Document | Kind::Mssql => Some(Slot::Datastore),
             Kind::Events(_) => Some(Slot::Events),
             Kind::Cache | Kind::Blob => None,
         }
@@ -141,6 +153,7 @@ impl Slot {
                 "postgres",
                 "mysql",
                 "document",
+                "mssql",
                 "seaorm-postgres",
                 "seaorm-mysql",
             ],
@@ -224,6 +237,23 @@ const SEA_REPO: &str = "src/infrastructure/sea_repo.rs";
 /// capability is one line in Cargo.toml plus `bootstrap.rs` — never a deletion.
 const SEA_MOD: &str = "#[cfg(feature = \"seaorm\")]\npub mod sea_db;\n#[cfg(feature = \"seaorm\")]\npub mod sea_repo;\n";
 
+const MSSQL_DB: &str = "src/infrastructure/mssql_db.rs";
+const MSSQL_REPO: &str = "src/infrastructure/mssql_repo.rs";
+/// The MSSQL half of `SEA_MOD`, gated for the same reason: with `mssql` off
+/// these two files stay on disk and stop compiling, so undoing the capability is
+/// one line in Cargo.toml plus `bootstrap.rs` — never a deletion.
+const MSSQL_MOD: &str = "#[cfg(feature = \"mssql\")]\npub mod mssql_db;\n#[cfg(feature = \"mssql\")]\npub mod mssql_repo;\n";
+/// `DATABASE_URL` is not a URL here: `tiberius::Config` parses an **ADO.NET**
+/// connection string and nothing else (`from_jdbc_string` exists too, but one
+/// shape is enough and this is the one Azure portal, SSMS and every Microsoft
+/// document print). The variable keeps its name because it is the same switch for
+/// the same slot — a `postgres://` left over from another backend gets a parse
+/// error on the first request, which is loud rather than silent.
+///
+/// `TrustServerCertificate=true` is **dev only**: the image serves a self-signed
+/// certificate. Against a real server (Azure SQL, or anything with a CA-issued
+/// cert) take it out — see the `SSL_CERT_FILE` note in the Dockerfile.
+const MSSQL_URL: &str = "server=tcp:127.0.0.1,1433;user id=sa;password=kodeGen!2026;database=app;encrypt=true;TrustServerCertificate=true";
 const PORTS: &str = "src/domain/ports.rs";
 const IN_MEMORY_CACHE: &str = "src/infrastructure/in_memory_cache.rs";
 const REDIS_CACHE: &str = "src/infrastructure/redis_cache.rs";
@@ -310,6 +340,7 @@ impl Capability {
             Capability::Mariadb => "mariadb",
             Capability::Timescaledb => "timescaledb",
             Capability::Mongodb => "mongodb",
+            Capability::Mssql => "mssql",
             Capability::Redis => "redis",
             Capability::S3 => "s3",
             Capability::Clickhouse => "clickhouse",
@@ -332,6 +363,7 @@ impl Capability {
             // image and one migration
             Capability::Timescaledb => Kind::Relational(Relational::Timescaledb),
             Capability::Mongodb => Kind::Document,
+            Capability::Mssql => Kind::Mssql,
             Capability::Redis => Kind::Cache,
             Capability::S3 => Kind::Blob,
             Capability::Clickhouse => Kind::Events(EventBackend::Clickhouse),
@@ -364,6 +396,10 @@ impl Capability {
             // "mongodb": it is the datastore slot's document option, the way
             // `sqlite`/`postgres` are its relational ones
             Kind::Document => "document",
+            // named for the vendor, unlike its two slot-mates, because there is
+            // one: `mssql` is SQL Server, Azure SQL Database and Azure SQL MI,
+            // which are one server behind one driver
+            Kind::Mssql => "mssql",
             // Redis and Valkey speak the same protocol, so one feature covers
             // both: the capability is the cache, not the vendor
             Kind::Cache => "cache",
@@ -371,6 +407,23 @@ impl Capability {
             // capability is object storage, not the vendor
             Kind::Blob => "blob",
             Kind::Events(backend) => backend.feature(),
+        }
+    }
+
+    /// How to bring this capability's dev services up, as lines to print after
+    /// `add`. One line for everything except SQL Server, whose compose file has a
+    /// second, one-shot service that creates the database — and `--wait` over the
+    /// whole file exits **1** when that service finishes, because a container
+    /// that is no longer running reads to it as a failed dependency. Naming the
+    /// long-running service and then running the init one is the form that
+    /// reports what actually happened, and it is what the README and CI use.
+    pub fn compose_up(self) -> &'static [&'static str] {
+        match self.kind() {
+            Kind::Mssql => &[
+                "docker compose -f docker-compose.dev.yml up -d --wait mssql",
+                "docker compose -f docker-compose.dev.yml run --rm mssql-init",
+            ],
+            _ => &["docker compose -f docker-compose.dev.yml up -d"],
         }
     }
 
@@ -384,6 +437,10 @@ impl Capability {
             // `MONGODB_DB` only to say what the default is: the builder falls
             // back to `app`, so the URL alone is enough to switch adapters
             Kind::Document => &[("MONGODB_URL", MONGO_URL), ("MONGODB_DB", "app")],
+            // the same variable the relational capabilities use, because it is
+            // the same slot's switch — the *value* is an ADO.NET string, not a
+            // URL (see `MSSQL_URL`)
+            Kind::Mssql => &[("DATABASE_URL", MSSQL_URL)],
             Kind::Cache => &[("REDIS_URL", REDIS_URL)],
             Kind::Blob => S3_ENV,
             Kind::Events(backend) => backend.env(),
@@ -670,6 +727,10 @@ pub fn list(project: &Path) -> Result<()> {
     );
     println!("  timescaledb  relational — TimescaleDB (a PostgreSQL extension: same driver, plus a hypertable) (--orm diesel [default] | seaorm)");
     println!("  mongodb      document — MongoDB behind the same `UserRepository`, in place of Diesel");
+    println!(
+        "  mssql        relational — SQL Server / Azure SQL, raw SQL over tiberius (no ORM: \
+         --orm is an error here)"
+    );
     println!("  redis        cache — the `Cache` port + a Redis adapter (Valkey speaks the same protocol)");
     println!("  s3           object storage — the `BlobStore` port + an S3 adapter (RustFS, MinIO, AWS)");
     println!("  clickhouse   event sink — the `EventSink` port + a ClickHouse adapter");
@@ -677,14 +738,36 @@ pub fn list(project: &Path) -> Result<()> {
     println!("  greptimedb   event sink — the same line-protocol adapter, GreptimeDB image + docs");
     println!();
     println!(
-        "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb) and one event sink \
-         (clickhouse, influxdb, greptimedb) can be on at a time; redis and s3 sit alongside them."
+        "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb, mssql) and one event \
+         sink (clickhouse, influxdb, greptimedb) can be on at a time; redis and s3 sit alongside \
+         them."
     );
     println!(
         "Relational capabilities take --orm: `diesel` links a C driver and gives you versioned \
          migrations under migrations/; `seaorm` is pure Rust (no perl/cmake in the build image) \
          and applies its schema at startup instead, so there are no versioned migrations on that \
-         path. One ORM per project."
+         path. One ORM per project. `mssql` takes neither — see below."
+    );
+    println!();
+    // said here, before the choice, rather than in a file read afterwards: this
+    // is the one capability whose driver is not actively developed, and a user
+    // is entitled to know that while picking rather than while debugging
+    println!("`mssql` is the thinnest capability in this list, and deliberately so:");
+    println!(
+        "  - tiberius 0.12.3 was released 2024-07 and has had no release since. It is also the \
+         only usable TDS implementation in Rust — there is no second option to fall back to, and \
+         no ORM on either side of it (diesel#2201 open since 2019; SeaORM's SQL Server backend is \
+         in the commercial SeaORM X). So `add mssql` writes raw SQL, and the build image gets \
+         perl/make back for vendored OpenSSL."
+    );
+    println!(
+        "  - It is watched, not assumed: `cargo audit` runs over the template's lock in CI on \
+         every change, and the generated project ships the same job."
+    );
+    println!(
+        "  - The withdrawal trigger is stated up front: a RUSTSEC advisory on tiberius, or on a \
+         dependency it pins that a lock bump cannot move off, deprecates this capability in the \
+         next release. It does not get an `ignore` entry in .cargo/audit.toml."
     );
     match fs::read_to_string(project.join("Cargo.toml")).ok().as_deref().and_then(default_line) {
         // `default = [...]` is the only state there is — the features it lists
@@ -703,16 +786,32 @@ pub fn list(project: &Path) -> Result<()> {
 /// shipped on SeaORM, so there is nothing left to refuse per backend. A third
 /// ORM would change that: it would arrive supporting some subset, and this is
 /// where that subset gets written down.
+///
+/// Three arms rather than two, because `mssql` is the case the general sentence
+/// gets wrong: it *is* a relational capability, so "--orm applies only to
+/// relational capabilities" would read as a contradiction to somebody who just
+/// typed it. What is missing there is an ORM to choose, not relationality, and
+/// the message has to say which.
 fn check_orm(cap: Capability, orm: Option<Orm>) -> Result<()> {
-    if orm.is_some() && !cap.takes_orm() {
-        return Err(format!(
+    if orm.is_none() {
+        return Ok(());
+    }
+    match cap.kind() {
+        Kind::Relational(_) => Ok(()),
+        Kind::Mssql => Err(
+            "--orm does not apply to 'mssql': neither Diesel nor SeaORM supports SQL Server in \
+             open source (diesel#2201 has been open since 2019, and SeaORM's SQL Server backend is \
+             in the commercial SeaORM X), so `kodegen add mssql` writes raw SQL over tiberius. \
+             That is the trade — see `kodegen add --list`."
+                .into(),
+        ),
+        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) => Err(format!(
             "--orm applies only to relational capabilities (postgres, mysql, mariadb, timescaledb) \
              — '{}' has no ORM",
             cap.name()
         )
-        .into());
+        .into()),
     }
-    Ok(())
 }
 
 /// Rejects a `--with` list that cannot be applied, *before* `new` renders
@@ -722,6 +821,14 @@ pub fn check_combination(with: &[Capability], orm: Option<Orm>) -> Result<()> {
     // (the slot rule below guarantees there is at most one), so a list with none
     // is a flag that would do nothing at all
     if orm.is_some() && !with.iter().any(|c| c.takes_orm()) {
+        // ...but if the reason there is no ORM to pick is that the list holds
+        // `mssql`, that capability has a better answer than this one: "nothing
+        // here has an ORM" is true and useless next to a SQL database the user
+        // just named. `check_orm` is where that sentence lives, so ask it rather
+        // than copying it.
+        if let Some(cap) = with.iter().find(|c| matches!(c.kind(), Kind::Mssql)) {
+            check_orm(*cap, orm)?;
+        }
         return Err(
             "--orm needs a relational capability in --with (postgres, mysql, mariadb, \
                     timescaledb) — nothing in this list has an ORM"
@@ -804,6 +911,11 @@ pub fn add(
         (Kind::Relational(rel), Orm::Seaorm) => add_seaorm(project, rel, dry_run),
         (Kind::Relational(rel), Orm::Diesel) => add_relational(project, rel, dry_run),
         (Kind::Document, _) => add_mongodb(project, dry_run),
+        // `_` on the ORM and not a missed case: `check_orm` above turned every
+        // `Some(_)` into an error before a file was read, so the only value that
+        // reaches here is the `Orm::Diesel` `add` defaults to when the flag was
+        // absent — and this path never asks
+        (Kind::Mssql, _) => add_mssql(project, dry_run),
         (Kind::Cache, _) => add_redis(project, dry_run),
         (Kind::Blob, _) => add_s3(project, dry_run),
         (Kind::Events(backend), _) => add_event_sink(project, backend, dry_run),
@@ -883,6 +995,13 @@ fn datastore_conflict(other: &str, cap: Capability, orm: Orm) -> String {
             " — scaffolded builders need no change, since both ORMs call the handle `Db`",
             "seaorm",
         ),
+        // and the third occupant that calls its handle `Db` for the same reason
+        "mssql" => blocks(
+            "src/infrastructure/mssql_db.rs + mssql_repo.rs",
+            " — scaffolded builders need no change, since the SQL Server handle is called `Db` as \
+             well",
+            "mssql",
+        ),
         _ => "src/infrastructure/diesel_db.rs + diesel_repo.rs: restore the versions from a fresh \
               `kodegen new`"
             .to_string(),
@@ -900,7 +1019,9 @@ fn datastore_conflict(other: &str, cap: Capability, orm: Orm) -> String {
     // never reaches here — it is the slot's shipped occupant).
     let occupant = match other.strip_prefix("seaorm-") {
         Some(backend) => format!("{backend} (seaorm)"),
-        None if other == "document" => other.to_string(),
+        // neither of these has an ORM, so neither takes the "(diesel)" suffix
+        // that tells two spellings of one backend apart
+        None if other == "document" || other == "mssql" => other.to_string(),
         None => format!("{other} (diesel)"),
     };
     let target = match cap.takes_orm() {
@@ -1128,6 +1249,127 @@ fn add_mongodb(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String
     Ok((paths(&creates), paths(&edits)))
 }
 
+/// `kodegen add mssql` — the datastore slot a third time, with a driver that has
+/// no ORM at all.
+///
+/// Structurally this is `add_seaorm`: it writes its own two files next to the
+/// ones already on disk, swaps the three `bootstrap.rs` blocks rather than
+/// rewriting a file, calls its handle `Db` so scaffolded builders keep compiling,
+/// and applies its schema at startup instead of through `migrations/`. Nothing is
+/// overwritten, so this command cannot destroy anything a user wrote.
+///
+/// The one thing it does that `add_seaorm` does not is touch the `Dockerfile`,
+/// and that is the price of the TLS decision (see the template's Cargo.toml):
+/// `native-tls` means `openssl-sys`, and the distroless/cc runtime image has no
+/// libssl to link against — so `vendored` is on, which needs perl and make in the
+/// build stage, and `SSL_CERT_FILE` in the runtime stage so that a statically
+/// linked OpenSSL can still find a CA store.
+fn add_mssql(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(project, &[INFRA_MOD, BOOTSTRAP, "Dockerfile"])?;
+
+    let mut creates = vec![
+        (MSSQL_DB.to_string(), MSSQL_DB_TPL.to_string()),
+        (MSSQL_REPO.to_string(), MSSQL_REPO_TPL.to_string()),
+    ];
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(
+            format!("{rel} already exists — remove it first, or keep the one you have").into(),
+        );
+    }
+
+    let mut edits = vec![
+        // the slot again: `mssql` replaces whatever filled it, and [dependencies]
+        // is never touched, so Cargo.lock stays valid and `--locked` keeps working
+        edit(project, "Cargo.toml", |c| {
+            enable_feature(&c, "mssql", Some(Slot::Datastore))
+        })?,
+        // gated and appended, symmetrically with the Mongo and SeaORM modules
+        edit(project, INFRA_MOD, |c| Ok(format!("{c}\n{MSSQL_MOD}")))?,
+        edit(project, BOOTSTRAP, |c| rewrite_bootstrap(&c, &MSSQL_SWAP))?,
+        edit(project, "Dockerfile", |c| rewrite_dockerfile_for_mssql(&c))?,
+    ];
+
+    // two services, not one, and the second is the reason: unlike postgres and
+    // mysql, this image has no `POSTGRES_DB` equivalent — it boots with master,
+    // tempdb, model and msdb and nothing else, so `database=app` in the
+    // connection string would never resolve
+    if project.join(COMPOSE).is_file() {
+        edits.push(edit(project, COMPOSE, |c| {
+            let c = add_compose_service(&c, "mssql", MSSQL_COMPOSE)?;
+            add_compose_service(&c, "mssql-init", MSSQL_INIT_COMPOSE)
+        })?);
+    } else {
+        creates.push((
+            COMPOSE.to_string(),
+            format!("{COMPOSE_HEADER}{MSSQL_COMPOSE}{MSSQL_INIT_COMPOSE}"),
+        ));
+    }
+
+    // said once, here, rather than in the file nobody reads afterwards — the same
+    // sentence `add_seaorm` prints, one backend over
+    if project.join("migrations").is_dir() {
+        eprintln!(
+            "warning: migrations/ is not used on the SQL Server path (the schema lives in \
+             {MSSQL_DB} and is applied on the first connection) — delete it, or wire up a \
+             migration tool of your own when your schema outgrows the startup DDL"
+        );
+    }
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    // everything above is pure, so this is the only side effect
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
+/// Two edits with two different failure modes, so they are checked separately.
+///
+/// The `apt-get` line is the same anchor and the same code path `add postgres`
+/// uses. `SSL_CERT_FILE` is new and belongs to this capability alone: vendored
+/// OpenSSL compiles in an `OPENSSLDIR` pointing at the build directory, which
+/// does not exist in the runtime image, so without this variable certificate
+/// verification fails against **any server with a real certificate** — Azure SQL
+/// first among them — while dev and CI stay green forever on
+/// `TrustServerCertificate=true`. The file itself is in `distroless/cc-debian12`
+/// (216 KB, 142 certificates — verified in the image, not assumed).
+fn rewrite_dockerfile_for_mssql(content: &str) -> Result<String> {
+    if !content.contains(APT_ANCHOR) {
+        return Err(format!(
+            "Dockerfile has no `{APT_ANCHOR}` in its build stage, so there is nothing to hang the \
+             extra packages off — add what vendored OpenSSL needs to its `apt-get install` line \
+             yourself: {MSSQL_APT}"
+        )
+        .into());
+    }
+    if !content.contains(RUNTIME_ANCHOR) {
+        return Err(format!(
+            "Dockerfile has no `{RUNTIME_ANCHOR}` line, so there is no runtime stage to put the CA \
+             bundle path in — add `ENV {SSL_CERT_FILE}` to whatever your runtime stage is, or TLS \
+             against a server with a real certificate will fail with a verification error while \
+             dev and CI stay green on TrustServerCertificate=true"
+        )
+        .into());
+    }
+    let out = content.replacen(APT_ANCHOR, &format!("{APT_ANCHOR} {MSSQL_APT}"), 1);
+    insert_after_line(&out, RUNTIME_ANCHOR, MSSQL_SSL_ENV)
+}
+
+/// What vendored OpenSSL's build needs, and nothing more: no cmake here, because
+/// there is no C client library to build — tiberius speaks TDS itself.
+const MSSQL_APT: &str = "perl make";
+const RUNTIME_ANCHOR: &str = "FROM gcr.io/distroless/cc-debian12";
+const SSL_CERT_FILE: &str = "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt";
+const MSSQL_SSL_ENV: &str = r##"
+# Where a *statically linked* OpenSSL looks for CA certificates. `openssl-sys`
+# with `vendored` compiles in an OPENSSLDIR that points at the build directory,
+# which does not exist here — so without this line certificate verification fails
+# against every server with a real certificate (Azure SQL first among them),
+# while dev and CI stay green forever because the compose file sets
+# TrustServerCertificate=true. This image ships the file (Debian's ca-certificates).
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"##;
+
 /// What one datastore's `bootstrap.rs` swap replaces, and what must be gone
 /// afterwards. Two capabilities share this function because they do the same
 /// thing — take the datastore slot with a driver that is not Diesel — and
@@ -1231,6 +1473,25 @@ const SEA_SWAP: Swap = Swap {
     refusal: sea_refusal,
 };
 
+/// The SQL Server handle is a `Db` too, so — exactly like `SEA_SWAP` — "did the
+/// swap take?" is answered by looking for `diesel`/`Diesel`, not for `Db`. Same
+/// reason, and it applies harder here: the type keeps its name and shares not one
+/// method with the old one (no `run`, no pool of `PgConnection`), so a call
+/// kodegen did not write compile-errors after the swap rather than disappearing
+/// with the type.
+const MSSQL_SWAP: Swap = Swap {
+    use_block: BOOTSTRAP_USE_MSSQL,
+    db_block: BOOTSTRAP_DB_MSSQL,
+    build_user: BOOTSTRAP_BUILD_USER_MSSQL,
+    builder_handle: None,
+    leftovers: &["diesel", "Diesel"],
+    leftover_what: "no mention of Diesel outside the blocks kodegen generated (yours is still \
+                    there — the SQL Server handle is called `Db` as well, but it has none of the \
+                    same API, and the Diesel modules stop compiling when the relational feature \
+                    goes off)",
+    refusal: mssql_refusal,
+};
+
 fn mongo_refusal(what: &str) -> String {
     format!(
         "no longer matches what kodegen generated (expected {what}) — refusing to overwrite your \
@@ -1262,6 +1523,29 @@ fn sea_refusal(what: &str) -> String {
          pool, no migration step — and hand it to build_user_service, which now constructs a \
          `SeaUserRepository`\n  \
          4. run with DATABASE_URL={PG_URL}"
+    )
+}
+
+/// The same again, one driver over. Step 3 names `Db::new` because the handle
+/// keeps its name here too; step 5 is the one no other capability has, and
+/// leaving it out is a TLS failure that only shows up against a server with a
+/// real certificate.
+fn mssql_refusal(what: &str) -> String {
+    format!(
+        "no longer matches what kodegen generated (expected {what}) — refusing to overwrite your \
+         changes.\nSwitch to SQL Server by hand instead:\n  \
+         1. Cargo.toml: `default = [\"mssql\"]` — dropping the relational feature is what stops \
+         the Diesel modules compiling\n  \
+         2. src/infrastructure/mssql_db.rs + mssql_repo.rs: the handle and the adapter, plus \
+         `#[cfg(feature = \"mssql\")] pub mod mssql_db;` and the same for `mssql_repo` in \
+         infrastructure/mod.rs (generate a throwaway `kodegen new tmp --with mssql` and copy the \
+         files across)\n  \
+         3. src/bootstrap.rs: build the handle with `Db::new(ado)` where the pool was built — no \
+         pool to build here and no migration step — and hand it to build_user_service, which now \
+         constructs an `MssqlUserRepository`\n  \
+         4. Dockerfile: add `{MSSQL_APT}` to the build stage's apt line (vendored OpenSSL needs \
+         them) and `ENV {SSL_CERT_FILE}` to the runtime stage\n  \
+         5. run with DATABASE_URL={MSSQL_URL}"
     )
 }
 
@@ -2411,8 +2695,10 @@ impl Db {
                 // exhausted pool will not have healed by the next line: the retry
                 // would just pay the acquire timeout a second time (30s by
                 // default, so 60 before the caller hears anything) and fail the
-                // same way. A permission error is the same story — `CREATE` that
-                // is not granted stays not granted.
+                // same way, so those are returned untried. A permission error
+                // *is* server-answered, so it does get the second attempt — it
+                // costs one round trip and then reports the same denial, which is
+                // cheaper than a rule that tries to tell the two apart.
                 for stmt in SCHEMA {
                     if let Err(e) = conn.execute_unprepared(stmt).await {
                         if matches!(e, DbErr::Conn(_) | DbErr::ConnectionAcquire(_)) {
@@ -2609,6 +2895,441 @@ mod tests {
 }
 "##;
 
+/// The SQL Server half of the three swapped blocks, and under the same rule as
+/// the SeaORM ones: **nothing in these three constants may contain the word
+/// "diesel" in any case**, because that is exactly what `MSSQL_SWAP.leftovers`
+/// looks for once the swap is done. A comment mentioning the other ORM would make
+/// the command refuse its own output, on every project, forever.
+const BOOTSTRAP_USE_MSSQL: &str = r##"        grpc_greeter::GrpcGreeter,
+        in_memory_repo::InMemoryUserRepository,
+        mssql_db::Db,
+        mssql_repo::MssqlUserRepository,
+"##;
+
+/// Still called `db`, still resolved in the same place, still `DATABASE_URL` —
+/// the datastore slot is one slot, so both `api::Services` literals keep working
+/// untouched. What changes is the *shape* of the value: an ADO.NET connection
+/// string, not a URL.
+const BOOTSTRAP_DB_MSSQL: &str = r##"    // no pool to build and no migration step: the pool is opened on first use
+    // and the schema applied with it (see mssql_db.rs), so a database that is
+    // not up yet cannot stop the service booting — the same property the lazy
+    // Redis connection has. The value is an ADO.NET connection string
+    // (`server=tcp:host,1433;user id=...;database=...`), not a URL.
+    let db = std::env::var("DATABASE_URL").ok().map(Db::new);"##;
+
+const BOOTSTRAP_BUILD_USER_MSSQL: &str = r##"fn build_user_service(db: Option<&Db>) -> Arc<dyn UserService> {
+    let repo: Arc<dyn UserRepository> = match db {
+        Some(db) => Arc::new(MssqlUserRepository::new(db.clone())),
+        None => Arc::new(InMemoryUserRepository::new()),
+    };
+    Arc::new(UserServiceImpl::new(repo))
+}"##;
+
+const MSSQL_DB_TPL: &str = r##"//! Shared SQL Server plumbing for every repository: one pool, one schema, one
+//! error mapping. A new repository only needs a `Db` clone and its own queries.
+//!
+//! Written by `kodegen add mssql`.
+//!
+//! **This handle is called `Db` deliberately.** So are the Diesel and SeaORM
+//! ones, and no two of them are ever compiled together, so sharing the name is
+//! what makes switching datastores cost nothing above this layer: the
+//! composition root's binding keeps its name and every builder `kodegen feature`
+//! scaffolded (`_db: Option<&Db>`) keeps compiling in both directions. Only the
+//! name is shared — say `use crate::infrastructure::mssql_db::Db;` when a file
+//! has to name which one it means.
+//!
+//! **There is no ORM behind this file, on purpose.** Neither Diesel nor SeaORM
+//! supports SQL Server in open source, so the queries here are SQL text with
+//! bound parameters. Every value goes through `execute`/`query`'s parameter
+//! array — `@P1`, `@P2` — which is a real TDS bind, not interpolation. There is
+//! no `format!` anywhere in this adapter and there must not be one: that is the
+//! only thing standing between this file and SQL injection.
+//!
+//! **There are no versioned migrations on this path.** `SCHEMA` below is applied
+//! when the pool is opened, every statement idempotent, and `migrations/` is not
+//! read at all — the same deal the Mongo, SeaORM, ClickHouse and S3 adapters
+//! already make. The first time you change a table that already holds production
+//! data, move to a migration tool and empty this constant: `IF OBJECT_ID(...) IS
+//! NULL CREATE TABLE` cannot express an `ALTER`, and a startup that silently does
+//! nothing is worse than one that fails.
+//!
+//! **The database itself is not created here.** SQL Server's image has no
+//! `POSTGRES_DB` equivalent — it boots with master/tempdb/model/msdb — so
+//! `docker-compose.dev.yml` runs a one-shot service that issues
+//! `CREATE DATABASE app`, and a real deployment does the same thing in its
+//! deployment step. That is not a gap: an application role in production is
+//! almost never granted `CREATE DATABASE`. If it is missing you will see SQL
+//! Server's own words — "Cannot open database ... requested by the login" — in a
+//! 500 on every request, because `infra` below passes the server's message
+//! through rather than swallowing it.
+//!
+//! **The role in `DATABASE_URL` must be allowed to create tables**, for the same
+//! reason and with the same symptom: a failing *request*, never a failing boot,
+//! because the pool is opened lazily and a failed init is not cached.
+//!
+//! **Collation matters here in a way it does not on PostgreSQL.** The image's
+//! default (`SQL_Latin1_General_CP1_CI_AS`) is case-**in**sensitive, so `"u1"`
+//! and `"U1"` are the same primary key — MySQL's behaviour, not PostgreSQL's.
+//!
+//! **`NVARCHAR`, never `VARCHAR`.** tiberius sends every Rust string as
+//! `NVARCHAR`; against a `VARCHAR` column that makes each `WHERE id = @P1` an
+//! implicit conversion, which turns an index seek into a scan. Nothing warns —
+//! it is a pure performance failure, the same class as MySQL's `TEXT PRIMARY KEY`.
+//!
+//! **On a macOS host, `TrustServerCertificate=true` does not connect.** This is
+//! the driver, not this file, and it is worth knowing before you spend an hour on
+//! it. `native-tls` is OpenSSL on Linux but Apple's Secure Transport on macOS,
+//! and tiberius 0.12.3's trust-everything path also turns SNI off — which Secure
+//! Transport will not do, so the handshake is torn down and you get
+//! `Tls("connection closed via error")`. Ordinary validation works there (point
+//! it at a server with a real certificate and it connects), and the whole
+//! `TrustServerCertificate` path works on Linux, which is what the runtime image
+//! and CI are. On a Mac, run the service in a container, or talk to the local
+//! dev server with `encrypt=DANGER_PLAINTEXT` in place of
+//! `encrypt=true;TrustServerCertificate=true` — **only** against a database on
+//! your own machine: that setting sends the login packet in the clear.
+
+use crate::domain::DomainError;
+use bb8::{Pool, PooledConnection, RunError};
+use bb8_tiberius::ConnectionManager;
+use std::sync::Arc;
+use tiberius::error::Error as TiberiusError;
+use tokio::sync::OnceCell;
+
+/// The schema this adapter needs, applied once when the pool is opened.
+///
+/// **SQL Server has no `CREATE TABLE IF NOT EXISTS`** — not in 2022, not in 2025
+/// — so idempotency is spelled `IF OBJECT_ID(N'dbo.users', N'U') IS NULL`.
+/// Copying the `CREATE TABLE IF NOT EXISTS` from another adapter here is a
+/// *runtime* syntax error, not a compile error.
+///
+/// `dbo` explicitly, so there is no `CREATE SCHEMA` to run — that statement has
+/// to be first in its batch, while a `CREATE TABLE` nests inside an `IF` fine.
+///
+/// **The widths are the domain's limits, not round numbers.** `User::new`
+/// accepts an id of up to 64 bytes and a name of up to 256, so a column narrower
+/// than that would reject a value the domain calls valid — and on this backend it
+/// would *fail* rather than truncate: SQL Server runs with `ANSI_WARNINGS ON`, so
+/// an over-long string is error 2628, which arrives here as a 500 on a request
+/// every other datastore accepts. 256 UTF-16 units covers 256 UTF-8 bytes exactly
+/// (the widest character costs 4 bytes and 2 units), so the two limits line up
+/// with nothing left over.
+///
+/// One statement per entry, like every other adapter here.
+const SCHEMA: &[&str] = &[
+    "IF OBJECT_ID(N'dbo.users', N'U') IS NULL
+         CREATE TABLE dbo.users (
+             id   NVARCHAR(64)  NOT NULL PRIMARY KEY,
+             name NVARCHAR(256) NOT NULL
+         )",
+];
+
+/// Cheap-to-clone handle every repository here shares.
+///
+/// The pool is built on **first use**, not at startup: opening it dials the
+/// server and `build_services_from_env()` is a plain `fn`. Deferring it costs one
+/// `OnceCell` and means a database that is still coming up cannot stop the
+/// process from booting — the request that arrives first pays for the
+/// connection, and a `DomainError::Unavailable` answers 503 until it succeeds.
+#[derive(Clone)]
+pub struct Db(Arc<Inner>);
+
+struct Inner {
+    /// An **ADO.NET** connection string, which is what `tiberius::Config` parses
+    /// — `server=tcp:host,1433;user id=sa;password=...;database=app;encrypt=true`.
+    /// Not a URL: a `postgres://...` left in `DATABASE_URL` by a previous
+    /// backend fails to parse on the first request, loudly.
+    ado: String,
+    pool: OnceCell<Pool<ConnectionManager>>,
+}
+
+impl Db {
+    pub fn new(ado: impl Into<String>) -> Self {
+        Self(Arc::new(Inner {
+            ado: ado.into(),
+            pool: OnceCell::new(),
+        }))
+    }
+
+    /// A connection from the shared pool, opening it and applying `SCHEMA` on
+    /// the first call.
+    ///
+    /// A failure here is not cached: `get_or_try_init` leaves the cell empty, so
+    /// a server that was down when the first request arrived is retried on the
+    /// next one instead of poisoning the process.
+    pub async fn conn(&self) -> Result<PooledConnection<'_, ConnectionManager>, DomainError> {
+        let pool = self
+            .0
+            .pool
+            .get_or_try_init(|| async {
+                let manager = ConnectionManager::build(self.0.ado.as_str()).map_err(manager_infra)?;
+                // `min_idle(1)` is what makes the next line report a real error,
+                // and it is not a tuning knob. bb8's `build()` opens
+                // `min_idle` connections and returns the first failure verbatim
+                // — but `min_idle` defaults to *none*, which means zero, which
+                // makes `build()` identical to `build_unchecked()`: it returns
+                // `Ok` without ever dialling, and the first thing the caller
+                // hears is bb8's 30-second acquire timeout as a bare `TimedOut`
+                // with the server's own words thrown away. Those words are the
+                // whole diagnosis for the two mistakes this backend invites —
+                // "Cannot open database 'app' requested by the login" (nobody
+                // ran CREATE DATABASE) and "Login failed for user 'sa'". With
+                // one idle connection asked for, they arrive on the first
+                // request instead. Measured against a real server, not assumed.
+                //
+                // `retry_connection(false)` is the other half of it. bb8's
+                // default is to keep retrying a failing connect with backoff
+                // until `connection_timeout` (30s) expires and *then* report —
+                // so a wrong password costs every request 30 seconds before the
+                // 500. That retry is already covered one layer up and better:
+                // `get_or_try_init` does not cache a failure, so the next
+                // request opens the pool again. Once here, once per request,
+                // instead of eight times inside one.
+                let pool = Pool::builder()
+                    .max_size(8)
+                    .min_idle(1)
+                    .retry_connection(false)
+                    .build(manager)
+                    .await
+                    .map_err(manager_infra)?;
+                {
+                    let mut conn = pool.get().await.map_err(pool_infra)?;
+                    // The DDL is idempotent but **not atomic**: two processes
+                    // whose first connection lands at the same moment on a
+                    // database that does not have the table yet can collide, and
+                    // SQL Server answers one of them with error 2714 ("There is
+                    // already an object named 'users'") rather than "it exists
+                    // now". The loser retries once, by which time the statement
+                    // is a no-op — and a second failure is a real one, so it is
+                    // returned rather than swallowed.
+                    //
+                    // Only for errors the *server* answered. A dead connection
+                    // will not have healed by the next line: retrying it would
+                    // pay the same failure twice before the caller hears
+                    // anything, so it is returned untried. A permission error
+                    // *is* server-answered, so it does get the second attempt —
+                    // one round trip, then the same denial, which is cheaper than
+                    // a rule that tries to tell the two apart.
+                    for stmt in SCHEMA {
+                        if let Err(e) = conn.execute(*stmt, &[]).await {
+                            if !matches!(e, TiberiusError::Server(_)) {
+                                return Err(infra(e));
+                            }
+                            conn.execute(*stmt, &[]).await.map_err(infra)?;
+                        }
+                    }
+                }
+                Ok(pool)
+            })
+            .await?;
+        pool.get().await.map_err(pool_infra)
+    }
+}
+
+/// A server that cannot be reached is `Unavailable`, which `api::to_http_err`
+/// turns into a 503 — the same treatment `GrpcGreeter` gives a dead upstream.
+/// Anything SQL Server itself answered is a real `Other` and a 500: the
+/// dependency is up, the request or the deployment is wrong, and dressing that
+/// up as "try again later" would hide it. `Error::Server` carries the server's
+/// own message, so "Cannot open database 'app' requested by the login" and
+/// "Login failed for user 'sa'" come through intact — which is the one thing
+/// that makes a missing `CREATE DATABASE` step diagnosable.
+///
+/// **`Tls` is on the 500 side**, which is the one judgement here that is worth
+/// arguing about. A failed handshake means the server *was* reached and
+/// answered; what went wrong is a certificate or a trust setting, and neither
+/// gets better by retrying. Calling it 503 would say "try again later" about a
+/// deployment mistake, forever — and would swallow the message that names it.
+pub fn infra(e: TiberiusError) -> DomainError {
+    match e {
+        // never reached, or the framing broke mid-stream
+        TiberiusError::Io { .. } | TiberiusError::Protocol(_) => DomainError::Unavailable,
+        _ => DomainError::Other(Box::new(e)),
+    }
+}
+
+/// The same judgement for the pool's own errors. `TimedOut` is bb8 giving up
+/// waiting for a connection, which is the definition of `Unavailable`.
+pub fn pool_infra(e: RunError<bb8_tiberius::Error>) -> DomainError {
+    match e {
+        RunError::TimedOut => DomainError::Unavailable,
+        RunError::User(e) => manager_infra(e),
+    }
+}
+
+fn manager_infra(e: bb8_tiberius::Error) -> DomainError {
+    match e {
+        bb8_tiberius::Error::Tiberius(e) => infra(e),
+        // the TCP connect itself failed
+        bb8_tiberius::Error::Io(_) => DomainError::Unavailable,
+    }
+}
+"##;
+
+const MSSQL_REPO_TPL: &str = r##"//! `UserRepository` adapter over SQL Server. Written by `kodegen add mssql`.
+//!
+//! No new port: this is another adapter of the port the template already ships,
+//! which is why the application service, the routes and `tests/api.rs` are
+//! untouched — and why the port's contract (`save` is an upsert, `get` on a
+//! missing id is `NotFound`) is what this file has to honor rather than
+//! reinterpret.
+//!
+//! The handle is owned by the composition root (`bootstrap.rs`) and handed in: a
+//! repository never reads `DATABASE_URL`.
+//!
+//! **Every value is a bound parameter.** `@P1`/`@P2` are filled by TDS from the
+//! slice passed to `execute`/`query`; there is no `format!` in this file and
+//! there must never be one. A unit test in kodegen itself asserts that.
+
+use crate::domain::{DomainError, User, UserRepository};
+use crate::infrastructure::mssql_db::{infra, Db};
+use async_trait::async_trait;
+
+/// The upsert, and two things about it that are not style choices:
+///
+/// - **`WITH (HOLDLOCK)` is required.** Without it two concurrent `MERGE`s on the
+///   same key can both take the NOT MATCHED branch and one gets a duplicate-key
+///   error. It fails no test and only shows up under a real concurrent writer,
+///   which is exactly the kind of bug that ships. Do not remove it.
+/// - **The trailing `;` is required.** `MERGE` is the one statement SQL Server
+///   insists on terminating; without it this is a syntax error at run time.
+///
+/// **When to stop using `MERGE` here.** Its known bug list is real, and every
+/// item on it needs something this table does not have: a trigger, a foreign key
+/// pointing at `users`, a filtered index, an `OUTPUT $action` clause, or a view
+/// as the target. Add any of those to `users` and re-evaluate — the replacement
+/// is `UPDATE` then `INSERT` when `@@ROWCOUNT = 0`, inside an explicit
+/// `BEGIN TRAN`/`COMMIT` with `SET XACT_ABORT ON`. It is only correct *with* that
+/// transaction: in autocommit each statement commits on its own, so the range
+/// lock the `UPDATE` took is released before the `INSERT` runs and the race is
+/// back. That is three things to get right, which is why a single atomic
+/// statement is the default here.
+const UPSERT: &str = "MERGE dbo.users WITH (HOLDLOCK) AS t
+     USING (VALUES (@P1, @P2)) AS s (id, name)
+        ON t.id = s.id
+      WHEN MATCHED THEN UPDATE SET name = s.name
+      WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name);";
+
+const SELECT: &str = "SELECT TOP 1 id, name FROM dbo.users WHERE id = @P1";
+
+pub struct MssqlUserRepository {
+    db: Db,
+}
+
+impl MssqlUserRepository {
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl UserRepository for MssqlUserRepository {
+    async fn save(&self, user: User) -> Result<(), DomainError> {
+        let mut conn = self.db.conn().await?;
+        // the affected-row count is deliberately not inspected: `save` of
+        // unchanged values is `WHEN MATCHED` -> an UPDATE that writes the same
+        // bytes, and whether the server calls that 1 row or 0 is not the port's
+        // business. It says `Ok(())`, so this returns `Ok(())`.
+        conn.execute(UPSERT, &[&user.id, &user.name])
+            .await
+            .map(|_| ())
+            .map_err(infra)
+    }
+
+    async fn get(&self, id: &str) -> Result<User, DomainError> {
+        let mut conn = self.db.conn().await?;
+        let row = conn
+            .query(SELECT, &[&id])
+            .await
+            .map_err(infra)?
+            .into_row()
+            .await
+            .map_err(infra)?
+            .ok_or(DomainError::NotFound)?;
+        // by name rather than index, so adding a column ahead of these two in
+        // `SCHEMA` cannot silently swap them
+        let (Some(id), Some(name)) = (row.get::<&str, _>("id"), row.get::<&str, _>("name")) else {
+            return Err(DomainError::NotFound);
+        };
+        Ok(User {
+            id: id.to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SQL Server needs a server, so these are gated on `DATABASE_URL` rather
+    /// than `#[ignore]`: `docker compose -f docker-compose.dev.yml up -d` plus
+    /// the env var is all it takes to run them, and CI stays green without one
+    /// (the in-memory adapter is what runs when `DATABASE_URL` is unset —
+    /// exactly how the app itself picks its adapter).
+    ///
+    /// A handle **per test**, not one shared by the binary: `#[tokio::test]`
+    /// builds a runtime per test and drops it at the end, and a pool belongs to
+    /// the runtime that created it — shared, the second test to use it would wait
+    /// out the acquire timeout on connections whose runtime is gone. Which leaves
+    /// these tests applying the schema concurrently on an empty database, and
+    /// that is handled where it has to be for real deployments too: the retry in
+    /// `mssql_db.rs`.
+    fn repo() -> Option<MssqlUserRepository> {
+        let ado = std::env::var("DATABASE_URL").ok()?;
+        Some(MssqlUserRepository::new(Db::new(ado)))
+    }
+
+    #[tokio::test]
+    async fn save_then_get_roundtrips() {
+        let Some(repo) = repo() else {
+            eprintln!("DATABASE_URL unset — skipping the SQL Server roundtrip test");
+            return;
+        };
+
+        // save is an upsert, so re-running this against a live database must not
+        // fail on the row the previous run left behind
+        let user = User::new("u1", "Alice").expect("valid user");
+        repo.save(user).await.expect("save");
+        assert_eq!(repo.get("u1").await.expect("get").name, "Alice");
+
+        repo.save(User::new("u1", "Alicia").expect("valid user"))
+            .await
+            .expect("saving an existing id must update it");
+        assert_eq!(repo.get("u1").await.expect("get").name, "Alicia");
+    }
+
+    /// The upsert against unchanged values, which is where an adapter that reads
+    /// the affected-row count would start reporting an error for a call the port
+    /// documents as `Ok(())`. Both writes are in one test on purpose: split
+    /// across two, a stale row from an earlier run would make the second one pass
+    /// for the wrong reason.
+    #[tokio::test]
+    async fn save_twice_identical_values_is_ok() {
+        let Some(repo) = repo() else {
+            return;
+        };
+
+        let user = User::new("u2", "Bob").expect("valid user");
+        repo.save(user.clone()).await.expect("save");
+        repo.save(user)
+            .await
+            .expect("saving identical values again must still be Ok");
+        assert_eq!(repo.get("u2").await.expect("get").name, "Bob");
+    }
+
+    #[tokio::test]
+    async fn get_missing_is_not_found() {
+        let Some(repo) = repo() else {
+            return;
+        };
+
+        let err = repo.get("no-such-user").await.unwrap_err();
+        assert!(matches!(err, DomainError::NotFound));
+    }
+}
+"##;
+
 const COMPOSE_HEADER: &str = r##"# Dev-only services, written by `kodegen add`. Not the production deployment —
 # that is the Dockerfile. Boots what the env-gated integration tests need:
 #
@@ -2762,6 +3483,85 @@ const GREPTIME_COMPOSE: &str = r##"  greptimedb:
       interval: 5s
       timeout: 3s
       retries: 20
+"##;
+
+/// SQL Server, and the two things that make it unlike every other service in
+/// this file: it needs a second service to create the database, and it has no
+/// arm64 image.
+const MSSQL_COMPOSE: &str = r##"  mssql:
+    # 2022 rather than 2025 (`2025-latest` works and is a one-line change): the
+    # 2025 image crashed at start between RTM and CU2 when
+    # sockets x cores_per_socket did not equal the total processor count, which
+    # is a property of whatever machine happens to run it.
+    #
+    # There is **no arm64 image** — the manifest is amd64 only and Microsoft does
+    # not support emulating it — so `platform:` is here to make Apple Silicon
+    # emulate rather than fail with a confusing manifest error. Expect it to be
+    # slow there.
+    #
+    # And one more macOS caveat, this one about the client: an app built *on* a
+    # Mac cannot reach this server with `TrustServerCertificate=true`, because
+    # native-tls is Apple's Secure Transport there and tiberius's trust-everything
+    # path turns SNI off, which Secure Transport refuses. Use
+    # `encrypt=DANGER_PLAINTEXT` against this container, or run the service in a
+    # container too. On Linux — the runtime image, and CI — it works as written.
+    #
+    # ACCEPT_EULA is the Developer edition's licence, which is free for
+    # development, testing and demonstration — including on shared machines like
+    # a CI runner — and not for production. MSSQL_PID is not needed: the image is
+    # built as `developer` already.
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "Y"
+      # >= 8 characters and three of upper/lower/digit/symbol, or the server
+      # refuses to start. This is why it is not `app:app` like the others — it
+      # has to match the password in DATABASE_URL.
+      MSSQL_SA_PASSWORD: "kodeGen!2026"
+    ports:
+      - "1433:1433"
+    healthcheck:
+      # sqlcmd lives in /opt/mssql-tools18/bin and **/opt/mssql-tools is gone** —
+      # most examples on the web still point at the old path and silently never
+      # pass. `-C` is not optional either: tools18 encrypts by default and this
+      # server has a self-signed certificate. `-b` is what turns a failed query
+      # into a non-zero exit.
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -C -U sa -P \"$$MSSQL_SA_PASSWORD\" -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      # the server takes appreciably longer to accept connections than postgres
+      # or mysql, and a start_period keeps the early failures from counting
+      start_period: 30s
+"##;
+
+/// The service that has no equivalent anywhere else in this file, because this
+/// image has no `POSTGRES_DB`/`MYSQL_DATABASE`: it boots with master, tempdb,
+/// model and msdb, and `database=app` in the connection string resolves to
+/// nothing until somebody runs `CREATE DATABASE`.
+///
+/// Deliberately not done by the application. It would need a connection to
+/// `master` and then a second one to `app` — two configurations behind one handle
+/// — and in production an application role is almost never granted
+/// `CREATE DATABASE` anyway. It is a deployment step, and this is the dev
+/// deployment.
+///
+/// **`docker compose up -d --wait` exits 1 when this service finishes**, even on
+/// a clean `exit 0`: `--wait` treats a container that is no longer running as a
+/// failed dependency. Measured, not assumed. So boot it in two commands —
+/// `up -d --wait mssql` then `run --rm mssql-init` — which is what the generated
+/// CI does and what the README says.
+const MSSQL_INIT_COMPOSE: &str = r##"  mssql-init:
+    # the same image, so there is nothing extra to pull
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    depends_on:
+      mssql:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      MSSQL_SA_PASSWORD: "kodeGen!2026"
+    entrypoint: ["/bin/bash", "-c", "/opt/mssql-tools18/bin/sqlcmd -S mssql -C -U sa -P \"$$MSSQL_SA_PASSWORD\" -b -Q \"IF DB_ID('app') IS NULL CREATE DATABASE app\""]
 "##;
 
 const MONGO_COMPOSE: &str = r##"  mongo:
@@ -4256,6 +5056,19 @@ mod tests {
         root
     }
 
+    /// A generated file with its comments stripped. The SQL adapters name the
+    /// traps they avoid *in their comments* — "SQL Server has no `CREATE TABLE IF
+    /// NOT EXISTS`", "there must never be a `format!` here" — so an assertion
+    /// that a spelling is absent has to look at what the file does, not at what
+    /// it says about itself. Line comments only, which is all these templates
+    /// have.
+    fn code_only(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
@@ -4643,6 +5456,7 @@ mod tests {
             (Capability::Postgres, "DATABASE_URL"),
             (Capability::Timescaledb, "DATABASE_URL"),
             (Capability::Mongodb, "MONGODB_URL"),
+            (Capability::Mssql, "DATABASE_URL"),
             (Capability::Redis, "REDIS_URL"),
             (Capability::S3, "S3_BUCKET"),
             (Capability::Clickhouse, "CLICKHOUSE_URL"),
@@ -5577,6 +6391,441 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The Phase 7 path: the datastore slot with no ORM behind it at all.
+    ///
+    /// Structurally `add_seaorm`, so most of what is asserted here is the same
+    /// list. What is new is the SQL — every statement of it is a *runtime*
+    /// failure if it is wrong, because nothing on this path compiles a query.
+    #[test]
+    fn mssql_takes_the_datastore_slot_with_no_orm_behind_it() {
+        let root = fixture("mssql");
+        let manifest_before = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let seed = "migrations/2026-07-26-000000_create_users/up.sql";
+        let seed_before = fs::read_to_string(root.join(seed)).unwrap();
+
+        add(&root, Capability::Mssql, None, false).unwrap();
+
+        // the slot, not a second entry beside it — and the lock stays valid
+        // because nothing but that one line moved
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"mssql\"]"), "{toml}");
+        let strip = |s: &str| {
+            s.lines()
+                .filter(|l| !l.starts_with("default = ["))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip(&manifest_before), strip(&toml));
+
+        let db = code_only(&fs::read_to_string(root.join(MSSQL_DB)).unwrap());
+        assert!(
+            db.contains("pub struct Db("),
+            "the handle must be `Db`, or every scaffolded builder breaks: {db}"
+        );
+        // SQL Server has no `CREATE TABLE IF NOT EXISTS`. Copying it in from
+        // another adapter is a syntax error nothing here would catch until a
+        // server saw it.
+        assert!(
+            db.contains("IF OBJECT_ID(N'dbo.users', N'U') IS NULL"),
+            "the DDL must be idempotent the way SQL Server spells it: {db}"
+        );
+        assert!(
+            !db.contains("CREATE TABLE IF NOT EXISTS"),
+            "that spelling does not exist on this backend: {db}"
+        );
+        // NVARCHAR, not VARCHAR: tiberius sends every Rust string as NVARCHAR,
+        // and the mismatch is a silent index-seek-to-scan, never an error
+        assert!(db.contains("id   NVARCHAR(64)"), "{db}");
+        // ...and the widths are the domain's own limits. A name of exactly 256
+        // bytes is a valid `User`, and `ANSI_WARNINGS ON` makes an over-long
+        // string error 2628 rather than a truncation — so a narrower column is a
+        // 500 on a request every other datastore in this repo accepts.
+        assert!(db.contains("name NVARCHAR(256)"), "{db}");
+        assert!(
+            !db.contains(" VARCHAR("),
+            "a VARCHAR column would make every lookup an implicit conversion: {db}"
+        );
+        // the startup-DDL race fix and its limit, exactly as on the SeaORM path:
+        // one retry, and only for something the server answered
+        assert!(
+            db.contains("if !matches!(e, TiberiusError::Server(_))"),
+            "the schema loop must retry once, and never on a transport error: {db}"
+        );
+
+        let repo = code_only(&fs::read_to_string(root.join(MSSQL_REPO)).unwrap());
+        assert!(
+            repo.contains("impl UserRepository for MssqlUserRepository"),
+            "{repo}"
+        );
+        // the two halves of the upsert that fail silently when they are missing:
+        // without HOLDLOCK the MERGE is racy under a concurrent writer and every
+        // test still passes; without the trailing `;` it is a syntax error
+        assert!(repo.contains("MERGE dbo.users WITH (HOLDLOCK)"), "{repo}");
+        assert!(
+            repo.contains("VALUES (s.id, s.name);"),
+            "MERGE must be terminated with a semicolon: {repo}"
+        );
+        assert!(
+            repo.contains("fn save_twice_identical_values_is_ok"),
+            "{repo}"
+        );
+        assert!(
+            repo.contains("DATABASE_URL"),
+            "the adapter test must be env-gated: {repo}"
+        );
+
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("mssql_repo::MssqlUserRepository"), "{bootstrap}");
+        assert!(
+            bootstrap.contains("DATABASE_URL"),
+            "the env var does not change: {bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("fn build_user_service(db: Option<&Db>)"),
+            "{bootstrap}"
+        );
+        for gone in ["diesel", "Diesel", "build_pool"] {
+            assert!(!bootstrap.contains(gone), "'{gone}' survived the swap: {bootstrap}");
+        }
+        // the `Services` literals are untouched — same slot, same binding name
+        assert!(bootstrap.contains("user: build_user_service(db.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("user: build_user_service(None),"), "{bootstrap}");
+        for marker in [
+            RESOURCES_MARKER,
+            "// kodegen:services:env",
+            "// kodegen:services:default",
+        ] {
+            assert!(bootstrap.contains(marker), "marker '{marker}' was consumed: {bootstrap}");
+        }
+
+        // undo has to be possible: nothing is deleted, both sides are gated
+        assert!(root.join(DIESEL_DB).is_file() && root.join(DIESEL_REPO).is_file());
+        let infra = fs::read_to_string(root.join(INFRA_MOD)).unwrap();
+        assert!(infra.contains(MSSQL_MOD), "the modules must be cfg-gated: {infra}");
+        assert_eq!(
+            infra.matches("#[cfg(feature = \"relational\")]").count(),
+            2,
+            "both Diesel modules must stay behind the relational gate: {infra}"
+        );
+
+        // migrations/ is not used on this path, and not ours to rewrite either
+        assert_eq!(seed_before, fs::read_to_string(root.join(seed)).unwrap());
+
+        // the Dockerfile *is* touched here, unlike the SeaORM path — vendored
+        // OpenSSL needs a build toolchain, and a statically linked one needs to
+        // be told where the CA bundle is
+        let dockerfile = fs::read_to_string(root.join("Dockerfile")).unwrap();
+        assert!(
+            dockerfile.contains("protobuf-compiler perl make"),
+            "the build stage needs perl/make for vendored OpenSSL: {dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"),
+            "without this, TLS fails against every server with a real certificate while dev and \
+             CI stay green: {dockerfile}"
+        );
+        // ...in the runtime stage, not the build one, or it does nothing
+        let (_, runtime) = dockerfile.split_once(RUNTIME_ANCHOR).expect("runtime stage");
+        assert!(runtime.contains("ENV SSL_CERT_FILE="), "{dockerfile}");
+
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        assert!(compose.contains("image: mcr.microsoft.com/mssql/server:2022-latest"), "{compose}");
+        // the second service, which no other capability needs: this image
+        // creates no database of its own
+        assert!(compose.contains("  mssql-init:"), "{compose}");
+        assert!(compose.contains("CREATE DATABASE app"), "{compose}");
+        // and the two things that are wrong in most examples on the web
+        assert!(compose.contains("/opt/mssql-tools18/bin/sqlcmd"), "{compose}");
+        assert!(compose.contains("platform: linux/amd64"), "no arm64 image exists: {compose}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Cheap test, expensive bug. This adapter is the only one in the tree whose
+    /// queries are strings rather than a builder, so "no interpolation anywhere"
+    /// is the whole of its injection story — and a `format!` is how that story
+    /// ends. The parameters go through `execute`/`query`'s slice, which is a real
+    /// TDS bind.
+    #[test]
+    fn the_mssql_adapter_never_builds_sql_by_formatting() {
+        for (what, tpl) in [("repo", MSSQL_REPO_TPL), ("db", MSSQL_DB_TPL)] {
+            assert!(
+                !code_only(tpl).contains("format!"),
+                "{what}: SQL in this adapter must never be built by formatting"
+            );
+        }
+        assert!(MSSQL_REPO_TPL.contains("&[&user.id, &user.name]"), "the upsert must bind");
+        assert!(MSSQL_REPO_TPL.contains("&[&id]"), "the lookup must bind");
+    }
+
+    /// One password, three places — the connection string kodegen prints, the
+    /// server that has to accept it and the init service that has to log in with
+    /// it. Change it in one and the compose file boots a server nothing can
+    /// reach, which reads like a network problem.
+    ///
+    /// Spelled out here rather than shared as a constant: this is the definition,
+    /// and the three below are what it pins.
+    #[test]
+    fn the_dev_password_is_the_same_everywhere_it_appears() {
+        const SA: &str = "kodeGen!2026";
+        for (what, s) in [
+            ("DATABASE_URL", MSSQL_URL),
+            ("the mssql service", MSSQL_COMPOSE),
+            ("the init service", MSSQL_INIT_COMPOSE),
+        ] {
+            assert!(
+                s.contains(SA),
+                "{what} no longer carries the SA password the others use"
+            );
+        }
+        // and it still passes the image's own policy — at least 8 characters and
+        // three of upper/lower/digit/symbol — which is why this is not `app:app`
+        // like every other dev service in that file
+        assert!(SA.len() >= 8);
+        assert!(SA.chars().any(|c| c.is_ascii_uppercase()));
+        assert!(SA.chars().any(|c| c.is_ascii_lowercase()));
+        assert!(SA.chars().any(|c| c.is_ascii_digit()));
+        assert!(SA.chars().any(|c| c.is_ascii_punctuation()));
+    }
+
+    /// `--orm` on `mssql` gets its own sentence, because the general one is
+    /// wrong here: SQL Server *is* relational, so "--orm applies only to
+    /// relational capabilities" would read as a contradiction to whoever just
+    /// typed it. What is missing is an ORM, and the message has to say so.
+    #[test]
+    fn the_orm_flag_on_mssql_says_why_rather_than_that_it_is_not_relational() {
+        for orm in [Orm::Diesel, Orm::Seaorm] {
+            // before the project is even looked at
+            let err = add(Path::new("/nonexistent-project"), Capability::Mssql, Some(orm), true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--orm does not apply to 'mssql'"), "{err}");
+            assert!(err.contains("SeaORM X"), "must say where the support is: {err}");
+            assert!(
+                !err.contains("applies only to relational capabilities"),
+                "the general message is the wrong one here: {err}"
+            );
+        }
+        // ...and `new --with mssql --orm seaorm` gets the *same* sentence, not
+        // the generic "nothing in this list has an ORM": the user named a SQL
+        // database, so the answer has to be about that database.
+        let err = check_combination(&[Capability::Mssql, Capability::Redis], Some(Orm::Seaorm))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--orm does not apply to 'mssql'"), "{err}");
+        // the generic one is still what a list with no SQL database at all gets
+        let err = check_combination(&[Capability::Redis, Capability::S3], Some(Orm::Seaorm))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--orm needs a relational capability"), "{err}");
+    }
+
+    /// The datastore slot has four occupants now, and a user can arrive from any
+    /// of them.
+    #[test]
+    fn mssql_refuses_and_is_refused_by_every_other_datastore() {
+        // into mssql, from each of the other three
+        for (tag, first, orm, occupant) in [
+            ("pg-then-mssql", Capability::Postgres, None, "'postgres (diesel)'"),
+            (
+                "seaorm-then-mssql",
+                Capability::Postgres,
+                Some(Orm::Seaorm),
+                "'postgres (seaorm)'",
+            ),
+            ("mongo-then-mssql", Capability::Mongodb, None, "'document'"),
+        ] {
+            let root = fixture(tag);
+            add(&root, first, orm, false).unwrap();
+            let err = add(&root, Capability::Mssql, None, true).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("capability {occupant} is already this project's datastore")),
+                "{tag}: {err}"
+            );
+            assert!(err.contains("rerun `kodegen add mssql`"), "{tag}: {err}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+
+        // ...and out of mssql, into each of them
+        let root = fixture("mssql-then-others");
+        add(&root, Capability::Mssql, None, false).unwrap();
+        for (cap, orm) in [
+            (Capability::Postgres, None),
+            (Capability::Mysql, Some(Orm::Seaorm)),
+            (Capability::Mongodb, None),
+        ] {
+            let err = add(&root, cap, orm, true).unwrap_err().to_string();
+            assert!(
+                err.contains("capability 'mssql' is already this project's datastore"),
+                "{}: {err}",
+                cap.name()
+            );
+            // no "(diesel)" suffix on an occupant that has no ORM
+            assert!(!err.contains("'mssql (diesel)'"), "{err}");
+            assert!(
+                err.contains("mssql_db.rs + mssql_repo.rs"),
+                "must name what can stay: {err}"
+            );
+        }
+        // and twice is the other error
+        let err = add(&root, Capability::Mssql, None, true).unwrap_err().to_string();
+        assert!(err.contains("capability 'mssql' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The guard has to *pass* on the file kodegen itself writes, not only refuse
+    /// a hand-edited one — the three replacement blocks are the output it then
+    /// inspects, so one stray "Diesel" in a comment inside them would make the
+    /// command refuse its own work, on every project, forever.
+    #[test]
+    fn the_mssql_guard_passes_on_a_fresh_bootstrap_and_refuses_a_spiked_one() {
+        let fresh = crate::TEMPLATES
+            .get_file("hexagonal/src/bootstrap.rs")
+            .unwrap()
+            .contents_utf8()
+            .unwrap();
+        let out = rewrite_bootstrap(fresh, &MSSQL_SWAP).expect("the swap must succeed on the template");
+        for word in MSSQL_SWAP.leftovers {
+            assert!(!out.contains(word), "the replacement blocks mention '{word}': {out}");
+        }
+        assert!(out.contains("mssql_db::Db,"), "{out}");
+
+        // the handle keeps its name across the swap, so a hand-written call to
+        // the old one is the only thing this can catch
+        let spiked = format!(
+            "{fresh}\nfn mine(db: &Db) {{ let _ = db.run(|_| diesel::result::QueryResult::Ok(())); }}\n"
+        );
+        let err = rewrite_bootstrap(&spiked, &MSSQL_SWAP).unwrap_err().to_string();
+        assert!(err.contains("no mention of Diesel"), "{err}");
+        assert!(err.contains("DATABASE_URL="), "must list the manual steps: {err}");
+        assert!(err.contains("SSL_CERT_FILE"), "the manual steps must include the CA path: {err}");
+    }
+
+    #[test]
+    fn mssql_refuses_a_hand_edited_bootstrap() {
+        for (tag, spike) in [
+            ("mssql-edited-use", "diesel_repo::DieselUserRepository,"),
+            ("mssql-edited-db", "expect(\"diesel pool init failed\")"),
+            ("mssql-edited-builder", "fn build_user_service(db: Option<&Db>)"),
+        ] {
+            let root = fixture(tag);
+            let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+            let spiked = bootstrap.replace(spike, "// mine now");
+            fs::write(root.join(BOOTSTRAP), &spiked).unwrap();
+
+            let err = add(&root, Capability::Mssql, None, false).unwrap_err().to_string();
+            assert!(err.contains("refusing to overwrite"), "{tag}: {err}");
+            assert!(err.contains("mssql_db.rs"), "{tag}: must list the manual steps: {err}");
+            assert_eq!(
+                fs::read_to_string(root.join(BOOTSTRAP)).unwrap(),
+                spiked,
+                "{tag}: a refusal must not write"
+            );
+            assert!(!root.join(MSSQL_DB).exists(), "{tag}: a refusal must not write");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn mssql_refuses_to_overwrite_an_existing_adapter() {
+        let root = fixture("mssql-existing-adapter");
+        fs::write(root.join(MSSQL_REPO), "// mine now\n").unwrap();
+        let err = add(&root, Capability::Mssql, None, true).unwrap_err().to_string();
+        assert!(err.contains(MSSQL_REPO) && err.contains("already exists"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Two anchors, two different repairs — and the second one is the whole
+    /// reason this capability touches the Dockerfile at all, so its message has
+    /// to say what is lost by skipping it.
+    #[test]
+    fn mssql_refuses_a_dockerfile_it_cannot_complete() {
+        let root = fixture("mssql-no-apt");
+        fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        let err = add(&root, Capability::Mssql, None, true).unwrap_err().to_string();
+        assert!(err.contains(APT_ANCHOR) && err.contains("perl make"), "{err}");
+
+        let root2 = fixture("mssql-no-runtime");
+        let dockerfile = fs::read_to_string(root2.join("Dockerfile")).unwrap();
+        fs::write(
+            root2.join("Dockerfile"),
+            dockerfile.replace(RUNTIME_ANCHOR, "FROM debian:bookworm-slim"),
+        )
+        .unwrap();
+        let err = add(&root2, Capability::Mssql, None, true).unwrap_err().to_string();
+        assert!(err.contains("SSL_CERT_FILE"), "{err}");
+        assert!(
+            err.contains("TrustServerCertificate"),
+            "must say what stays green while this is broken: {err}"
+        );
+        for dir in [root, root2] {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn mssql_dry_run_writes_nothing_but_plans_the_same_change() {
+        let root = fixture("mssql-dry");
+        let before = snapshot(&root);
+        let planned = add(&root, Capability::Mssql, None, true).unwrap();
+        assert_eq!(before, snapshot(&root), "dry run touched the tree");
+        assert_eq!(planned, add(&root, Capability::Mssql, None, false).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The reason this handle is called `Db` as well: a builder scaffolded on
+    /// either side of the switch asks for a type that exists on both.
+    #[test]
+    fn scaffolded_builders_survive_the_mssql_switch_in_both_orders() {
+        let root = fixture("mssql-then-feature");
+        add(&root, Capability::Mssql, None, false).unwrap();
+        crate::scaffold::add_feature(&root, "notification", crate::scaffold::Transport::Rest, false)
+            .unwrap();
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("_db: Option<&Db>"), "{bootstrap}");
+        assert!(!bootstrap.contains("Diesel"), "{bootstrap}");
+
+        // and the other order, where `cargo fmt` has already wrapped the
+        // generated signature by the time `add` runs
+        let root2 = fixture("feature-then-mssql");
+        crate::scaffold::add_feature(&root2, "notification", crate::scaffold::Transport::Rest, false)
+            .unwrap();
+        add(&root2, Capability::Mssql, None, false).unwrap();
+        let after = fs::read_to_string(root2.join(BOOTSTRAP)).unwrap();
+        assert!(after.contains("_db: Option<&Db>"), "{after}");
+        assert!(!after.contains("diesel"), "{after}");
+        for dir in [root, root2] {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The additive capabilities wire into the same `bootstrap.rs` and the same
+    /// compose file this path rewrites, from both sides.
+    #[test]
+    fn mssql_coexists_with_a_cache_a_blob_store_and_an_event_sink() {
+        let root = fixture("mssql-and-friends");
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::Mssql, None, false).unwrap();
+        add(&root, Capability::S3, None, false).unwrap();
+        add(&root, Capability::Clickhouse, None, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(
+            toml.contains("default = [\"cache\", \"mssql\", \"blob\", \"analytics\"]"),
+            "{toml}"
+        );
+        let bootstrap = fs::read_to_string(root.join(BOOTSTRAP)).unwrap();
+        assert!(bootstrap.contains("MssqlUserRepository"), "{bootstrap}");
+        assert!(bootstrap.contains("cache: build_cache(redis.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("blobs: build_blob_store(s3.as_ref()),"), "{bootstrap}");
+        assert!(bootstrap.contains("events: build_event_sink(clickhouse.as_ref()),"), "{bootstrap}");
+        assert!(!bootstrap.contains("diesel"), "{bootstrap}");
+        let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
+        for service in ["  mssql:", "  mssql-init:", "  redis:", "  s3:", "  clickhouse:"] {
+            assert!(compose.contains(service), "{service} missing: {compose}");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn refuses_to_clobber_a_hand_edited_diesel_db() {
         let root = fixture("handedited");
@@ -5746,6 +6995,12 @@ mod tests {
             "seaorm = [\"dep:sea-orm\"",
             "seaorm-postgres = [\"seaorm\"",
             "seaorm-mysql = [\"seaorm\"",
+            // and the SQL Server one. `dep:openssl-sys` is the half that is easy
+            // to drop and impossible to notice: without it `native-tls` links the
+            // *system* libssl, which distroless/cc does not have — the build
+            // succeeds on a developer's machine and the image will not start.
+            "mssql = [\"dep:tiberius\", \"dep:bb8\", \"dep:bb8-tiberius\", \"dep:openssl-sys\", \
+             \"tokio/sync\"]",
         ] {
             assert!(toml.contains(feature), "template's [features] lost `{feature}`");
         }

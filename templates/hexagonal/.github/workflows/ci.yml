@@ -57,6 +57,15 @@ jobs:
       - name: Check document backend
         run: cargo check --locked --features document
 
+      # The datastore slot's third occupant, and the one with no ORM. Additive
+      # here like the rows above, but it proves the thing that is easiest to get
+      # wrong about this feature: that `mssql` resolves with --locked *and* that
+      # `openssl-sys` unifies to `vendored` next to a Diesel backend rather than
+      # trying to link a system libssl that the runtime image does not have.
+      # ubuntu-latest ships the perl and make that vendored OpenSSL needs.
+      - name: Check mssql backend
+        run: cargo check --locked --features mssql
+
       # Not a backend — `cache` sits alongside one. Turning it on with no cache
       # adapter generated is still the check that matters: it is what proves the
       # lock already pins `redis` before `kodegen add redis` needs it.

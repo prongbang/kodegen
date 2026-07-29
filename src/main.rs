@@ -165,7 +165,9 @@ fn run() -> Result<()> {
             }
             let env = cap.env();
             println!("Start it and point the app at it:");
-            println!("  docker compose -f docker-compose.dev.yml up -d");
+            for line in cap.compose_up() {
+                println!("  {line}");
+            }
             println!("  {} cargo run", env_line(env));
             // the first one is the switch: s3 needs four variables, but only the
             // bucket decides which adapter is built
@@ -222,8 +224,21 @@ fn print_plan(created: &[String], edited: &[String]) {
 
 /// The capability's env vars as one shell prefix — an S3 client with three of
 /// its four variables is not a client, so they are printed together.
+///
+/// Quoted when the value is not a bare word, because this line is printed to be
+/// pasted: `mssql`'s `DATABASE_URL` is an ADO.NET connection string whose `;`
+/// separators are statement separators to a shell, so unquoted it would run the
+/// first clause and then try to execute `user id=sa`. Single quotes, and no
+/// escaping inside them: none of these values contains one, and a value that did
+/// would be a new problem rather than a formatting one.
 fn env_line(env: &[(&str, &str)]) -> String {
-    env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
+    env.iter()
+        .map(|(k, v)| match v.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:@+".contains(c)) {
+            true => format!("{k}={v}"),
+            false => format!("{k}='{v}'"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn cache_root() -> Result<PathBuf> {
@@ -384,6 +399,43 @@ fn validate_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The printed line is meant to be pasted, and exactly one capability's
+    /// value is not a bare word: an ADO.NET connection string's `;` is a
+    /// statement separator to a shell, so unquoted it would run the first clause
+    /// and then try to execute `user id=sa`. Every other capability must come
+    /// through unquoted, or this "fix" would churn every line in the README.
+    #[test]
+    fn only_values_a_shell_would_eat_are_quoted() {
+        use capability::Capability;
+        assert_eq!(
+            env_line(Capability::Mssql.env()),
+            "DATABASE_URL='server=tcp:127.0.0.1,1433;user id=sa;password=kodeGen!2026;database=app;\
+             encrypt=true;TrustServerCertificate=true'"
+        );
+        for cap in [
+            Capability::Postgres,
+            Capability::Mysql,
+            Capability::Mongodb,
+            Capability::Redis,
+            Capability::S3,
+            Capability::Clickhouse,
+            Capability::Influxdb,
+            Capability::Greptimedb,
+        ] {
+            let line = env_line(cap.env());
+            assert!(!line.contains('\''), "{}: {line}", cap.name());
+        }
+        // and the assumption the quoting rests on: single quotes do not nest and
+        // are not escapable inside single quotes, so a value that contained one
+        // would need a different strategy rather than a wider allow-list. No
+        // value has one today; this is what notices the day one does.
+        for cap in <Capability as clap::ValueEnum>::value_variants() {
+            for (k, v) in cap.env() {
+                assert!(!v.contains('\''), "{}: {k} has a quote in it: {v}", cap.name());
+            }
+        }
+    }
 
     #[test]
     fn applies_placeholder_and_source_name() {

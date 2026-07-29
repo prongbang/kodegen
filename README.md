@@ -7,7 +7,7 @@ switching their infrastructure capabilities.
 |---|---|
 | `kodegen new <name>` | Generate a project from a template |
 | `kodegen feature <name>` | Scaffold one feature across every layer and wire it up |
-| `kodegen add <capability>` | Add infrastructure: a datastore (postgres/mysql/mariadb/timescaledb/mongodb), a cache (redis), object storage (s3) or an event sink (clickhouse/influxdb/greptimedb) |
+| `kodegen add <capability>` | Add infrastructure: a datastore (postgres/mysql/mariadb/timescaledb/mongodb/mssql), a cache (redis), object storage (s3) or an event sink (clickhouse/influxdb/greptimedb) |
 | `kodegen list` | List built-in and cached templates |
 | `kodegen update <template>` | Re-clone a cached remote template |
 
@@ -105,6 +105,7 @@ kodegen add mysql                        # Diesel + MySQL
 kodegen add mariadb                      # same driver as mysql, MariaDB image + docs
 kodegen add timescaledb                  # same driver as postgres, + a hypertable migration
 kodegen add mongodb                      # the same UserRepository, on the Mongo driver
+kodegen add mssql                        # SQL Server / Azure SQL, raw SQL over tiberius (no ORM)
 kodegen add redis                        # a Cache port + a Redis adapter (Valkey too)
 kodegen add s3                           # a BlobStore port + an S3 adapter (RustFS/MinIO/AWS)
 kodegen add clickhouse                   # an EventSink port + a ClickHouse adapter
@@ -126,6 +127,7 @@ kodegen new svc --with postgres,redis --orm seaorm
 | `mariadb` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
 | `timescaledb` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` |
 | `mongodb` | datastore | the existing `UserRepository` | in-memory repo | `MONGODB_URL` (+ `MONGODB_DB`) |
+| `mssql` | datastore | the existing `UserRepository` | in-memory repo | `DATABASE_URL` (an ADO.NET string, not a URL) |
 | `redis` | — (additive) | **`Cache`** (new) | in-memory cache | `REDIS_URL` |
 | `s3` | — (additive) | **`BlobStore`** (new) | files under `./data/blobs` | `S3_BUCKET` (+ endpoint/credentials) |
 | `clickhouse` | event sink | **`EventSink`** (new) | the tracing log | `CLICKHOUSE_URL` (+ `_DB`/`_USER`/`_PASSWORD`) |
@@ -134,10 +136,12 @@ kodegen new svc --with postgres,redis --orm seaorm
 
 The four relational rows take `--orm diesel` (default) or `--orm seaorm`; the ORM
 changes the adapter and the cargo feature, never the port or `DATABASE_URL` (see
-[`--orm seaorm`](#--orm-seaorm)).
+[`--orm seaorm`](#--orm-seaorm)). `mssql` is relational too and takes neither —
+there is no open-source ORM for SQL Server, so `--orm` on it is an error that
+says why (see [`add mssql`](#add-mssql)).
 
 A **slot** holds exactly one adapter, so the capabilities in it are alternatives:
-the four relational backends and `mongodb` are all adapters of the same
+the four relational backends, `mongodb` and `mssql` are all adapters of the same
 `UserRepository`, and `clickhouse`/`influxdb`/`greptimedb` are all adapters of
 the same `EventSink`. `--with` rejects a second occupant of either slot before
 `new` writes anything. Everything else combines freely — one datastore, one event sink,
@@ -373,6 +377,119 @@ Four things follow from the driver, not from taste:
   first.
 - **Leaving `MONGODB_URL` unset** selects the in-memory adapter, exactly as an
   unset `DATABASE_URL` does. `cargo test` stays green with no server.
+
+#### `add mssql`
+
+The datastore slot a third time, and the only capability here with no ORM behind
+it at all. Structurally it is `--orm seaorm`: two new files, three swapped
+`bootstrap.rs` blocks, a handle called `Db`, a schema applied at startup, nothing
+overwritten. What is different is that the SQL is text you can read, and that the
+`Dockerfile` is touched.
+
+```
+Cargo.toml                              default = ["sqlite"] -> ["mssql"]
+src/infrastructure/mssql_db.rs          the Db handle, the pool, the startup schema
+src/infrastructure/mssql_repo.rs        the UserRepository adapter (MERGE + SELECT)
+src/infrastructure/mod.rs               two cfg-gated `pub mod` lines appended
+src/bootstrap.rs                        the same three blocks `add mongodb` swaps
+Dockerfile                              perl/make for vendored OpenSSL, + ENV SSL_CERT_FILE
+docker-compose.dev.yml                  a SQL Server 2022 service **and** an init service
+```
+
+```bash
+docker compose -f docker-compose.dev.yml up -d --wait mssql
+docker compose -f docker-compose.dev.yml run --rm mssql-init
+DATABASE_URL='server=tcp:127.0.0.1,1433;user id=sa;password=kodeGen!2026;database=app;encrypt=true;TrustServerCertificate=true' cargo run
+```
+
+**Read this before you choose it.** It is the thinnest capability in the list,
+and the three facts below are the whole of why:
+
+- tiberius 0.12.3 was released in **July 2024** and has had no release since. It
+  is also the only usable TDS implementation in Rust, and there is no ORM on
+  either side of it — diesel#2201 has been open since 2019, and SeaORM's SQL
+  Server backend lives in the commercial SeaORM X. So this capability writes raw
+  SQL, and it is the one capability with no second driver to fall back to.
+- It is watched rather than assumed: `cargo audit` runs over the template's lock
+  in this repo's CI on every change, and every generated project ships the same
+  job.
+- **The withdrawal trigger is stated in advance.** A RUSTSEC advisory on tiberius
+  itself, or on a dependency it pins that a lock bump cannot move off, deprecates
+  this capability in the next release. It does not get an `ignore` entry in
+  `.cargo/audit.toml` — that file is for advisories whose unreachability has been
+  demonstrated in source, which is not the same thing as an advisory nobody can
+  fix.
+
+`DATABASE_URL` keeps its name, because it is the same slot's switch. Its *value*
+is an **ADO.NET connection string**, not a URL — that is the shape SSMS, the
+Azure portal and Microsoft's own documentation print, and the only shape
+`tiberius::Config::from_ado_string` parses. A `postgres://…` left over from
+another backend fails to parse on the first request rather than quietly doing
+something else.
+
+Six things follow from the backend rather than from taste:
+
+- **No `CREATE TABLE IF NOT EXISTS`.** SQL Server does not have it, in 2022 or in
+  2025, so the startup DDL is
+  `IF OBJECT_ID(N'dbo.users', N'U') IS NULL CREATE TABLE …`. Copying the spelling
+  from any other adapter in this repo is a *runtime* syntax error. The columns are
+  `NVARCHAR`, never `VARCHAR`: tiberius sends every Rust string as `NVARCHAR`, and
+  against a `VARCHAR` key each lookup becomes an implicit conversion that turns an
+  index seek into a scan — with nothing to warn you.
+- **`save` is `MERGE … WITH (HOLDLOCK)`.** One statement, so it is atomic in
+  autocommit with no transaction to manage. `HOLDLOCK` is not optional: without
+  it two concurrent merges on one key can both take the NOT MATCHED branch, which
+  fails no test and only appears under a real concurrent writer. Neither is the
+  trailing `;`, which `MERGE` requires.
+  **When to stop using it:** the known bugs in `MERGE` all need something this
+  two-column table does not have — a trigger, a foreign key pointing at `users`,
+  a filtered index, an `OUTPUT $action`, or a view as the target. Add any of those
+  and re-evaluate; the replacement is `UPDATE` then `INSERT` on `@@ROWCOUNT = 0`
+  inside an explicit `BEGIN TRAN`/`COMMIT` with `SET XACT_ABORT ON` — and it is
+  only correct *with* that transaction, because in autocommit the `UPDATE`'s range
+  lock is released before the `INSERT` runs. That comment lives next to the
+  constant too.
+- **The database is created by a compose service, not by the app.** This image has
+  no `POSTGRES_DB` equivalent — it boots with master/tempdb/model/msdb — so
+  `mssql-init` runs `IF DB_ID('app') IS NULL CREATE DATABASE app` once. A real
+  deployment does the same in its deployment step: an application role is almost
+  never granted `CREATE DATABASE`. Skip it and the first request answers 500 with
+  SQL Server's own words in the log ("Cannot open database 'app' requested by the
+  login"), which is deliberate — the pool is built with one idle connection and
+  connection retries off, so that message arrives immediately instead of behind a
+  30-second pool timeout.
+- **`docker compose up -d --wait` over the whole file exits 1**, even when
+  everything worked: `mssql-init` exits 0 and `--wait` reads a container that is
+  no longer running as a failed dependency. Hence the two commands above, which is
+  also what CI runs.
+- **`ENV SSL_CERT_FILE` in the Dockerfile is load-bearing.** `native-tls` means
+  `openssl-sys`, and the distroless/cc runtime image has no libssl, so it is
+  linked statically (`vendored`) — which compiles in an `OPENSSLDIR` pointing at a
+  build directory that does not exist at runtime. Without that variable the binary
+  cannot verify any certificate, and the first thing to notice is a deployment
+  failing to reach Azure SQL, because dev and CI connect with
+  `TrustServerCertificate=true` and never validate anything. CI asserts the CA
+  bundle is in the built image on every run. `TrustServerCertificate=true` is for
+  the dev container only — drop it in production and use a real CA.
+- **Two host caveats.** There is no arm64 image (the manifest is amd64 only and
+  Microsoft does not support emulating it), so the compose service pins
+  `platform: linux/amd64` and is slow on Apple Silicon. And on a **macOS host** the
+  app cannot reach that container at all with `TrustServerCertificate=true`:
+  `native-tls` is Apple's Secure Transport there, tiberius's trust-everything path
+  also turns SNI off, and Secure Transport refuses — you get
+  `Tls("connection closed via error")`. Ordinary certificate validation works on
+  macOS, and the whole path works on Linux, which is what the runtime image and CI
+  are. On a Mac, run the service in a container, or use `encrypt=DANGER_PLAINTEXT`
+  against your own local container only.
+
+Why not `tiberius/rustls`, given that everything else here is rustls? Because it
+pins `tokio-rustls 0.24` → **rustls 0.21**, a major version behind the rest of the
+graph and from before rustls had a provider system, so `ring` comes back into a
+build that got rid of it and the binary carries two TLS stacks. And `cargo audit`
+on that lock is not clean: `rustls-webpki 0.101.7` carries three advisories that
+sit squarely in **certificate validation** — the code path every TLS connection
+runs — with the fix in a major version tiberius cannot reach. That is not an
+advisory anyone can honestly ignore, so the answer was to not take the dependency.
 
 #### `add redis`
 
