@@ -48,8 +48,12 @@ no slot and sit alongside anything. Usage and per-capability details are in
 From GitHub:
 
 ```bash
-cargo install --git https://github.com/prongbang/kodegen
+cargo install --git https://github.com/prongbang/kodegen kodegen
 ```
+
+The trailing `kodegen` names the package to install — the repo also ships
+`templates/hexagonal`, a full Rust package with its own binary, so cargo needs
+to be told which one you want.
 
 From source:
 
