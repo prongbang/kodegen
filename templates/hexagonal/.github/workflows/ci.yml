@@ -91,6 +91,14 @@ jobs:
       - name: Check timeseries feature
         run: cargo check --locked --features timeseries
 
+      # Not a backend either, and no slot — `apidocs` is `kodegen add scalar`'s
+      # switch. Turning it on with no `openapi.rs` generated yet still proves
+      # the lock already pins `utoipa`/`utoipa-scalar` with `--locked`, and that
+      # every `cfg_attr(feature = "apidocs", ...)` line `kodegen feature` writes
+      # unconditionally actually compiles once the feature is real.
+      - name: Check apidocs feature
+        run: cargo check --locked --features apidocs
+
   # Separate job: an advisory landing in RustSec is not a reason to hold up the
   # fmt/clippy/test signal, and vice versa. cargo-audit is run directly rather
   # than via rustsec/audit-check, which needs a write-scoped token to publish a

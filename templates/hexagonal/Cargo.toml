@@ -165,6 +165,16 @@ hyper-util = { version = "0.1", default-features = false, features = [
     "tokio",
 ], optional = true }
 http-body-util = { version = "0.1", optional = true }
+# OpenAPI, and the one capability with no server behind it: the spec is derived
+# from the handlers themselves (`#[utoipa::path]`), not hand-maintained JSON, so
+# it cannot drift the way a static file would the moment a feature adds a route.
+# Default features only (`macros`) — the schema collector is recursive over
+# `paths(...)`, so `components(schemas(...))` needs no template of its own.
+utoipa = { version = "5.5.0", optional = true }
+# `axum` is what brings `Scalar::with_url` and the `Servable` trait `add scalar`
+# calls into a `Router`; the two other frameworks it supports are not this
+# template's problem.
+utoipa-scalar = { version = "0.3.0", features = ["axum"], optional = true }
 
 # Which backend C driver gets compiled and linked. Optional dependencies are all
 # pinned in Cargo.lock whether or not their feature is on, so flipping `default`
@@ -234,6 +244,12 @@ blob = ["dep:aws-sdk-s3", "tokio/fs"]
 mssql = ["dep:tiberius", "dep:bb8", "dep:bb8-tiberius", "dep:openssl-sys", "tokio/sync"]
 analytics = ["dep:clickhouse", "tokio/sync"]
 timeseries = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+# Not a backend either, and no slot: `GET /docs` (Scalar) + `GET /openapi.json`,
+# generated from whichever handlers `kodegen feature`/`kodegen add scalar`
+# annotated with `#[cfg_attr(feature = "apidocs", utoipa::path(...))]`. With this
+# off, every one of those attributes disappears and neither crate below is even
+# compiled — that is the production kill switch (see the README).
+apidocs = ["dep:utoipa", "dep:utoipa-scalar"]
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

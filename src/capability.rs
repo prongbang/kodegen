@@ -30,6 +30,15 @@
 //!   and two different variables, the way `mariadb` is `mysql` — one adapter, one
 //!   cargo feature.) Everything else about them is additive, so any of them sits
 //!   next to any datastore, the cache and the blob store.
+//! - **scalar** (`add_scalar`) adds no port at all: `GET /docs` and
+//!   `GET /openapi.json` are a route, not an adapter behind a trait, so there is
+//!   nothing for a composition root to build and nothing to refuse a second
+//!   occupant of. What it does add is a `#[cfg_attr(feature = "apidocs", ...)]`
+//!   above every handler and DTO the template ships, plus one new file
+//!   (`src/api/openapi.rs`) whose `paths(...)` list names them. `kodegen feature`
+//!   carries the same attributes on every handler it scaffolds regardless of
+//!   whether this capability is on, which is what lets the two commands run in
+//!   either order — see the comment on `add_scalar`.
 //!
 //! `Slot` is what makes "these exclude each other" one rule rather than one per
 //! pair: a capability names the slot it fills, the slot names the cargo features
@@ -56,6 +65,7 @@ pub enum Capability {
     Clickhouse,
     Influxdb,
     Greptimedb,
+    Scalar,
 }
 
 /// Which ORM a relational capability is built on. Orthogonal to `Capability`
@@ -105,6 +115,13 @@ enum Kind {
     Cache,
     Blob,
     Events(EventBackend),
+    /// `GET /docs` + `GET /openapi.json`. No slot for the same reason `Cache`
+    /// and `Blob` have none — see the `slot()` doc — but it is not a third
+    /// example of the same shape: it has no port, no trait, no adapter the
+    /// composition root builds, so it needs no env either (`env()` returns
+    /// `&[]`, which is what `main.rs` has to not index into — see the
+    /// `env[0]` fix next to `Cmd::Add`).
+    ApiDocs,
 }
 
 impl Kind {
@@ -118,7 +135,7 @@ impl Kind {
         match self {
             Kind::Relational(_) | Kind::Document | Kind::Mssql => Some(Slot::Datastore),
             Kind::Events(_) => Some(Slot::Events),
-            Kind::Cache | Kind::Blob => None,
+            Kind::Cache | Kind::Blob | Kind::ApiDocs => None,
         }
     }
 }
@@ -271,6 +288,19 @@ const FS_BLOBS: &str = "src/infrastructure/fs_blobs.rs";
 const S3_BLOBS: &str = "src/infrastructure/s3_blobs.rs";
 const BLOB_TEST: &str = "tests/blob.rs";
 
+const API_MOD: &str = "src/api/mod.rs";
+const USER_API: &str = "src/api/user.rs";
+const HELLO_API: &str = "src/api/hello.rs";
+const DOMAIN_MODEL: &str = "src/domain/model.rs";
+const OPENAPI_RS: &str = "src/api/openapi.rs";
+const APIDOCS_TEST: &str = "tests/apidocs.rs";
+/// Where a REST `kodegen feature` inserts its own two paths (`add_feature` in
+/// scaffold.rs), and the line `OPENAPI_TPL` seeds `openapi.rs` with so there is
+/// always somewhere to insert them. One real constant rather than the same
+/// string literal in two files, so a typo in either place is a compile error
+/// instead of a silently-missed anchor.
+pub(crate) const OPENAPI_PATHS_MARKER: &str = "// kodegen:openapi:paths";
+
 const LOG_EVENTS: &str = "src/infrastructure/log_events.rs";
 const CLICKHOUSE_EVENTS: &str = "src/infrastructure/clickhouse_events.rs";
 const LINE_PROTOCOL_EVENTS: &str = "src/infrastructure/line_protocol_events.rs";
@@ -346,6 +376,7 @@ impl Capability {
             Capability::Clickhouse => "clickhouse",
             Capability::Influxdb => "influxdb",
             Capability::Greptimedb => "greptimedb",
+            Capability::Scalar => "scalar",
         }
     }
 
@@ -373,6 +404,7 @@ impl Capability {
             // what differs is the image and the two variables (see the README),
             // exactly the relationship mariadb has with mysql
             Capability::Greptimedb => Kind::Events(EventBackend::Greptimedb),
+            Capability::Scalar => Kind::ApiDocs,
         }
     }
 
@@ -407,6 +439,10 @@ impl Capability {
             // capability is object storage, not the vendor
             Kind::Blob => "blob",
             Kind::Events(backend) => backend.feature(),
+            // the compile-time kill switch: off, `cfg_attr(feature = "apidocs",
+            // ...)` disappears from every handler `kodegen feature` writes and
+            // neither utoipa crate is even compiled — see the README
+            Kind::ApiDocs => "apidocs",
         }
     }
 
@@ -444,6 +480,11 @@ impl Capability {
             Kind::Cache => &[("REDIS_URL", REDIS_URL)],
             Kind::Blob => S3_ENV,
             Kind::Events(backend) => backend.env(),
+            // no server, so no switch: `/docs` and `/openapi.json` are on
+            // whenever `apidocs` is compiled in, which `main.rs` has to treat
+            // as "nothing to print an env line or a compose_up for" rather
+            // than index `env[0]` into a panic
+            Kind::ApiDocs => &[],
         }
     }
 }
@@ -736,6 +777,10 @@ pub fn list(project: &Path) -> Result<()> {
     println!("  clickhouse   event sink — the `EventSink` port + a ClickHouse adapter");
     println!("  influxdb     event sink — the `EventSink` port + a line-protocol adapter (InfluxDB v2/v3)");
     println!("  greptimedb   event sink — the same line-protocol adapter, GreptimeDB image + docs");
+    println!(
+        "  scalar       API docs — GET /docs (Scalar) + GET /openapi.json, derived from the code \
+         (no --orm, no slot, sits next to anything)"
+    );
     println!();
     println!(
         "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb, mssql) and one event \
@@ -805,7 +850,7 @@ fn check_orm(cap: Capability, orm: Option<Orm>) -> Result<()> {
              That is the trade — see `kodegen add --list`."
                 .into(),
         ),
-        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) => Err(format!(
+        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs => Err(format!(
             "--orm applies only to relational capabilities (postgres, mysql, mariadb, timescaledb) \
              — '{}' has no ORM",
             cap.name()
@@ -919,6 +964,7 @@ pub fn add(
         (Kind::Cache, _) => add_redis(project, dry_run),
         (Kind::Blob, _) => add_s3(project, dry_run),
         (Kind::Events(backend), _) => add_event_sink(project, backend, dry_run),
+        (Kind::ApiDocs, _) => add_scalar(project, dry_run),
     }
 }
 
@@ -1878,6 +1924,256 @@ fn add_event_sink(
     }
     Ok((paths(&creates), paths(&edits)))
 }
+
+/// `kodegen add scalar` — no port, no adapter, no slot (see `Kind::ApiDocs`), so
+/// there is nothing here for a second `add` to conflict with and nothing to
+/// refuse: this is `insert_before_line` over five files that already exist,
+/// plus one new one.
+///
+/// Four handlers are annotated unconditionally, because they ship with the
+/// template regardless of whether this capability is ever added:
+/// `health`/`ErrorRes` in `api/mod.rs`, `create_user`/`get_user`/`CreateUserReq`
+/// in `api/user.rs`, `say_hello` in `api/hello.rs`, and `User` in
+/// `domain/model.rs`. Anything `kodegen feature` scaffolded *before* this ran is
+/// picked up the same way `kodegen feature` itself would recognize it later —
+/// `scanned_openapi_paths` finds the `#[cfg_attr(feature = "apidocs",
+/// utoipa::path(...))]` that template already carries (see `API_TPL`) and lists
+/// it in `paths(...)` here. A feature scaffolded *after* this runs takes the
+/// other path: `scaffold::add_feature` sees `src/api/openapi.rs` on disk and
+/// inserts its two paths above `OPENAPI_PATHS_MARKER`, which this leaves behind
+/// for exactly that.
+fn add_scalar(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(project, &[API_MOD, USER_API, HELLO_API, DOMAIN_MODEL])?;
+    let crate_name = crate::package_name(project)
+        .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
+        .replace('-', "_");
+
+    let creates = vec![
+        (
+            OPENAPI_RS.to_string(),
+            OPENAPI_TPL
+                .replace("{{extra_paths}}", &scanned_openapi_paths(project)?)
+                .replace("{{marker}}", OPENAPI_PATHS_MARKER),
+        ),
+        (APIDOCS_TEST.to_string(), APIDOCS_TEST_TPL.replace("{{crate_name}}", &crate_name)),
+    ];
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(format!("{rel} already exists — remove it first, or keep the one you have").into());
+    }
+
+    let edits = vec![
+        // one list of feature names, never [dependencies] — the two utoipa
+        // crates are already in the template's Cargo.toml behind `optional =
+        // true`, pinned in Cargo.lock whether or not this feature is on
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "apidocs", None))?,
+        edit(project, API_MOD, |c| {
+            let c = insert_pub_mod(&c, "openapi")?;
+            let c = insert_before_line(&c, ".with_state(services)", "        .merge(openapi::routes())")?;
+            let c = insert_before_line(&c, "pub struct ErrorRes {", TO_SCHEMA_ATTR)?;
+            insert_before_line(&c, "async fn health() -> &'static str {", HEALTH_PATH_ATTR)
+        })?,
+        edit(project, USER_API, |c| {
+            let c = insert_before_line(&c, "pub struct CreateUserReq {", TO_SCHEMA_ATTR)?;
+            let c = insert_before_line(&c, "pub async fn create_user(", CREATE_USER_PATH_ATTR)?;
+            insert_before_line(&c, "pub async fn get_user(", GET_USER_PATH_ATTR)
+        })?,
+        edit(project, HELLO_API, |c| {
+            insert_before_line(&c, "pub async fn say_hello(", SAY_HELLO_PATH_ATTR)
+        })?,
+        edit(project, DOMAIN_MODEL, |c| insert_before_line(&c, "pub struct User {", TO_SCHEMA_ATTR))?,
+    ];
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    // everything above is pure, so this is the only side effect
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
+/// The paths a REST `kodegen feature` already annotated before this ran — the
+/// "feature first" direction described on `add_scalar`.
+///
+/// `src/api/*.rs` minus the four files this function's caller annotates by hand
+/// (`mod.rs`, `user.rs`, `hello.rs` — already covered) and minus `*_grpc.rs`
+/// (OpenAPI does not describe gRPC, and there is no HTTP route in those files to
+/// find). What is left is exactly the REST delivery files `kodegen feature`
+/// writes, and every one of them carries `API_TPL`'s annotations unconditionally
+/// — on `apidocs` or off — so there is always something here to find once a
+/// feature has been scaffolded.
+///
+/// No `syn`: the shape being searched for is one this crate itself writes —
+/// `utoipa::path(` followed by the next `async fn <name>(` — and being exact
+/// about anything more general is not this function's job. What is annotated is
+/// what ends up in the spec, by definition: a hand-written route that skipped
+/// the attribute is documented in the README, not caught here.
+///
+/// ponytail: two known ceilings from that shape, both cheap to leave as is —
+/// - a hand-edited file where the attribute is not immediately followed by the
+///   `async fn` it was meant for (a helper function moved between them) gets
+///   the *wrong* name here, but that fails loudly: `crate::api::<module>::<wrong
+///   name>` either does not exist or has no `__path_*` for utoipa's macro to
+///   find, so it is a compile error in `openapi.rs`, not a silently wrong spec.
+/// - a REST feature whose file happens to be named `*_grpc.rs` (nobody does
+///   this; `kodegen feature --transport grpc` is what produces that suffix) is
+///   skipped along with the real gRPC files — the exclusion is by filename, not
+///   by transport, because there is nothing else here to tell them apart from.
+fn scanned_openapi_paths(project: &Path) -> Result<String> {
+    let api_dir = project.join("src/api");
+    let mut modules: Vec<String> = fs::read_dir(&api_dir)
+        .map_err(|e| format!("src/api: {e}"))?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stem = name.strip_suffix(".rs")?.to_string();
+            (!matches!(stem.as_str(), "mod" | "user" | "hello") && !stem.ends_with("_grpc")).then_some(stem)
+        })
+        .collect();
+    // read_dir order is not guaranteed; the paths this writes must be stable
+    modules.sort();
+
+    let mut out = String::new();
+    for module in modules {
+        let content = fs::read_to_string(api_dir.join(format!("{module}.rs")))
+            .map_err(|e| format!("src/api/{module}.rs: {e}"))?;
+        let mut rest = content.as_str();
+        while let Some(at) = rest.find("utoipa::path(") {
+            rest = &rest[at..];
+            let Some(fn_at) = rest.find("async fn ") else { break };
+            let name_start = fn_at + "async fn ".len();
+            let Some(paren) = rest[name_start..].find('(') else { break };
+            let name = rest[name_start..name_start + paren].trim();
+            out.push_str(&format!("    crate::api::{module}::{name},\n"));
+            rest = &rest[name_start + paren..];
+        }
+    }
+    Ok(out)
+}
+
+/// Shared by every DTO `add_scalar` annotates: a second, independent `derive`
+/// attribute is legal next to whatever the struct already has (`Serialize`,
+/// `Deserialize`, ...) — attribute order carries no meaning in Rust — and
+/// `cfg_attr` is what makes it vanish along with the `apidocs` feature rather
+/// than sit there unused.
+const TO_SCHEMA_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", derive(utoipa::ToSchema))]";
+
+const HEALTH_PATH_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", utoipa::path(\n    get, path = \"/health\", tag = \"health\",\n    responses((status = 200, description = \"ok\", body = String)),\n))]";
+
+const CREATE_USER_PATH_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", utoipa::path(\n    post, path = \"/users\", tag = \"users\",\n    request_body = CreateUserReq,\n    responses(\n        (status = 201, description = \"created\"),\n        (status = 400, description = \"validation failed\", body = ErrorRes),\n    ),\n))]";
+
+const GET_USER_PATH_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", utoipa::path(\n    get, path = \"/users/{id}\", tag = \"users\",\n    params((\"id\" = String, Path)),\n    responses(\n        (status = 200, description = \"found\", body = User),\n        (status = 404, description = \"not found\", body = ErrorRes),\n    ),\n))]";
+
+const SAY_HELLO_PATH_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", utoipa::path(\n    get, path = \"/hello/{name}\", tag = \"hello\",\n    params((\"name\" = String, Path)),\n    responses((status = 200, description = \"greeted\")),\n))]";
+
+/// The OpenAPI document + the two routes that serve it. Written once by
+/// `add_scalar`; every path after the four fixed ones is inserted above
+/// `OPENAPI_PATHS_MARKER`, either by `scanned_openapi_paths` at write time or by
+/// `scaffold::add_feature` on every `kodegen feature` that runs afterward.
+///
+/// `cfg` rather than `cfg_attr` on `ApiDoc` and inside `routes()`: with
+/// `apidocs` off, the struct and the whole derive macro invocation disappear —
+/// there is nothing partial to gate attribute-by-attribute the way a single
+/// `#[derive(...)]` line is elsewhere in this file.
+const OPENAPI_TPL: &str = r##"//! The OpenAPI document, and the two routes that serve it — written by
+//! `kodegen add scalar`. Empty with `apidocs` off, which is how a production
+//! build drops both routes (and every `utoipa`/`utoipa-scalar` line) without
+//! touching `api/mod.rs` — see the README.
+
+use axum::Router;
+
+#[cfg(feature = "apidocs")]
+#[derive(utoipa::OpenApi)]
+#[openapi(paths(
+    crate::api::health,
+    crate::api::user::create_user,
+    crate::api::user::get_user,
+    crate::api::hello::say_hello,
+{{extra_paths}}    {{marker}}
+))]
+pub struct ApiDoc;
+
+/// `GET /docs` (Scalar, needs a network for its JS — see the README) and
+/// `GET /openapi.json` (fully offline). Both empty when `apidocs` is off.
+pub fn routes() -> Router<super::Services> {
+    #[cfg(feature = "apidocs")]
+    {
+        use utoipa::OpenApi;
+        use utoipa_scalar::Servable;
+        let spec = ApiDoc::openapi();
+        let json = axum::Json(spec.clone());
+        Router::from(utoipa_scalar::Scalar::with_url("/docs", spec)).route(
+            "/openapi.json",
+            axum::routing::get(move || {
+                let json = json.clone();
+                async move { json }
+            }),
+        )
+    }
+    #[cfg(not(feature = "apidocs"))]
+    {
+        Router::new()
+    }
+}
+"##;
+
+/// The contract test, written next to `openapi.rs`. It proves the spec *that
+/// is there* is honest (parses, `/docs` answers, the routes present when this
+/// ran are listed) — it cannot prove the spec covers *every* route, because
+/// axum 0.8 has no way to list a `Router`'s routes back out to compare against
+/// `paths`. That half of the promise is proven in `kodegen`'s own test suite
+/// (`scanned_openapi_paths`, `add_feature`'s marker insert) and by CI grepping
+/// this test's own `println!` output for routes scaffolded after this ran —
+/// see `.github/workflows/ci.yml`.
+const APIDOCS_TEST_TPL: &str = r##"#![cfg(feature = "apidocs")]
+//! The OpenAPI contract — written by `kodegen add scalar`. See the doc
+//! comment on `APIDOCS_TEST_TPL` in kodegen's `capability.rs` for what this
+//! does and does not prove.
+//!
+//! Gated on the file itself, not just the routes it hits: without `apidocs`,
+//! `/docs` and `/openapi.json` are gone (see `openapi.rs`), so this whole file
+//! compiling out is what keeps "drop apidocs from default" a green build
+//! instead of a red `cargo test` — the exact case the README tells someone to
+//! do before shipping.
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+use {{crate_name}}::bootstrap;
+
+#[tokio::test]
+async fn openapi_json_parses_and_covers_the_shipped_routes() {
+    let app = bootstrap::build_router();
+    let res = app
+        .oneshot(Request::get("/openapi.json").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let paths = spec["paths"].as_object().expect("a `paths` object");
+    for known in ["/health", "/hello/{name}", "/users", "/users/{id}"] {
+        assert!(paths.contains_key(known), "missing {known} in {:?}", paths.keys().collect::<Vec<_>>());
+    }
+
+    // printed, not asserted: a fixed list here would go stale the moment a
+    // later `kodegen feature` adds a route. CI greps this output instead.
+    for path in paths.keys() {
+        println!("openapi path: {path}");
+    }
+}
+
+#[tokio::test]
+async fn docs_page_is_reachable() {
+    let app = bootstrap::build_router();
+    let res = app
+        .oneshot(Request::get("/docs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+"##;
 
 /// The file as `kodegen new` would have written it into a project called `pkg`
 /// — the embedded template with the rename applied, in the same order
@@ -5050,9 +5346,15 @@ mod tests {
     fn fixture(tag: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("kodegen-capability-{tag}"));
         let _ = fs::remove_dir_all(&root);
-        let tpl = crate::resolve_template("hexagonal").unwrap();
+        let (tpl, staging) = crate::resolve_template("hexagonal").unwrap();
         let subs = crate::substitutions(&tpl, "demo-svc");
         crate::render_tree(&tpl, &root, &subs).unwrap();
+        // this is the one call site that runs once per test rather than once
+        // per CLI invocation — leaving the staged copy behind here is exactly
+        // what turned into thousands of them (see resolve_template's doc)
+        if let Some(dir) = staging {
+            let _ = fs::remove_dir_all(&dir);
+        }
         root
     }
 
@@ -5444,6 +5746,160 @@ mod tests {
             err.contains(S3_BLOBS) && err.contains("already exists"),
             "{err}"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The Phase 2 path this capability exists to prove, `scalar`'s version: no
+    /// port and no adapter, so what `add` writes is one new file and five
+    /// `cfg_attr` insertions into files the template already ships.
+    #[test]
+    fn scalar_writes_openapi_rs_and_annotates_the_shipped_handlers() {
+        let root = fixture("scalar");
+        add(&root, Capability::Scalar, None, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"sqlite\", \"apidocs\"]"), "{toml}");
+
+        let openapi = fs::read_to_string(root.join(OPENAPI_RS)).unwrap();
+        for path in [
+            "crate::api::health",
+            "crate::api::user::create_user",
+            "crate::api::user::get_user",
+            "crate::api::hello::say_hello",
+        ] {
+            assert!(openapi.contains(path), "{openapi}");
+        }
+        assert!(openapi.contains("pub struct ApiDoc"), "{openapi}");
+        assert!(openapi.contains("Scalar::with_url"), "{openapi}");
+        assert!(openapi.contains("/openapi.json"), "{openapi}");
+
+        let api_mod = fs::read_to_string(root.join(API_MOD)).unwrap();
+        assert!(api_mod.contains("pub mod openapi;"), "{api_mod}");
+        assert!(api_mod.contains(".merge(openapi::routes())"), "{api_mod}");
+        assert!(
+            api_mod.contains("utoipa::path") && api_mod.contains("utoipa::ToSchema"),
+            "health/ErrorRes were not annotated: {api_mod}"
+        );
+
+        let user = fs::read_to_string(root.join(USER_API)).unwrap();
+        assert!(user.matches("utoipa::path").count() == 2, "{user}");
+        assert!(user.contains("utoipa::ToSchema"), "{user}");
+
+        let hello = fs::read_to_string(root.join(HELLO_API)).unwrap();
+        assert!(hello.contains("utoipa::path"), "{hello}");
+
+        let model = fs::read_to_string(root.join(DOMAIN_MODEL)).unwrap();
+        assert!(model.contains("utoipa::ToSchema"), "{model}");
+
+        let test = fs::read_to_string(root.join(APIDOCS_TEST)).unwrap();
+        assert!(test.contains("demo_svc::bootstrap"), "the contract test must import the project's own crate: {test}");
+        assert!(test.contains("/openapi.json") && test.contains("/docs"), "{test}");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn adding_scalar_twice_fails() {
+        let root = fixture("scalar-twice");
+        add(&root, Capability::Scalar, None, false).unwrap();
+        let err = add(&root, Capability::Scalar, None, true).unwrap_err().to_string();
+        assert!(err.contains("capability 'scalar' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn scalar_dry_run_writes_nothing_but_plans_the_same_change() {
+        let root = fixture("scalar-dry");
+        let before = snapshot(&root);
+        let planned = add(&root, Capability::Scalar, None, true).unwrap();
+        assert_eq!(before, snapshot(&root), "dry run touched the tree");
+        assert_eq!(planned, add(&root, Capability::Scalar, None, false).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// No port, no slot: `scalar` refuses no one and no one refuses it.
+    #[test]
+    fn scalar_coexists_with_a_backend_a_cache_and_an_event_sink() {
+        let root = fixture("scalar-coexist");
+        add(&root, Capability::Postgres, None, false).unwrap();
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::Clickhouse, None, false).unwrap();
+        add(&root, Capability::Scalar, None, false).unwrap();
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(
+            toml.contains("default = [\"postgres\", \"cache\", \"analytics\", \"apidocs\"]"),
+            "{toml}"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `--orm` means nothing to a capability with no ORM to choose, and `scalar`
+    /// is one of them — same rule `redis`/`s3`/the event sinks already prove,
+    /// pinned here so the arm that added `Kind::ApiDocs` to `check_orm` cannot
+    /// quietly become a no-op.
+    #[test]
+    fn scalar_refuses_an_orm_flag() {
+        let root = fixture("scalar-orm");
+        let err = add(&root, Capability::Scalar, Some(Orm::Diesel), true).unwrap_err().to_string();
+        assert!(err.contains("no ORM"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Direction 1 of the module doc: `kodegen feature order` first, so its
+    /// handlers are already annotated by the time `add scalar` scans for them.
+    #[test]
+    fn feature_before_scalar_is_found_by_the_scanner() {
+        let root = fixture("feature-then-scalar");
+        crate::scaffold::add_feature(&root, "order", crate::scaffold::Transport::Rest, false).unwrap();
+        add(&root, Capability::Scalar, None, false).unwrap();
+        let openapi = fs::read_to_string(root.join(OPENAPI_RS)).unwrap();
+        assert!(openapi.contains("crate::api::order::create_order"), "{openapi}");
+        assert!(openapi.contains("crate::api::order::get_order"), "{openapi}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Direction 2: `add scalar` first, so `openapi.rs` does not exist yet when
+    /// the scanner would have looked — `kodegen feature` has to notice the file
+    /// afterward instead, which is `add_feature`'s `is_file()` check.
+    #[test]
+    fn scalar_before_feature_gets_its_paths_inserted_afterward() {
+        let root = fixture("scalar-then-feature");
+        add(&root, Capability::Scalar, None, false).unwrap();
+        crate::scaffold::add_feature(&root, "order", crate::scaffold::Transport::Rest, false).unwrap();
+        let openapi = fs::read_to_string(root.join(OPENAPI_RS)).unwrap();
+        assert!(openapi.contains("crate::api::order::create_order"), "{openapi}");
+        assert!(openapi.contains("crate::api::order::get_order"), "{openapi}");
+        // the marker must survive so a *third* feature still has somewhere to land
+        assert!(openapi.contains("// kodegen:openapi:paths"), "{openapi}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `kodegen feature <name> --transport grpc` still annotates nothing OpenAPI
+    /// can use (no HTTP route), so `add_feature` must not touch `openapi.rs` for
+    /// it and the scanner must not walk into `*_grpc.rs` looking for a route
+    /// that is not there.
+    #[test]
+    fn grpc_features_are_invisible_to_the_spec() {
+        let root = fixture("scalar-grpc");
+        crate::scaffold::add_feature(&root, "billing", crate::scaffold::Transport::Grpc, false).unwrap();
+        add(&root, Capability::Scalar, None, false).unwrap();
+        let openapi = fs::read_to_string(root.join(OPENAPI_RS)).unwrap();
+        assert!(!openapi.contains("billing"), "{openapi}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A project with no `kodegen add scalar` on it still scaffolds features
+    /// that carry the `cfg_attr` annotations — they simply have no `apidocs`
+    /// feature to turn on, which `cfg_attr` on an undeclared feature treats as
+    /// off rather than an error (proven for real, not just asserted here, by
+    /// `cargo build` in the verification pass over a generated project).
+    #[test]
+    fn feature_annotates_even_without_scalar_on_the_project() {
+        let root = fixture("feature-no-scalar");
+        crate::scaffold::add_feature(&root, "order", crate::scaffold::Transport::Rest, false).unwrap();
+        let api = fs::read_to_string(root.join("src/api/order.rs")).unwrap();
+        assert!(api.contains("cfg_attr(feature = \"apidocs\""), "{api}");
+        assert!(!root.join(OPENAPI_RS).exists(), "no openapi.rs without add scalar");
         fs::remove_dir_all(&root).unwrap();
     }
 

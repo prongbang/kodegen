@@ -122,9 +122,16 @@ fn run() -> Result<()> {
             if dest.exists() {
                 return Err(format!("{} already exists", dest.display()).into());
             }
-            let tpl_dir = resolve_template(&template)?;
+            let (tpl_dir, staging) = resolve_template(&template)?;
             let subs = substitutions(&tpl_dir, &name);
-            render_tree(&tpl_dir, &dest, &subs)?;
+            let rendered = render_tree(&tpl_dir, &dest, &subs);
+            // clean up regardless of outcome: a staged copy is ours the moment
+            // resolve_template hands it back, and `dest` (not `tpl_dir`) is what
+            // every line below this actually needs
+            if let Some(root) = staging {
+                let _ = fs::remove_dir_all(&root);
+            }
+            rendered?;
             println!("Created {} from template '{template}'", dest.display());
             // --with is a loop over the same `add`, not a second code path, so
             // there is nothing here for `kodegen add` to drift away from
@@ -163,15 +170,9 @@ fn run() -> Result<()> {
             if dry_run {
                 return Ok(());
             }
-            let env = cap.env();
-            println!("Start it and point the app at it:");
-            for line in cap.compose_up() {
-                println!("  {line}");
+            for line in add_epilogue(cap) {
+                println!("{line}");
             }
-            println!("  {} cargo run", env_line(env));
-            // the first one is the switch: s3 needs four variables, but only the
-            // bucket decides which adapter is built
-            println!("Leave {} unset for the default adapter, as before.", env[0].0);
         }
         Cmd::Update { template } => {
             let (_, cached) = remote_target(&template)?;
@@ -182,7 +183,11 @@ fn run() -> Result<()> {
                     return Err(format!("cannot remove cached {}: {e}", cached.display()).into());
                 }
             }
-            resolve_template(&template)?;
+            // built-in and local paths were already refused by `remote_target`
+            // above, so this is always the clone branch and never stages
+            // anything — the destructure just keeps the type honest
+            let (_, staging) = resolve_template(&template)?;
+            debug_assert!(staging.is_none(), "update never resolves a built-in template");
             println!("Updated {}", cached.display());
         }
         Cmd::Feature { name, transport, path, dry_run } => {
@@ -222,6 +227,31 @@ fn print_plan(created: &[String], edited: &[String]) {
     }
 }
 
+/// Lines printed after a real (non-dry-run) `add`. Split out from `run()` so it
+/// can be pinned by a test: `scalar` is the first capability whose `env()` is
+/// empty (`Kind::ApiDocs` — no server, so no switch), and `env[0].0` indexed
+/// straight into that slice used to panic on it. A capability with something to
+/// start still gets the compose command and the one-line `unset` reminder; one
+/// that has nothing to start gets a plain `cargo run`, not a boot command for a
+/// service that was never written.
+fn add_epilogue(cap: capability::Capability) -> Vec<String> {
+    let env = cap.env();
+    if env.is_empty() {
+        return vec![
+            "cargo run".to_string(),
+            "Open http://localhost:8080/docs — the spec itself is at /openapi.json.".to_string(),
+            "Drop \"apidocs\" from default = [...] in Cargo.toml before you ship if you don't want either public.".to_string(),
+        ];
+    }
+    let mut lines = vec!["Start it and point the app at it:".to_string()];
+    lines.extend(cap.compose_up().iter().map(|l| format!("  {l}")));
+    lines.push(format!("  {} cargo run", env_line(env)));
+    // the first one is the switch: s3 needs four variables, but only the
+    // bucket decides which adapter is built
+    lines.push(format!("Leave {} unset for the default adapter, as before.", env[0].0));
+    lines
+}
+
 /// The capability's env vars as one shell prefix — an S3 client with three of
 /// its four variables is not a client, so they are printed together.
 ///
@@ -249,37 +279,50 @@ fn cache_root() -> Result<PathBuf> {
 /// Built-in name -> extract the embedded copy to a temp dir. Local path -> use
 /// as-is. Otherwise clone into ~/.kodegen/templates/<name> on first use
 /// (owner/repo shorthand or full git URL).
-fn resolve_template(template: &str) -> Result<PathBuf> {
+///
+/// The second element is `Some(dir)` only for the embedded/staged case — the
+/// one path of the three the caller made and is the only one allowed to
+/// delete once it is done reading. A local path is the user's own directory
+/// and a cache entry under `~/.kodegen/templates` is meant to outlive this
+/// call, so returning "the thing to clean up" explicitly (rather than having
+/// every caller guess from the shape of the path) is what keeps a future
+/// caller from ever deleting either by mistake.
+fn resolve_template(template: &str) -> Result<(PathBuf, Option<PathBuf>)> {
     if let Some(embedded) = TEMPLATES.get_dir(template) {
         // A fresh directory per call. The staging tree is written and then read,
         // so a fixed path means one caller deleting or re-extracting what another
         // is still reading — two `kodegen new`s in a script, or this binary's own
         // parallel tests. pid + counter also makes the path unguessable, so
         // nothing in a world-writable /tmp can pre-create it as a symlink.
-        // ponytail: one directory per call is left in /tmp for the OS to reap;
-        // reach for a tempdir crate with a Drop guard only if that ever matters.
+        //
+        // The caller removes `root` once it has read `staged` (see `Cmd::New`
+        // and `fixture()` in capability.rs) — this function cannot do it itself,
+        // because the path has to stay alive until whoever asked for it is
+        // actually done with it.
+        // ponytail: still not a tempdir crate with a Drop guard — an early
+        // return before cleanup (a `?` between here and the caller's cleanup)
+        // leaks one directory, same ceiling as before, just a much smaller one.
         static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let staged = std::env::temp_dir()
-            .join(format!(
-                "kodegen-{}-{}",
-                std::process::id(),
-                NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ))
-            .join(template);
+        let root = std::env::temp_dir().join(format!(
+            "kodegen-{}-{}",
+            std::process::id(),
+            NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let staged = root.join(template);
         fs::create_dir_all(&staged)?;
         // include_dir extracts relative to its root, so extract from the parent
-        embedded.extract(staged.parent().unwrap())?;
-        return Ok(staged);
+        embedded.extract(&root)?;
+        return Ok((staged, Some(root)));
     }
 
     let as_path = Path::new(template);
     if as_path.is_dir() {
-        return Ok(as_path.to_path_buf());
+        return Ok((as_path.to_path_buf(), None));
     }
 
     let (url, cached) = remote_target(template)?;
     if cached.is_dir() {
-        return Ok(cached);
+        return Ok((cached, None));
     }
 
     fs::create_dir_all(cached.parent().unwrap())?;
@@ -294,7 +337,7 @@ fn resolve_template(template: &str) -> Result<PathBuf> {
         return Err(format!("git clone failed for {url}").into());
     }
     let _ = fs::remove_dir_all(cached.join(".git"));
-    Ok(cached)
+    Ok((cached, None))
 }
 
 /// Clone URL + cache directory for a remote template. Built-in names and local
@@ -458,6 +501,32 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The bug the 52GB of `/tmp/kodegen-*` staging dirs came from: every
+    /// caller of `resolve_template` has to know which of the three return
+    /// shapes is safe to `remove_dir_all`. Pinned directly on the function
+    /// rather than through `Cmd::New`, which needs a full `Cli` to drive.
+    #[test]
+    fn resolve_template_reports_staging_only_for_the_embedded_case() {
+        // a local path is the caller's own directory: never staged, never
+        // reported as ours to delete
+        let local = std::env::temp_dir().join("kodegen-resolve-local-test");
+        fs::create_dir_all(&local).unwrap();
+        let (path, staging) = resolve_template(local.to_str().unwrap()).unwrap();
+        assert_eq!(path, local);
+        assert!(staging.is_none(), "a local path must never be reported as ours to delete");
+        assert!(local.is_dir(), "resolve_template must not touch a local path");
+        fs::remove_dir_all(&local).unwrap();
+
+        // the embedded case is the one this function actually creates, and the
+        // one whose staging root the caller can safely remove once it is read
+        let (staged, staging) = resolve_template("hexagonal").unwrap();
+        assert!(staged.is_dir());
+        let root = staging.expect("the embedded case must report its staging root");
+        assert!(staged.starts_with(&root), "staged path must live under its own reported root");
+        fs::remove_dir_all(&root).unwrap();
+        assert!(!root.exists());
+    }
+
     #[test]
     fn embedded_hexagonal_template_exists() {
         let toml = TEMPLATES.get_file("hexagonal/Cargo.toml").unwrap().contents_utf8().unwrap();
@@ -483,6 +552,23 @@ mod tests {
         }
         let toml = TEMPLATES.get_file("hexagonal/Cargo.toml").unwrap().contents_utf8().unwrap();
         assert!(toml.contains("default = ["), "template lost the [features] default anchor");
+    }
+
+    /// The bug the `Cmd::Add` epilogue used to have: `env[0].0` on a capability
+    /// whose `env()` is empty. `scalar` (`Kind::ApiDocs`) is the first one — no
+    /// server, so nothing to print a boot command or an `unset` reminder for.
+    #[test]
+    fn add_epilogue_does_not_index_an_empty_env() {
+        use capability::Capability;
+        assert!(Capability::Scalar.env().is_empty(), "this test needs a capability with no env");
+        let lines = add_epilogue(Capability::Scalar);
+        assert_eq!(lines[0], "cargo run");
+        assert!(lines[1].contains("/docs") && lines[1].contains("/openapi.json"), "{lines:?}");
+        assert!(lines[2].contains("apidocs"), "{lines:?}");
+        // and a capability that does have one still gets the full epilogue
+        let lines = add_epilogue(Capability::Redis);
+        assert!(lines[0].starts_with("Start it"), "{lines:?}");
+        assert!(lines.last().unwrap().contains("REDIS_URL"), "{lines:?}");
     }
 
     #[test]

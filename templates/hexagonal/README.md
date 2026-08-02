@@ -38,7 +38,7 @@ GRPC_PORT=50052 cargo run       # + inbound gRPC features on 0.0.0.0:50052
 cargo test
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `document`, `mssql`, `cache`, `blob`, `analytics`, `timeseries`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` on every push/PR to `main` (after installing `protoc`). It then runs `cargo check --locked` once per optional feature (`postgres`, `mysql`, `document`, `mssql`, `cache`, `blob`, `analytics`, `timeseries`, `apidocs`) — that is what proves turning a capability on never needs a lock update — plus a separate `cargo audit` job so a RustSec advisory cannot mask the fmt/clippy/test signal.
 
 ### Examples
 
@@ -115,6 +115,10 @@ curl localhost:8080/users/u1
 curl localhost:8080/hello/world
 ```
 
+After `kodegen add scalar`, two more routes exist: `GET /docs` (a Scalar UI,
+needs a network for its JS) and `GET /openapi.json` (the spec itself, fully
+offline) — see [API documentation](#api-documentation-kodegen-add-scalar).
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -170,6 +174,7 @@ kodegen add s3            # the BlobStore port + an S3 adapter (RustFS/MinIO/AWS
 kodegen add clickhouse    # the EventSink port + a ClickHouse adapter
 kodegen add influxdb      # the same port, over line protocol (InfluxDB v2/v3)
 kodegen add greptimedb    # the same adapter, GreptimeDB image + URL
+kodegen add scalar        # GET /docs + GET /openapi.json, derived from the code
 kodegen add --list        # what's supported + what this project has on
 ```
 
@@ -182,8 +187,11 @@ Two of these are **slots**, and a slot holds one adapter:
   adapters of the same `EventSink`, so they replace each other (`influxdb` and
   `greptimedb` are two names for one of them: same feature, same adapter file).
 
-`redis` and `s3` fill no slot: they sit alongside whatever is on, and each other.
-One of each is a legal project (`--with mongodb,redis,s3,clickhouse`).
+`redis`, `s3` and `scalar` fill no slot: they sit alongside whatever is on, and
+each other. One of each is a legal project
+(`--with mongodb,redis,s3,clickhouse,scalar`). `scalar` is the odd one out even
+among these three — it has no port and no adapter, just a route and a derived
+document (see below), which is also why it takes no `--orm` and needs no env.
 
 ### Relational backend
 
@@ -562,6 +570,72 @@ it has no `migrations/` step. The table is one row per field, which keeps the ro
 type a plain `derive(Row)`; a wide table is the right answer once you know your
 fields, and `clickhouse_events.rs` is where you would make that change.
 
+### API documentation (`kodegen add scalar`)
+
+No port, no adapter, no slot — this one is a route and a document, not a piece
+of infrastructure, so it sits next to anything and never conflicts.
+
+```
+Cargo.toml                              default = [...] gains "apidocs" (utoipa/utoipa-scalar were already optional deps)
+src/api/openapi.rs                      created — the ApiDoc derive + GET /docs + GET /openapi.json
+src/api/mod.rs                          .merge(openapi::routes()); #[cfg_attr(..., utoipa::path)] on health, ToSchema on ErrorRes
+src/api/user.rs                         same cfg_attr treatment on create_user/get_user/CreateUserReq
+src/api/hello.rs                        same cfg_attr treatment on say_hello
+src/domain/model.rs                     ToSchema on User
+tests/apidocs.rs                        created — GET /openapi.json parses + covers the shipped routes, GET /docs is reachable
+```
+
+```bash
+kodegen add scalar
+cargo run
+curl localhost:8080/openapi.json | jq .paths    # every annotated route, offline
+open http://localhost:8080/docs                 # needs a network — see below
+```
+
+**The spec is derived from the code, not hand-maintained JSON.** Every handler
+and DTO the template ships is annotated with
+`#[cfg_attr(feature = "apidocs", utoipa::path(...))]` /
+`#[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]` **unconditionally**
+— whether or not `apidocs` is on — and `kodegen feature <name>` carries the same
+annotations on every handler it scaffolds, in either order relative to
+`add scalar`:
+
+- `kodegen feature order` then `kodegen add scalar`: the new handlers are
+  already annotated, so `add scalar` finds them and lists them in
+  `paths(...)` from the start.
+- `kodegen add scalar` then `kodegen feature order`: `add_feature` sees
+  `src/api/openapi.rs` on disk and inserts the new feature's two paths above
+  the `// kodegen:openapi:paths` marker that file carries.
+
+A route added **by hand**, without the attribute, is invisible to the spec —
+there is no compiler check for "every route is documented", so add the
+attribute and one line in `paths(...)` (or run `kodegen feature`, which never
+forgets it) whenever you add one yourself.
+
+**`GET /docs` needs a network; `GET /openapi.json` does not.** `utoipa-scalar`
+serves a small HTML page whose `<script>` loads the Scalar UI from
+`cdn.jsdelivr.net` — `build`, `cargo test` and `GET /openapi.json` never touch
+the network, but the `/docs` page itself renders blank without one. Upgrade
+path if that matters for your deployment: swap `Scalar::with_url(...)` in
+`openapi.rs` for `Scalar::new(spec).custom_html(...)` with a vendored copy of
+`@scalar/api-reference` (~1.5 MB) — not done here, because it would grow the
+binary and every generated project for a need nobody has stated yet.
+
+**Both routes ship in a production build unless you turn them off.** `apidocs`
+is a `default = [...]` feature like any other: drop it and both routes — and
+every `cfg_attr`-gated line — compile out completely, not just stop being
+registered. Do that before shipping anything you would not want the API
+surface (paths, request/response shapes, tags) publicly readable for, or put
+`/docs` and `/openapi.json` behind the same auth/ingress rule as the rest of
+the API.
+
+**Schemas are collected automatically.** `#[openapi(paths(...))]` only lists
+functions; utoipa 5 walks each one's `request_body`/`responses` recursively and
+adds `CreateUserReq`, `ErrorRes`, `User` (and whatever a scaffolded feature
+adds) to `components.schemas` without a `components(schemas(...))` list to keep
+in sync by hand. `info.title`/`info.version` come from `Cargo.toml`'s own
+`[package] name`/`version` — no placeholder to forget either.
+
 ### Running a backend locally
 
 `docker-compose.dev.yml` (written by `kodegen add`, dev-only — the production
@@ -709,6 +783,7 @@ Each step touches one file per layer; nothing existing changes shape — `Servic
 - **Clear boundaries:** each layer has a single responsibility; accidental cross‑layer imports are easy to spot.
 - **`dyn` services, measured:** `Services` holds `Arc<dyn UserService>` / `Arc<dyn Greeter>` so adding a feature never grows generic signatures. The vtable cost is not measurable here: allocations per request are identical to a fully-generic variant (`#[async_trait]` already boxes every call), and `wrk` throughput differs by less than run-to-run noise (±2%). If you strip `async_trait` and need every nanosecond, making `Services` generic again is a local change to `api/mod.rs` + `bootstrap.rs`.
 - **State cloning:** prefer storing types that are cheap to clone (e.g., `diesel::r2d2::Pool` and `tonic::transport::Channel` are already cheap/Arc-backed — see `Db` in `diesel_db.rs`). Wrap custom non‑clone resources in `Arc<T>` only when necessary.
+- **`GET /docs` / `GET /openapi.json` (after `kodegen add scalar`) are on by default**, gated only on the `apidocs` cargo feature — no env kill switch. They expose every annotated route, request/response shape and tag; drop `"apidocs"` from `default = [...]` in `Cargo.toml` before a build you don't want that public, or put both routes behind the same auth/ingress rule as the rest of the API. See [API documentation](#api-documentation-kodegen-add-scalar) for the full trade-off.
 
 ## Getting Started (wiring, simplified)
 

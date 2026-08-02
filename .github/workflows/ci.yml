@@ -101,6 +101,7 @@ jobs:
           - capability: clickhouse
           - capability: influxdb
           - capability: greptimedb
+          - capability: scalar
           # The SeaORM path, and the only rows in this matrix that run their
           # datastore live. That is not a bonus: it is the only way to prove the
           # startup DDL, because there is no migration step to apply and the
@@ -267,6 +268,23 @@ jobs:
         run: cargo test --locked
         working-directory: ${{ runner.temp }}/demo
 
+      # The one thing `cargo test` above proves green without proving *which*
+      # routes ended up in the spec: `tests/apidocs.rs` (written by `add
+      # scalar`) prints every path in `/openapi.json`, and this greps that
+      # output for the two features this row scaffolded on opposite sides of
+      # `add scalar` — `order` before it (found by `scanned_openapi_paths`),
+      # `notification` after it (found by `add_feature`'s marker insert). Both
+      # missing would mean one direction silently lost its routes; this is the
+      # only place that notices.
+      - name: The spec must cover both scaffold orders
+        if: matrix.capability == 'scalar'
+        working-directory: ${{ runner.temp }}/demo
+        run: |
+          set -o pipefail
+          cargo test --locked --test apidocs -- --nocapture | tee "$RUNNER_TEMP/apidocs-out.txt"
+          grep -q '/order' "$RUNNER_TEMP/apidocs-out.txt"
+          grep -q '/notification' "$RUNNER_TEMP/apidocs-out.txt"
+
       # The same suite again, over the database the run above left behind, in a
       # new process. This is the whole gate for the startup DDL: run one proves
       # it creates the schema, run two proves every statement is idempotent —
@@ -323,11 +341,12 @@ jobs:
           test -s "$RUNNER_TEMP/image-ca.crt"
           test "$(grep -c 'BEGIN CERTIFICATE' "$RUNNER_TEMP/image-ca.crt")" -gt 100
 
-  # One job with one occupant of every slot plus both additive capabilities. Two
+  # One job with one occupant of every slot plus every additive capability. Two
   # things only exist here: cargo feature unification across the whole
-  # optional-dependency set, and four independent `add`s writing into the same
-  # `Services` literal and the same compose file. Neither is visible from a
-  # per-capability job.
+  # optional-dependency set, and five independent `add`s writing into the same
+  # `Services` literal and the same compose file (`scalar` writes into neither —
+  # it is the one that proves unification without also writing a resource or a
+  # compose service). Neither is visible from a per-capability job.
   #
   # It is also the only job that puts a real server behind an adapter — the
   # matrix above proves a generated project is green *without* one, which is a
@@ -425,7 +444,7 @@ jobs:
           echo "rustfs did not come up"; exit 1
 
       - name: Generate with every capability on
-        run: cargo run --locked -- new demo-all --with mongodb,redis,s3,clickhouse --output "$RUNNER_TEMP"
+        run: cargo run --locked -- new demo-all --with mongodb,redis,s3,clickhouse,scalar --output "$RUNNER_TEMP"
 
       - name: Format check
         run: cargo fmt --check

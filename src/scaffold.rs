@@ -72,7 +72,7 @@ pub fn add_feature(
     }
 
     // registrations
-    let edits = vec![
+    let mut edits = vec![
         edit(project, "src/domain/mod.rs", |c| {
             Ok(format!("{c}\npub mod {name};\npub use {name}::{{{pascal}, {pascal}Repository}};\n"))
         })?,
@@ -132,6 +132,24 @@ pub fn add_feature(
             Ok(format!("{c}\n{}", render(BOOTSTRAP_TPL).replace("{{db_ty}}", db_ty)))
         })?,
     ];
+
+    // `kodegen add scalar` before `kodegen feature`: `API_TPL` above annotates
+    // this feature's handlers unconditionally, but nothing has told the spec
+    // about them yet — `openapi.rs` only exists once `add scalar` has run, and
+    // when it has, this is the two-line insert its module doc promises. The
+    // other order needs no code here at all: `add scalar` scans for the
+    // annotation itself (`scanned_openapi_paths`), which this file already
+    // carries by the time it runs. gRPC is skipped because OpenAPI does not
+    // describe it — `{{name}}_grpc.rs` has no HTTP route to add.
+    if transport == Transport::Rest && project.join("src/api/openapi.rs").is_file() {
+        edits.push(edit(project, "src/api/openapi.rs", |c| {
+            insert_before_line(
+                &c,
+                crate::capability::OPENAPI_PATHS_MARKER,
+                &format!("    crate::api::{name}::create_{name},\n    crate::api::{name}::get_{name},"),
+            )
+        })?);
+    }
 
     let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
 
@@ -295,7 +313,11 @@ const DOMAIN_TPL: &str = r##"use crate::domain::DomainError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+// present whether or not this project has `kodegen add scalar` on — a project
+// that adds it later needs every existing feature already annotated, since
+// `add scalar` does not go back and edit files `kodegen feature` already wrote
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]
 pub struct {{Feature}} {
     pub id: String,
     pub name: String,
@@ -422,12 +444,24 @@ impl FromRef<Services> for {{Feature}}Svc {
     }
 }
 
+// same reasoning as {{Feature}}'s ToSchema in domain/{{feature}}.rs: annotated
+// unconditionally, so it is already there for `add scalar` to find regardless
+// of which command ran first — see capability.rs's `add_scalar`
 #[derive(Deserialize)]
+#[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]
 pub struct Create{{Feature}}Req {
     pub id: String,
     pub name: String,
 }
 
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    post, path = "/{{feature}}", tag = "{{feature}}",
+    request_body = Create{{Feature}}Req,
+    responses(
+        (status = 201, description = "created"),
+        (status = 400, description = "validation failed", body = ErrorRes),
+    ),
+))]
 pub async fn create_{{feature}}(
     State(svc): State<{{Feature}}Svc>,
     Json(req): Json<Create{{Feature}}Req>,
@@ -439,6 +473,14 @@ pub async fn create_{{feature}}(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))))
 }
 
+#[cfg_attr(feature = "apidocs", utoipa::path(
+    get, path = "/{{feature}}/{id}", tag = "{{feature}}",
+    params(("id" = String, Path)),
+    responses(
+        (status = 200, description = "found", body = {{Feature}}),
+        (status = 404, description = "not found", body = ErrorRes),
+    ),
+))]
 pub async fn get_{{feature}}(
     State(svc): State<{{Feature}}Svc>,
     Path(id): Path<String>,

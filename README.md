@@ -21,7 +21,7 @@ are used in place, so `kodegen update` refuses on either — see
 
 ### Capabilities
 
-All 11 supported by `kodegen add <capability>` / `kodegen new --with`:
+All 12 supported by `kodegen add <capability>` / `kodegen new --with`:
 
 | Capability | Slot | `--orm` | Default adapter (capability off / env unset) | Main env |
 |---|---|---|---|---|
@@ -36,11 +36,12 @@ All 11 supported by `kodegen add <capability>` / `kodegen new --with`:
 | `clickhouse` | event sink | not applicable | tracing log | `CLICKHOUSE_URL` (+ `_DB`/`_USER`/`_PASSWORD`) |
 | `influxdb` | event sink | not applicable | tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`/`_ORG`/`_TOKEN`) |
 | `greptimedb` | event sink — alias of `influxdb` (same adapter, GreptimeDB image + `INFLUX_URL` path) | not applicable | tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`) |
+| `scalar` | — (additive, no port at all) | not applicable | routes absent (`GET /docs`/`GET /openapi.json` compile out with the feature) | none — compile-time switch only |
 
 A **slot** holds exactly one adapter: `postgres`/`mysql`/`mariadb`/`timescaledb`/`mongodb`/`mssql`
 are all adapters of the datastore slot (`UserRepository`), and `clickhouse`/`influxdb`/`greptimedb`
-are all adapters of the event-sink slot (`EventSink`) — one occupant per slot, `redis` and `s3` fill
-no slot and sit alongside anything. Usage and per-capability details are in
+are all adapters of the event-sink slot (`EventSink`) — one occupant per slot, `redis`, `s3` and
+`scalar` fill no slot and sit alongside anything. Usage and per-capability details are in
 [Add a capability](#add-a-capability) below.
 
 ## Install
@@ -147,6 +148,7 @@ kodegen add s3                           # a BlobStore port + an S3 adapter (Rus
 kodegen add clickhouse                   # an EventSink port + a ClickHouse adapter
 kodegen add influxdb                     # the same port, over line protocol (InfluxDB v2/v3)
 kodegen add greptimedb                   # same adapter as influxdb, GreptimeDB image + URL
+kodegen add scalar                       # GET /docs + GET /openapi.json, derived from the code
 kodegen add postgres --orm seaorm        # the same PostgreSQL, on SeaORM instead of Diesel
 kodegen add mysql --orm seaorm           # same again on MySQL/MariaDB — no C driver to build
 kodegen add postgres --path ~/svc        # run from outside the project
@@ -199,8 +201,8 @@ Two rules the command enforces:
   each port — `Db`/`Mongo` behind `UserRepository`, one client behind
   `EventSink` — so `add mysql` on top of `postgres`, either on top of `mongodb`,
   or `add influxdb` on top of `clickhouse`, is refused with the steps to undo the
-  first one, not applied halfway. `add redis` and `add s3` fill no slot and are
-  never caught by this rule.
+  first one, not applied halfway. `add redis`, `add s3` and `add scalar` fill no
+  slot and are never caught by this rule.
 - **Adding the same capability twice** is an error, not a no-op rewrite. So is
   adding two names for one cargo feature: `mariadb` after `mysql`,
   `timescaledb` after `postgres`, or `greptimedb` after `influxdb`.
@@ -723,6 +725,58 @@ MSRV honest rather than letting the resolver fall back to a version nobody on
 1.88 can build. The whole `analytics` capability costs 11 lock entries;
 `timeseries` costs **zero**, because it is `hyper`/`hyper-util`/`http-body-util`,
 which `tonic` already pulls in.
+
+#### `add scalar`
+
+No port, no adapter, no slot — the only capability that is a route and a
+derived document rather than a piece of infrastructure, which is why it takes
+no `--orm`, needs no env, and sits next to anything (`--with
+mongodb,redis,s3,clickhouse,scalar` is a legal set).
+
+```
+Cargo.toml               default = [...] gains "apidocs" (utoipa/utoipa-scalar were already optional deps — no lock churn from this alone)
+src/api/openapi.rs        created — #[derive(utoipa::OpenApi)] + GET /docs (Scalar) + GET /openapi.json
+src/api/mod.rs             .merge(openapi::routes()); cfg_attr(utoipa::path) on health, cfg_attr(ToSchema) on ErrorRes
+src/api/user.rs           same cfg_attr treatment on create_user/get_user/CreateUserReq
+src/api/hello.rs          same cfg_attr treatment on say_hello
+src/domain/model.rs       cfg_attr(ToSchema) on User
+tests/apidocs.rs          created — GET /openapi.json parses + covers the shipped routes, GET /docs is reachable
+```
+
+**The spec is derived from the code, not a static file kept in sync by hand.**
+`kodegen feature <name>` annotates every handler and DTO it scaffolds with
+`#[cfg_attr(feature = "apidocs", utoipa::path(...))]` /
+`#[cfg_attr(feature = "apidocs", derive(utoipa::ToSchema))]`
+**unconditionally** — whether or not a project has `scalar` on — which is what
+makes both orders work:
+
+- `kodegen feature order` then `kodegen add scalar`: the annotations are
+  already there, so `add scalar` scans `src/api/*.rs` for
+  `utoipa::path(` immediately followed by an `async fn`, and lists what it
+  finds in `paths(...)` from the start.
+- `kodegen add scalar` then `kodegen feature order`: `kodegen feature` sees
+  `src/api/openapi.rs` on disk and inserts the new feature's two paths above
+  the `// kodegen:openapi:paths` marker `add scalar` leaves in place for
+  exactly that.
+
+A route added by hand, without the attribute, is invisible to the spec —
+`kodegen` cannot notice a route that skipped it, so the generated project's own
+README carries the same checklist as "Adding a Feature" for this case.
+
+`GET /openapi.json` is fully offline (parse it, contract-test it, pipe it to a
+client generator); `GET /docs` renders the Scalar UI from a page whose
+`<script>` loads `@scalar/api-reference` off `cdn.jsdelivr.net`, so that one
+page needs a network. Building, testing and every other route stay exactly as
+offline as before — see the generated project's own README for the vendoring
+trade-off if that page needs to work air-gapped.
+
+**Both routes ship in a production build unless you turn them off** — `apidocs`
+is a `default = [...]` feature like every other capability here: drop it and
+both routes, plus every `cfg_attr`-gated line, compile out completely. Do that
+before shipping anything you would not want the API surface publicly readable
+for, or put `/docs`/`/openapi.json` behind the same auth/ingress rule as the
+rest of the API. There is deliberately no env-based kill switch — see the
+generated project's README for why.
 
 ### Update a cached template
 
