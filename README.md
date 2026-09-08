@@ -821,3 +821,7 @@ matches it — `.github/workflows/release.yml` builds every target and attaches
 the binaries to a GitHub Release. A tag that disagrees with `Cargo.toml` fails
 the first step, before anything is published. There is no crates.io publish:
 the name `kodegen` is already taken there by an unrelated crate.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

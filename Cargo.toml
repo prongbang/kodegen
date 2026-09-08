@@ -2,6 +2,12 @@
 name = "kodegen"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+# The edition 2024 floor. Declared so an older toolchain says "requires rustc
+# 1.85" instead of failing on the edition key itself.
+rust-version = "1.85"
+description = "CLI for generating Rust starter projects, scaffolding features into them, and switching their infrastructure capabilities."
+repository = "https://github.com/prongbang/kodegen"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
