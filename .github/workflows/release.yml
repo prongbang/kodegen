@@ -1,0 +1,91 @@
+name: Release
+
+# Tag-driven only. There is no crates.io publish job: the name `kodegen` is
+# already taken on crates.io by an unrelated crate, so a GitHub Release with
+# prebuilt binaries (plus `cargo install --git`) is the whole distribution story.
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions:
+  contents: read
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # for taiki-e/create-gh-release-action
+    steps:
+      - uses: actions/checkout@v4
+
+      # create-gh-release-action parses the version out of the tag but never
+      # looks at Cargo.toml, so `v0.1.0` on a `version = "0.2.0"` tree would
+      # release binaries that report the wrong version. Fail before anything is
+      # published.
+      - name: The tag must match the version in Cargo.toml
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          echo "tag=$GITHUB_REF_NAME cargo=$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+
+      # Draft: the release is created first and the binaries are attached by the
+      # matrix below, so between the two it exists with no assets. Publishing it
+      # is the `publish` job's job, once every target has uploaded.
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: true
+
+  upload-assets:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl rather than gnu: the binary has no C dependencies (clap +
+          # include_dir), so a static build runs on any distro. The action picks
+          # cargo or cross per target on its own; aarch64 is the one that gets
+          # cross.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          # macos-latest is arm64; the x86_64 host toolchain cross-compiles
+          # there without any extra setup.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write # for taiki-e/upload-rust-binary-action
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: kodegen
+          target: ${{ matrix.target }}
+          checksum: sha256
+          # Build the versions in Cargo.lock, not whatever resolves today: the
+          # tag is what the lock was tested at.
+          locked: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # `needs` runs only when every matrix leg succeeded, which is the point of
+  # `fail-fast: false` above: one broken target leaves the draft unpublished with
+  # the other binaries attached for inspection, rather than shipping a release
+  # that is missing one.
+  publish:
+    needs: upload-assets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - run: gh release edit "$GITHUB_REF_NAME" --draft=false --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}

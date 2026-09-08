@@ -46,6 +46,12 @@ are all adapters of the event-sink slot (`EventSink`) — one occupant per slot,
 
 ## Install
 
+Prebuilt binaries for Linux (x86_64/aarch64, static musl), macOS (Intel and
+Apple silicon) and Windows are attached to every tagged release, with a sha256
+next to each: <https://github.com/prongbang/kodegen/releases>. Download, unpack,
+put `kodegen` on your `PATH` — no toolchain needed to *run* it (generating a
+project still needs cargo, and `protoc` to build the result).
+
 From GitHub:
 
 ```bash
@@ -807,3 +813,11 @@ kodegen new demo -t my-starter
 Keep the template's `Cargo.lock` in: generated projects inherit it (name is
 rewritten automatically), so `cargo build --locked` and Docker builds work
 straight away.
+
+## Cutting a release
+
+Bump `version` in the root `Cargo.toml`, commit, then push a `vX.Y.Z` tag that
+matches it — `.github/workflows/release.yml` builds every target and attaches
+the binaries to a GitHub Release. A tag that disagrees with `Cargo.toml` fails
+the first step, before anything is published. There is no crates.io publish:
+the name `kodegen` is already taken there by an unrelated crate.
