@@ -23,6 +23,11 @@ tokio = { version = "1", features = [
     "rt-multi-thread",
     "net",
     "signal",
+    # Unconditional rather than only via the capability features below that also
+    # ask for it: `main.rs` fans one shutdown signal out to both servers over a
+    # `watch` channel, so the base template needs it too. It is a leaf module of
+    # a crate already in the graph — enabling it always costs nothing.
+    "sync",
     "time",
 ] }
 serde = { version = "1", features = ["derive"] }
@@ -30,7 +35,10 @@ serde_json = "1"
 async-trait = "0.1"
 thiserror = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# `json` is what `LOG_FORMAT=json` selects (see `main.rs`): the same layer, one
+# object per line, so a container's stdout is machine-readable without a parser
+# in the log shipper. It only adds serde_json (already here) + tracing-serde.
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 recloser = "1.4.0"
 tonic = "0.14.6"
 prost = "0.14.4"

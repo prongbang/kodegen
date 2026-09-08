@@ -30,7 +30,15 @@ proto/                 # protobuf definitions — every file here is compiled by
 ```bash
 cargo run                       # HTTP on 0.0.0.0:$PORT (default 8080)
 GRPC_PORT=50052 cargo run       # + inbound gRPC features on 0.0.0.0:50052
+LOG_FORMAT=json cargo run       # structured logs (what the Dockerfile sets)
 ```
+
+Ctrl-C / `SIGTERM` drains both servers: one signal listener, both halves shut
+down gracefully, and a gRPC bind failure exits the process instead of leaving
+HTTP up with gRPC dead. The drain is bounded at 10s — an idle gRPC channel is
+never closed by its client, so without a deadline the process would still be
+waiting when Kubernetes SIGKILLs the pod. Exceeding it logs a warning and exits
+0 with those connections still open.
 
 ### Test
 
@@ -127,6 +135,7 @@ offline) — see [API documentation](#api-documentation-kodegen-add-scalar).
 | `GREETER_ADDR` | `http://localhost:50051` | gRPC address of the upstream Greeter service |
 | `GRPC_PORT` | unset | Optional. When set, inbound gRPC features (`bootstrap::grpc_routes`) are served on this port alongside HTTP. |
 | `RUST_LOG` | `info` | Tracing log filter (`EnvFilter`) |
+| `LOG_FORMAT` | unset (human-readable) | Set to `json` for one JSON object per log line. The `Dockerfile` sets it in the runtime stage, so containers log JSON while a local `cargo run` stays readable. `RUST_LOG` applies either way. |
 | `DATABASE_URL` | unset (in-memory repo) | Optional. Connection string for the Diesel-backed `UserRepository`; the format depends on which backend is enabled (see [Capabilities](#capabilities)) — after `kodegen add mssql` it is an ADO.NET connection string rather than a URL. Unset falls back to the in-memory adapter. |
 | `MONGODB_URL` / `MONGODB_DB` | unset (in-memory repo) | Optional, and only meaningful after `kodegen add mongodb`, which replaces `DATABASE_URL` with these: e.g. `mongodb://127.0.0.1:27017` and the database name (`app` if unset). Unset falls back to the in-memory adapter. |
 | `REDIS_URL` | unset (in-memory cache) | Optional, and only meaningful after `kodegen add redis`. Redis/Valkey connection string for the `Cache` port, e.g. `redis://127.0.0.1:6379`. Unset falls back to the in-memory adapter. |
@@ -694,7 +703,7 @@ Allocations per request (`alloc_bench`):
 
 ### `main.rs` — Entrypoint
 - Starts the runtime (logging/tracing/Tokio).
-- Binds the TCP listener and calls `axum::serve`; when `GRPC_PORT` is set it also spawns a tonic server with `bootstrap::grpc_routes(&services)`.
+- Binds the TCP listener and calls `axum::serve`; when `GRPC_PORT` is set it also serves a tonic server with `bootstrap::grpc_routes(&services)`. Both run under one `try_join!` and one shutdown signal, so either one's error ends the process and either one's failure is not silent.
 - Contains no business logic or wiring details.
 
 ### `bootstrap.rs` — Composition Root

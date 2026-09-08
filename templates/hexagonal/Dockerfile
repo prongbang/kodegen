@@ -28,5 +28,8 @@ WORKDIR /app
 COPY --from=builder /usr/src/app/target/release/hexagonal-rs /app/service
 
 EXPOSE 8080
+# Structured logs in a container, plain text under `cargo run` — nothing in the
+# image reads a terminal, and every log shipper prefers one JSON object per line.
+ENV LOG_FORMAT=json
 USER nonroot:nonroot
 ENTRYPOINT ["/app/service"]
