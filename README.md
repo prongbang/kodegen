@@ -44,6 +44,13 @@ are all adapters of the event-sink slot (`EventSink`) — one occupant per slot,
 `scalar` fill no slot and sit alongside anything. Usage and per-capability details are in
 [Add a capability](#add-a-capability) below.
 
+Every adapter above also implements the template's `Readiness` port with its
+cheapest real round-trip (`SELECT 1`, `PING`, `HEAD bucket`, `GET /health`), and
+`add` registers it in `bootstrap.rs` — so `GET /ready` (and, with `GRPC_PORT`,
+`grpc.health.v1`) answers `503` naming the backend that is down, while
+`GET /health` stays a plain liveness `ok`. A project with no capability on
+registers nothing and is ready as soon as it listens.
+
 ## Install
 
 Prebuilt binaries for Linux (x86_64/aarch64, static musl), macOS (Intel and
@@ -742,7 +749,7 @@ mongodb,redis,s3,clickhouse,scalar` is a legal set).
 ```
 Cargo.toml               default = [...] gains "apidocs" (utoipa/utoipa-scalar were already optional deps — no lock churn from this alone)
 src/api/openapi.rs        created — #[derive(utoipa::OpenApi)] + GET /docs (Scalar) + GET /openapi.json
-src/api/mod.rs             .merge(openapi::routes()); cfg_attr(utoipa::path) on health, cfg_attr(ToSchema) on ErrorRes
+src/api/mod.rs             .merge(openapi::routes()); cfg_attr(utoipa::path) on health and ready, cfg_attr(ToSchema) on ErrorRes and ReadyRes
 src/api/user.rs           same cfg_attr treatment on create_user/get_user/CreateUserReq
 src/api/hello.rs          same cfg_attr treatment on say_hello
 src/domain/model.rs       cfg_attr(ToSchema) on User

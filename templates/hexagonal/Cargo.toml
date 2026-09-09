@@ -43,6 +43,10 @@ recloser = "1.4.0"
 tonic = "0.14.6"
 prost = "0.14.4"
 tonic-prost = "0.14.6"
+# The standard `grpc.health.v1` service, so a Kubernetes gRPC probe (or grpcurl)
+# gets the same answer `GET /ready` gives — see `bootstrap::grpc_routes`. Same
+# 0.14 line as tonic; its dependencies were all in the lock already.
+tonic-health = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
 # Optional like every other datastore driver, and for the same reason: with
 # `document` selected there is no Diesel code left to compile (see

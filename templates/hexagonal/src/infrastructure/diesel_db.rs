@@ -2,7 +2,8 @@
 //! spawn_blocking entrypoint, one error mapping. A new repository only
 //! needs a `Db` clone and its own queries.
 
-use crate::domain::DomainError;
+use crate::domain::{DomainError, Readiness};
+use async_trait::async_trait;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
@@ -73,6 +74,39 @@ impl Db {
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().map_err(infra)?;
             f(&mut conn)
+        })
+        .await
+        .map_err(infra)?
+    }
+}
+
+/// The `/ready` probe gives each check the same 2s, and past it the answer is
+/// already "timed out" — so this is how long a connection is worth waiting for.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[async_trait]
+impl Readiness for Db {
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    /// A connection from the pool and one statement through it — the whole
+    /// path a query takes, minus the query.
+    async fn ready(&self) -> Result<(), DomainError> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            // `get_timeout`, not `Db::run`'s `pool.get()`: the probe's async 2s
+            // timeout cannot cancel a closure already on the blocking pool, so a
+            // dead database parks that thread for r2d2's 30s default while the
+            // gRPC loop fires another probe every 10s — and dropping the runtime
+            // waits for all of them, overrunning the 10s drain bound. The pool's
+            // own `connection_timeout` is left alone: that one governs real
+            // requests.
+            let mut conn = pool.get_timeout(READY_TIMEOUT).map_err(infra)?;
+            diesel::sql_query("SELECT 1")
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(infra)
         })
         .await
         .map_err(infra)?

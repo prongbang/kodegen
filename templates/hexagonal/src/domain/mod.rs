@@ -4,4 +4,4 @@ pub mod ports;
 
 pub use errors::DomainError;
 pub use model::User;
-pub use ports::{Greeter, UserRepository};
+pub use ports::{Greeter, Readiness, UserRepository};

@@ -1970,7 +1970,9 @@ fn add_scalar(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>
             let c = insert_pub_mod(&c, "openapi")?;
             let c = insert_before_line(&c, ".with_state(services)", "        .merge(openapi::routes())")?;
             let c = insert_before_line(&c, "pub struct ErrorRes {", TO_SCHEMA_ATTR)?;
-            insert_before_line(&c, "async fn health() -> &'static str {", HEALTH_PATH_ATTR)
+            let c = insert_before_line(&c, "pub struct ReadyRes {", TO_SCHEMA_ATTR)?;
+            let c = insert_before_line(&c, "async fn health() -> &'static str {", HEALTH_PATH_ATTR)?;
+            insert_before_line(&c, "async fn ready(", READY_PATH_ATTR)
         })?,
         edit(project, USER_API, |c| {
             let c = insert_before_line(&c, "pub struct CreateUserReq {", TO_SCHEMA_ATTR)?;
@@ -2060,6 +2062,8 @@ const TO_SCHEMA_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", derive(utoipa::T
 
 const HEALTH_PATH_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", utoipa::path(\n    get, path = \"/health\", tag = \"health\",\n    responses((status = 200, description = \"ok\", body = String)),\n))]";
 
+const READY_PATH_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", utoipa::path(\n    get, path = \"/ready\", tag = \"health\",\n    responses(\n        (status = 200, description = \"every backend answered\", body = ReadyRes),\n        (status = 503, description = \"a backend did not\", body = ReadyRes),\n    ),\n))]";
+
 const CREATE_USER_PATH_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", utoipa::path(\n    post, path = \"/users\", tag = \"users\",\n    request_body = CreateUserReq,\n    responses(\n        (status = 201, description = \"created\"),\n        (status = 400, description = \"validation failed\", body = ErrorRes),\n    ),\n))]";
 
 const GET_USER_PATH_ATTR: &str = "#[cfg_attr(feature = \"apidocs\", utoipa::path(\n    get, path = \"/users/{id}\", tag = \"users\",\n    params((\"id\" = String, Path)),\n    responses(\n        (status = 200, description = \"found\", body = User),\n        (status = 404, description = \"not found\", body = ErrorRes),\n    ),\n))]";
@@ -2086,6 +2090,7 @@ use axum::Router;
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(
     crate::api::health,
+    crate::api::ready,
     crate::api::user::create_user,
     crate::api::user::get_user,
     crate::api::hello::say_hello,
@@ -2483,7 +2488,8 @@ const DIESEL_DB_TPL: &str = r##"//! Shared Diesel/{{Dialect}} plumbing for every
 //! above it are unchanged, which is the whole point of keeping the pool in one
 //! place.
 
-use crate::domain::DomainError;
+use crate::domain::{DomainError, Readiness};
+use async_trait::async_trait;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
@@ -2532,6 +2538,39 @@ impl Db {
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().map_err(infra)?;
             f(&mut conn)
+        })
+        .await
+        .map_err(infra)?
+    }
+}
+
+/// The `/ready` probe gives each check the same 2s, and past it the answer is
+/// already "timed out" — so this is how long a connection is worth waiting for.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[async_trait]
+impl Readiness for Db {
+    fn name(&self) -> &'static str {
+        "{{capability}}"
+    }
+
+    /// A connection from the pool and one statement through it — the whole
+    /// path a query takes, minus the query.
+    async fn ready(&self) -> Result<(), DomainError> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            // `get_timeout`, not `Db::run`'s `pool.get()`: the probe's async 2s
+            // timeout cannot cancel a closure already on the blocking pool, so a
+            // dead database parks that thread for r2d2's 30s default while the
+            // gRPC loop fires another probe every 10s — and dropping the runtime
+            // waits for all of them, overrunning the 10s drain bound. The pool's
+            // own `connection_timeout` is left alone: that one governs real
+            // requests.
+            let mut conn = pool.get_timeout(READY_TIMEOUT).map_err(infra)?;
+            diesel::sql_query("SELECT 1")
+                .execute(&mut conn)
+                .map(|_| ())
+                .map_err(infra)
         })
         .await
         .map_err(infra)?
@@ -2662,7 +2701,7 @@ const MONGO_REPO_TPL: &str = r##"//! `UserRepository` adapter over MongoDB. Writ
 //! The handle is owned by the composition root (`bootstrap.rs`) and handed in,
 //! exactly like the Diesel `Db`: a repository never reads `MONGODB_URL` itself.
 
-use crate::domain::{DomainError, User, UserRepository};
+use crate::domain::{DomainError, Readiness, User, UserRepository};
 use async_trait::async_trait;
 use mongodb::bson::doc;
 use mongodb::{Client, Collection};
@@ -2736,6 +2775,24 @@ pub fn infra(e: mongodb::error::Error) -> DomainError {
         | ErrorKind::ConnectionPoolCleared { .. }
         | ErrorKind::DnsResolve { .. } => DomainError::Unavailable,
         _ => DomainError::Other(Box::new(e)),
+    }
+}
+
+#[async_trait]
+impl Readiness for Mongo {
+    fn name(&self) -> &'static str {
+        "mongodb"
+    }
+
+    /// The first call is the first connection; afterwards the server's own
+    /// `ping` command, which needs no collection to exist.
+    async fn ready(&self) -> Result<(), DomainError> {
+        self.database()
+            .await?
+            .run_command(doc! { "ping": 1 })
+            .await
+            .map(|_| ())
+            .map_err(infra)
     }
 }
 
@@ -2923,7 +2980,8 @@ const SEA_DB_TPL: &str = r##"//! Shared SeaORM/{{Dialect}} plumbing for every re
 //! timeout and not two. It is not a substitute for migrations once the schema is
 //! worth versioning.
 
-use crate::domain::DomainError;
+use crate::domain::{DomainError, Readiness};
+use async_trait::async_trait;
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -3019,6 +3077,19 @@ pub fn infra(e: DbErr) -> DomainError {
     match e {
         DbErr::Conn(_) | DbErr::ConnectionAcquire(_) => DomainError::Unavailable,
         _ => DomainError::Other(Box::new(e)),
+    }
+}
+
+#[async_trait]
+impl Readiness for Db {
+    fn name(&self) -> &'static str {
+        "{{capability}}"
+    }
+
+    /// The first call is the first connection (and the schema); afterwards one
+    /// round trip on the pool.
+    async fn ready(&self) -> Result<(), DomainError> {
+        self.conn().await?.ping().await.map_err(infra)
     }
 }
 "##;
@@ -3285,7 +3356,8 @@ const MSSQL_DB_TPL: &str = r##"//! Shared SQL Server plumbing for every reposito
 //! `encrypt=true;TrustServerCertificate=true` — **only** against a database on
 //! your own machine: that setting sends the login packet in the clear.
 
-use crate::domain::DomainError;
+use crate::domain::{DomainError, Readiness};
+use async_trait::async_trait;
 use bb8::{Pool, PooledConnection, RunError};
 use bb8_tiberius::ConnectionManager;
 use std::sync::Arc;
@@ -3458,6 +3530,30 @@ fn manager_infra(e: bb8_tiberius::Error) -> DomainError {
         bb8_tiberius::Error::Tiberius(e) => infra(e),
         // the TCP connect itself failed
         bb8_tiberius::Error::Io(_) => DomainError::Unavailable,
+    }
+}
+
+#[async_trait]
+impl Readiness for Db {
+    fn name(&self) -> &'static str {
+        "mssql"
+    }
+
+    /// The first call is the first connection (and the schema); afterwards one
+    /// round trip on a pooled connection. The row is read so the stream is
+    /// drained before the connection goes back to the pool.
+    async fn ready(&self) -> Result<(), DomainError> {
+        let mut conn = self.conn().await?;
+        // bound rather than returned: the stream borrows `conn`, and a tail
+        // expression's temporaries outlive the locals
+        let _row = conn
+            .query("SELECT 1", &[])
+            .await
+            .map_err(infra)?
+            .into_row()
+            .await
+            .map_err(infra)?;
+        Ok(())
     }
 }
 "##;
@@ -3994,7 +4090,7 @@ const REDIS_CACHE_TPL: &str = r##"//! `Cache` adapter over Redis — and over Va
 //! root (`bootstrap.rs`) and handed in, exactly like the Diesel `Db` handle: a
 //! repository or adapter never reads `REDIS_URL` itself.
 
-use crate::domain::{Cache, DomainError};
+use crate::domain::{Cache, DomainError, Readiness};
 use async_trait::async_trait;
 use redis::AsyncTypedCommands;
 use std::time::Duration;
@@ -4060,6 +4156,19 @@ impl Cache for RedisCache {
         conn.del(key).await.map(|_| ()).map_err(infra)
     }
 }
+
+#[async_trait]
+impl Readiness for RedisCache {
+    fn name(&self) -> &'static str {
+        "redis"
+    }
+
+    /// The manager dials lazily, so the first PING is the first connection.
+    async fn ready(&self) -> Result<(), DomainError> {
+        let mut conn = self.conn();
+        conn.ping().await.map(|_| ()).map_err(infra)
+    }
+}
 "##;
 
 /// Inserted above `// kodegen:resources` in `build_services_from_env`.
@@ -4072,7 +4181,10 @@ const REDIS_RESOURCE: &str = r##"    // one lazy, multiplexed Redis connection f
                 client.get_connection_manager_lazy(redis::aio::ConnectionManagerConfig::new())
             })
             .expect("invalid REDIS_URL")
-    });"##;
+    });
+    if let Some(conn) = &redis {
+        readiness.push(Arc::new(crate::infrastructure::redis_cache::RedisCache::new(conn.clone())));
+    }"##;
 
 /// Appended to `bootstrap.rs`.
 const BUILD_CACHE_TPL: &str = r##"/// Redis when `REDIS_URL` is set, in-memory otherwise — the same
@@ -4366,7 +4478,7 @@ const S3_BLOBS_TPL: &str = r##"//! `BlobStore` adapter over the S3 API — which
 //! (`bootstrap.rs`) and handed in, exactly like the Diesel `Db` handle: an
 //! adapter never reads `S3_ENDPOINT` itself.
 
-use crate::domain::{check_blob_key, BlobStore, DomainError};
+use crate::domain::{check_blob_key, BlobStore, DomainError, Readiness};
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
@@ -4454,6 +4566,27 @@ impl BlobStore for S3BlobStore {
             .map_err(infra)
     }
 }
+
+#[async_trait]
+impl Readiness for S3BlobStore {
+    fn name(&self) -> &'static str {
+        "s3"
+    }
+
+    /// `HEAD` on the bucket: reachable, credentials accepted, bucket exists —
+    /// the three things a first `put` would otherwise be the one to find out.
+    /// It is authorized by `s3:ListBucket` on the *bucket* ARN, which a policy
+    /// that only grants the object ARNs does not cover.
+    async fn ready(&self) -> Result<(), DomainError> {
+        self.client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(infra)
+    }
+}
 "##;
 
 /// Inserted above `// kodegen:resources` in `build_services_from_env`.
@@ -4492,7 +4625,13 @@ const S3_RESOURCE: &str = r##"    // one S3 client for the whole process. `S3_BU
             conf = conf.endpoint_url(endpoint).force_path_style(true);
         }
         (aws_sdk_s3::Client::from_conf(conf.build()), bucket)
-    });"##;
+    });
+    if let Some((client, bucket)) = &s3 {
+        readiness.push(Arc::new(crate::infrastructure::s3_blobs::S3BlobStore::new(
+            client.clone(),
+            bucket,
+        )));
+    }"##;
 
 /// Appended to `bootstrap.rs`.
 const BUILD_BLOB_STORE_TPL: &str = r##"/// S3 when `S3_BUCKET` is set, a directory on disk otherwise — the same
@@ -4834,7 +4973,7 @@ const CLICKHOUSE_EVENTS_TPL: &str = r##"//! `EventSink` adapter over ClickHouse,
 //! root (`bootstrap.rs`) and handed in, exactly like the Diesel `Db` handle: an
 //! adapter never reads `CLICKHOUSE_URL` itself.
 
-use crate::domain::{check_event, DomainError, Event, EventSink};
+use crate::domain::{check_event, DomainError, Event, EventSink, Readiness};
 use async_trait::async_trait;
 use clickhouse::{Client, Row};
 use serde::Serialize;
@@ -4963,6 +5102,24 @@ impl EventSink for ClickhouseEventSink {
             .unwrap_or(Err(DomainError::Unavailable))
     }
 }
+
+#[async_trait]
+impl Readiness for ClickhouseEventSink {
+    fn name(&self) -> &'static str {
+        "clickhouse"
+    }
+
+    /// One row fetched rather than `execute()`, so the answer is read back and
+    /// not just the request accepted. Needs no table.
+    async fn ready(&self) -> Result<(), DomainError> {
+        self.client
+            .query("SELECT 1")
+            .fetch_one::<u8>()
+            .await
+            .map(|_| ())
+            .map_err(infra)
+    }
+}
 "##;
 
 /// Inserted above `// kodegen:resources` in `build_services_from_env`.
@@ -4983,7 +5140,12 @@ const CLICKHOUSE_RESOURCE: &str = r##"    // one ClickHouse client for the whole
             client = client.with_password(password);
         }
         client
-    });"##;
+    });
+    if let Some(client) = &clickhouse {
+        readiness.push(Arc::new(
+            crate::infrastructure::clickhouse_events::ClickhouseEventSink::new(client.clone()),
+        ));
+    }"##;
 
 /// Appended to `bootstrap.rs`.
 const BUILD_EVENT_SINK_CLICKHOUSE: &str = r##"/// ClickHouse when `CLICKHOUSE_URL` is set, the tracing log otherwise — the same
@@ -5016,7 +5178,7 @@ const LINE_PROTOCOL_EVENTS_TPL: &str = r##"//! `EventSink` adapter over the Infl
 //! TLS-terminating proxy or swap `build_http()` below for a `hyper-rustls`
 //! connector (one line here, one dependency in Cargo.toml).
 
-use crate::domain::{check_event, DomainError, Event, EventSink};
+use crate::domain::{check_event, DomainError, Event, EventSink, Readiness};
 use async_trait::async_trait;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -5041,17 +5203,22 @@ pub struct LineProtocolEventSink {
     /// The complete write endpoint, query string included — see
     /// `bootstrap.rs`, which is where the vendor differences live.
     url: String,
+    /// `<base>/health`: the one path all three servers answer on the same base
+    /// the write endpoint hangs off (`/health` on InfluxDB v2 and v3,
+    /// `/v1/influxdb/health` on GreptimeDB), with 2xx meaning healthy.
+    health: String,
     token: Option<String>,
 }
 
 impl LineProtocolEventSink {
-    pub fn new(url: impl Into<String>, token: Option<String>) -> Self {
+    pub fn new(base: &str, url: impl Into<String>, token: Option<String>) -> Self {
         Self {
             // one pooled, keep-alive client for the whole process; it dials on
             // the first write, so a sink that is not up cannot stop the service
             // booting
             client: Client::builder(TokioExecutor::new()).build_http(),
             url: url.into(),
+            health: format!("{}/health", base.trim_end_matches('/')),
             token,
         }
     }
@@ -5139,6 +5306,44 @@ impl LineProtocolEventSink {
         ))
     }
 }
+
+#[async_trait]
+impl Readiness for LineProtocolEventSink {
+    fn name(&self) -> &'static str {
+        "timeseries"
+    }
+
+    /// `GET <base>/health`. The token goes along for a server that gates it;
+    /// the three known ones do not.
+    async fn ready(&self) -> Result<(), DomainError> {
+        let mut req = Request::get(&self.health);
+        if let Some(token) = &self.token {
+            req = req.header(AUTHORIZATION, format!("Token {token}"));
+        }
+        let req = req
+            .body(Full::default())
+            .map_err(|e| DomainError::Other(Box::new(e)))?;
+        let res = self.client.request(req).await.map_err(|e| {
+            if e.is_connect() {
+                DomainError::Unavailable
+            } else {
+                DomainError::Other(Box::new(e))
+            }
+        })?;
+        // the same judgement as `post`: a non-2xx is the server's answer, and
+        // it says what is wrong (a 503 from `/health` is the server saying "not
+        // healthy"; a 404 is the wrong base URL) — but it is an `Other`, so that
+        // status reaches the operator through the warn log and the caller's
+        // `/ready` says "internal error"
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(DomainError::Other(
+                format!("health endpoint answered {}", res.status()).into(),
+            ))
+        }
+    }
+}
 "##;
 
 /// Inserted above `// kodegen:resources` in `build_services_from_env`.
@@ -5166,17 +5371,30 @@ const INFLUX_RESOURCE: &str = r##"    // the write endpoint, assembled once. `IN
         if let Ok(org) = std::env::var("INFLUX_ORG") {
             url.push_str(&format!("&org={org}"));
         }
-        (url, std::env::var("INFLUX_TOKEN").ok())
-    });"##;
+        // the base travels too: the readiness check is `<base>/health`
+        (base, url, std::env::var("INFLUX_TOKEN").ok())
+    });
+    if let Some((base, url, token)) = &influx {
+        readiness.push(Arc::new(
+            crate::infrastructure::line_protocol_events::LineProtocolEventSink::new(
+                base,
+                url,
+                token.clone(),
+            ),
+        ));
+    }"##;
 
 /// Appended to `bootstrap.rs`.
 const BUILD_EVENT_SINK_INFLUX: &str = r##"/// The time-series database when `INFLUX_URL` is set, the tracing log otherwise
 /// — the same env-picks-the-adapter rule `build_user_service` follows for
 /// `DATABASE_URL`.
-fn build_event_sink(influx: Option<&(String, Option<String>)>) -> Arc<dyn crate::domain::EventSink> {
+fn build_event_sink(
+    influx: Option<&(String, String, Option<String>)>,
+) -> Arc<dyn crate::domain::EventSink> {
     match influx {
-        Some((url, token)) => Arc::new(
+        Some((base, url, token)) => Arc::new(
             crate::infrastructure::line_protocol_events::LineProtocolEventSink::new(
+                base,
                 url,
                 token.clone(),
             ),
@@ -5316,7 +5534,7 @@ async fn clickhouse_event_sink_honors_the_contract() {
 /// anything else into an error, which is what makes this assertion real).
 const INFLUX_TEST: &str = r##"#[tokio::test]
 async fn line_protocol_event_sink_honors_the_contract() {
-    let Ok(url) = std::env::var("INFLUX_URL") else {
+    let Ok(base) = std::env::var("INFLUX_URL") else {
         eprintln!("INFLUX_URL unset — skipping the line-protocol contract test");
         return;
     };
@@ -5325,12 +5543,12 @@ async fn line_protocol_event_sink_honors_the_contract() {
     let bucket = std::env::var("INFLUX_BUCKET").expect("INFLUX_BUCKET");
     let mut url = format!(
         "{}/api/v2/write?bucket={bucket}&precision=ns",
-        url.trim_end_matches('/')
+        base.trim_end_matches('/')
     );
     if let Ok(org) = std::env::var("INFLUX_ORG") {
         url.push_str(&format!("&org={org}"));
     }
-    let sink = LineProtocolEventSink::new(url, std::env::var("INFLUX_TOKEN").ok());
+    let sink = LineProtocolEventSink::new(&base, url, std::env::var("INFLUX_TOKEN").ok());
     // every write above is asserted to succeed, and the adapter only succeeds on
     // a 2xx — a rejected point, a bad token or an unknown bucket all fail here
     behaves_like_an_event_sink(&sink, &measurement("influx")).await;
@@ -5412,6 +5630,11 @@ mod tests {
         assert!(toml.contains("default = [\"mysql\"]"), "{toml}");
         let db = fs::read_to_string(root.join(DIESEL_DB)).unwrap();
         assert!(db.contains("MysqlConnection"), "{db}");
+        // `/ready` names what the operator runs, which is the alias, not the driver
+        assert!(
+            db.contains("impl Readiness for Db") && db.contains("\"mariadb\""),
+            "{db}"
+        );
         let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
         assert!(compose.contains("mariadb:11"), "{compose}");
         fs::remove_dir_all(&root).unwrap();
@@ -5763,6 +5986,7 @@ mod tests {
         let openapi = fs::read_to_string(root.join(OPENAPI_RS)).unwrap();
         for path in [
             "crate::api::health",
+            "crate::api::ready",
             "crate::api::user::create_user",
             "crate::api::user::get_user",
             "crate::api::hello::say_hello",
@@ -5777,8 +6001,9 @@ mod tests {
         assert!(api_mod.contains("pub mod openapi;"), "{api_mod}");
         assert!(api_mod.contains(".merge(openapi::routes())"), "{api_mod}");
         assert!(
-            api_mod.contains("utoipa::path") && api_mod.contains("utoipa::ToSchema"),
-            "health/ErrorRes were not annotated: {api_mod}"
+            api_mod.matches("utoipa::path").count() == 2
+                && api_mod.matches("utoipa::ToSchema").count() == 2,
+            "health/ready/ErrorRes/ReadyRes were not annotated: {api_mod}"
         );
 
         let user = fs::read_to_string(root.join(USER_API)).unwrap();
@@ -6840,6 +7065,11 @@ mod tests {
             "{bootstrap}"
         );
         assert!(!bootstrap.contains("diesel"), "{bootstrap}");
+        assert_eq!(
+            bootstrap.matches("readiness.push(").count(),
+            4,
+            "{bootstrap}"
+        );
         let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
         for service in ["  postgres:", "  redis:", "  s3:", "  clickhouse:"] {
             assert!(compose.contains(service), "{service} missing: {compose}");
@@ -7275,6 +7505,11 @@ mod tests {
         assert!(bootstrap.contains("blobs: build_blob_store(s3.as_ref()),"), "{bootstrap}");
         assert!(bootstrap.contains("events: build_event_sink(clickhouse.as_ref()),"), "{bootstrap}");
         assert!(!bootstrap.contains("diesel"), "{bootstrap}");
+        assert_eq!(
+            bootstrap.matches("readiness.push(").count(),
+            4,
+            "{bootstrap}"
+        );
         let compose = fs::read_to_string(root.join(COMPOSE)).unwrap();
         for service in ["  mssql:", "  mssql-init:", "  redis:", "  s3:", "  clickhouse:"] {
             assert!(compose.contains(service), "{service} missing: {compose}");
@@ -7589,9 +7824,11 @@ mod tests {
         assert!(bootstrap.contains("/api/v2/write?bucket="), "{bootstrap}");
         assert!(bootstrap.contains("events: build_event_sink(influx.as_ref()),"), "{bootstrap}");
         assert!(bootstrap.contains("events: build_event_sink(None),"), "{bootstrap}");
+        assert!(bootstrap.contains("readiness.push("), "the sink's readiness check is not registered: {bootstrap}");
 
         let adapter = fs::read_to_string(root.join(LINE_PROTOCOL_EVENTS)).unwrap();
         assert!(adapter.contains("impl EventSink for LineProtocolEventSink"), "{adapter}");
+        assert!(adapter.contains("impl Readiness for LineProtocolEventSink"), "{adapter}");
         // the reason this covers three products with one adapter, documented
         // where the decision is made
         assert!(adapter.contains("GreptimeDB"), "{adapter}");
@@ -7848,6 +8085,13 @@ mod tests {
         ] {
             assert!(bootstrap.contains(line), "{line} missing: {bootstrap}");
         }
+        // one readiness check per real backend — the datastore's is the block
+        // the swap leaves in place
+        assert_eq!(
+            bootstrap.matches("readiness.push(").count(),
+            4,
+            "{bootstrap}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

@@ -112,7 +112,8 @@ touches, its env vars, and its default (server-less) adapter.
 
 | Method | Path | Description | Success | Failure |
 |---|---|---|---|---|
-| GET | `/health` | Liveness check | `200` `ok` | — |
+| GET | `/health` | Liveness: the process is up. Never looks at a backend | `200` `ok` | — |
+| GET | `/ready` | Readiness: every real backend's check (`SELECT 1`, `PING`, `HEAD bucket`, ...), run concurrently, 2s each | `200` `{"status":"ok"}` | `503` `{"status":"unavailable","checks":{"<backend>":"ok"\|"<why>"}}` |
 | POST | `/users` | Create a user. Body: `{"id": "...", "name": "..."}` | `201` `{"ok": true}` | `400` on empty/too-long `id` or `name` |
 | GET | `/users/{id}` | Fetch a user | `200` `User` JSON (`{"id", "name"}`) | `404` if not found |
 | GET | `/hello/{name}` | Greet via the outbound gRPC Greeter service | `200` `{"message": "..."}` | `503` if the circuit breaker is open or the upstream is unavailable |
@@ -122,6 +123,19 @@ curl -X POST localhost:8080/users -H 'content-type: application/json' -d '{"id":
 curl localhost:8080/users/u1
 curl localhost:8080/hello/world
 ```
+
+`/health` and `/ready` are the two Kubernetes probes, and they must stay two: a
+pod whose database is down should stop *receiving traffic* (`readinessProbe:
+/ready`) and not be *restarted* into the same state (`livenessProbe: /health`).
+A fresh project registers no check, so `/ready` is `200` with no server around;
+each `kodegen add` registers its adapter's in `bootstrap.rs`, and the check *is*
+the first connection for the adapters that dial lazily. The failure text is the
+`DomainError` (`service unavailable`, `timed out after 2s`, `internal error`) —
+never the driver's own, which can carry a connection string; that goes to the
+log at `warn`. Set the probe's `timeoutSeconds` above 2. With `GRPC_PORT` set
+the same checks also answer `grpc.health.v1` (service `""`, re-evaluated every
+10s), for a `grpc:` probe or `grpcurl`. The `Dockerfile` has no `HEALTHCHECK`
+— distroless has no shell to run one — so the probes are the orchestrator's job.
 
 After `kodegen add scalar`, two more routes exist: `GET /docs` (a Scalar UI,
 needs a network for its JS) and `GET /openapi.json` (the spec itself, fully
@@ -500,7 +514,12 @@ loader where the client is built.
 
 The bucket itself is not created for you — `tests/blob.rs` creates it because a
 test may, but the app assumes it exists, the same way it assumes the database
-does.
+does. Neither does `docker compose up`, so on a fresh stack `/ready` reports
+`s3` as failing until you make it (`aws --endpoint-url http://localhost:9000 s3
+mb s3://<bucket>`, or `mc mb`). The readiness check is `HeadBucket`, which AWS
+authorizes with `s3:ListBucket` on the **bucket** ARN — a policy granting only
+the object ARNs (`arn:aws:s3:::bucket/*`) leaves `/ready` failing on a bucket
+the app can otherwise read and write.
 
 ### Event sink (`kodegen add clickhouse` / `influxdb` / `greptimedb`)
 
@@ -587,7 +606,7 @@ of infrastructure, so it sits next to anything and never conflicts.
 ```
 Cargo.toml                              default = [...] gains "apidocs" (utoipa/utoipa-scalar were already optional deps)
 src/api/openapi.rs                      created — the ApiDoc derive + GET /docs + GET /openapi.json
-src/api/mod.rs                          .merge(openapi::routes()); #[cfg_attr(..., utoipa::path)] on health, ToSchema on ErrorRes
+src/api/mod.rs                          .merge(openapi::routes()); #[cfg_attr(..., utoipa::path)] on health and ready, ToSchema on ErrorRes and ReadyRes
 src/api/user.rs                         same cfg_attr treatment on create_user/get_user/CreateUserReq
 src/api/hello.rs                        same cfg_attr treatment on say_hello
 src/domain/model.rs                     ToSchema on User
@@ -640,9 +659,9 @@ the API.
 
 **Schemas are collected automatically.** `#[openapi(paths(...))]` only lists
 functions; utoipa 5 walks each one's `request_body`/`responses` recursively and
-adds `CreateUserReq`, `ErrorRes`, `User` (and whatever a scaffolded feature
-adds) to `components.schemas` without a `components(schemas(...))` list to keep
-in sync by hand. `info.title`/`info.version` come from `Cargo.toml`'s own
+adds `CreateUserReq`, `ErrorRes`, `ReadyRes`, `User` (and whatever a scaffolded
+feature adds) to `components.schemas` without a `components(schemas(...))` list
+to keep in sync by hand. `info.title`/`info.version` come from `Cargo.toml`'s own
 `[package] name`/`version` — no placeholder to forget either.
 
 ### Running a backend locally
