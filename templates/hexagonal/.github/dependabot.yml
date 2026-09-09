@@ -1,0 +1,30 @@
+# Ships with the generated project — `kodegen new` copies this template verbatim,
+# so paths here are relative to the *generated* repository root, not kodegen's.
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+
+updates:
+  # ci.yml builds with `--locked`, so a bump has to re-resolve the committed
+  # Cargo.lock in a PR. Minor+patch land as one PR: the CI job checks every
+  # optional backend, and several build a C driver from source.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]

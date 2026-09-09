@@ -1,0 +1,44 @@
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+
+updates:
+  # The kodegen CLI itself.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      # One PR for all minor+patch bumps instead of one per crate. The `generated`
+      # matrix in ci.yml is a dozen-odd jobs, several of which build C from
+      # source, so a PR per crate would spend hours proving the same thing.
+      # Majors are deliberately left ungrouped — those get read one at a time.
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # The template is its own crate with a committed Cargo.lock, and both CIs build
+  # it with `--locked`, so a bump here has to arrive as a PR that re-resolves the
+  # lock — `cargo update` on a dev machine is what CI exists to catch.
+  - package-ecosystem: cargo
+    directory: "/templates/hexagonal"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      template-cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
