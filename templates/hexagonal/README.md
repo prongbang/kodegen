@@ -137,6 +137,23 @@ the same checks also answer `grpc.health.v1` (service `""`, re-evaluated every
 10s), for a `grpc:` probe or `grpcurl`. The `Dockerfile` has no `HEALTHCHECK`
 — distroless has no shell to run one — so the probes are the orchestrator's job.
 
+Every response carries an `x-request-id`: a caller's own header is passed
+through untouched (so an id assigned at the edge survives every hop) and a
+request without one gets a fresh uuid. Every request also gets one `INFO` line
+when it finishes, carrying `method`, `path`, `request_id`, `status` and
+`latency` — as a `tracing` span, so it reads the same in plain text and under
+`LOG_FORMAT=json`. Headers and bodies are never logged; they carry credentials.
+A handler that outlives `api::REQUEST_TIMEOUT` (30s — well past anything here on
+purpose, well under the 60s an idle load balancer gives up at) is dropped and
+the caller gets `408 Request Timeout`, still with its id. `api::middleware` is
+that whole stack as one function, so a test can wrap a router of its own in it.
+With `GRPC_PORT` set the gRPC server gets the same 30s budget and the same
+per-request span (no id — gRPC callers carry their own metadata). Both budgets
+start once the handler is invoked; hyper's header read and body streaming are
+not covered. tonic applies its timeout outside the layer stack, so on expiry a
+gRPC caller gets `CANCELLED` ("Timeout expired"), not `DEADLINE_EXCEEDED`, and
+nothing is logged — where HTTP gets its `408` and an access-log line.
+
 After `kodegen add scalar`, two more routes exist: `GET /docs` (a Scalar UI,
 needs a network for its JS) and `GET /openapi.json` (the spec itself, fully
 offline) — see [API documentation](#api-documentation-kodegen-add-scalar).
@@ -710,7 +727,7 @@ Reference numbers from one machine (Apple M4 Pro, release build, `wrk -t4 -c64`,
 | In-memory | ~175k req/s, p99 ~0.5ms | ~175k req/s, p99 ~0.5ms |
 | Diesel/SQLite (WAL) | ~41k req/s | ~51k req/s |
 
-Allocations per request (`alloc_bench`):
+Allocations per request (`alloc_bench`), measured before the request-id/trace/timeout middleware; those add a UUID string, a span with three fields and a timer per request:
 
 | Endpoint | In-memory | Diesel |
 |---|---|---|

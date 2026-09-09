@@ -48,6 +48,11 @@ tonic-prost = "0.14.6"
 # 0.14 line as tonic; its dependencies were all in the lock already.
 tonic-health = "0.14.6"
 tower = { version = "0.5.3", features = ["util"] }
+# The three HTTP middlewares a deployed service needs and axum ships none of: an
+# `x-request-id` on every response, one span + one line per request, and a wall
+# clock on the handler (see `api::middleware`). The `Layer` trait it hangs those
+# off is `tower`, already here; nothing else enters the lock but `uuid`.
+tower-http = { version = "0.6.11", features = ["request-id", "timeout", "trace"] }
 # Optional like every other datastore driver, and for the same reason: with
 # `document` selected there is no Diesel code left to compile (see
 # `infrastructure/mod.rs`), so nothing should pull the ORM or its migration

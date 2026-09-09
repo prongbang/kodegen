@@ -1,4 +1,6 @@
 use hexagonal_rs::{api, bootstrap};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // How long a graceful drain may take before the process exits anyway. Both
@@ -52,6 +54,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut rx = rx.clone();
         tracing::info!("starting gRPC on {grpc_addr}");
         tonic::transport::Server::builder()
+            // the gRPC half of `api::middleware`: same wall clock on a handler,
+            // same one-span-per-request access log. There is no request-id layer
+            // here — gRPC callers carry their own metadata and tonic has no
+            // equivalent header convention.
+            .timeout(api::REQUEST_TIMEOUT)
+            // levels spelled out because `new_for_grpc` defaults to DEBUG, which
+            // the `info` EnvFilter drops — gRPC would log nothing. `on_failure`
+            // stays at warn: `GrpcErrorsAsFailures` counts every non-OK code,
+            // NotFound and InvalidArgument included, as a failure.
+            .layer(
+                TraceLayer::new_for_grpc()
+                    .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                    .on_response(DefaultOnResponse::new().level(Level::INFO))
+                    .on_failure(DefaultOnFailure::new().level(Level::WARN)),
+            )
             .add_routes(routes)
             .serve_with_shutdown(grpc_addr, async move {
                 let _ = rx.changed().await;

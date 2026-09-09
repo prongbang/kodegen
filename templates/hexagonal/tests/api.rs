@@ -183,3 +183,48 @@ async fn create_user_empty_name_is_400() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
+
+/// Every response carries an id, whether or not the caller brought one — the
+/// two cases together are the whole contract of the request-id pair.
+#[tokio::test]
+async fn request_id_is_generated_or_propagated() {
+    let app = bootstrap::build_router();
+    let res = app
+        .clone()
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(!res.headers()["x-request-id"].is_empty());
+
+    let res = app
+        .oneshot(
+            Request::get("/health")
+                .header("x-request-id", "abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.headers()["x-request-id"], "abc");
+}
+
+/// The production stack around a handler that outlives its budget: 408, not a
+/// hung connection. Wrapped by hand only to shorten the 30s wait.
+#[tokio::test]
+async fn slow_handler_times_out() {
+    let router = axum::Router::new().route(
+        "/slow",
+        axum::routing::get(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }),
+    );
+    let app = hexagonal_rs::api::middleware(router, std::time::Duration::from_millis(100));
+    let res = app
+        .oneshot(Request::get("/slow").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::REQUEST_TIMEOUT);
+    // the id layer is outside the timeout, so even the response the handler
+    // never produced is traceable
+    assert!(!res.headers()["x-request-id"].is_empty());
+}

@@ -49,7 +49,13 @@ cheapest real round-trip (`SELECT 1`, `PING`, `HEAD bucket`, `GET /health`), and
 `add` registers it in `bootstrap.rs` — so `GET /ready` (and, with `GRPC_PORT`,
 `grpc.health.v1`) answers `503` naming the backend that is down, while
 `GET /health` stays a plain liveness `ok`. A project with no capability on
-registers nothing and is ready as soon as it listens.
+registers nothing and is ready as soon as it listens. Every HTTP response also
+carries an `x-request-id` (the caller's own, or a fresh uuid) that appears in
+that request's one-line access log alongside its method, path, status and
+latency, and every request is bounded at 30s once the handler is invoked →
+`408`. gRPC gets the same budget, but tonic applies it outside the layer stack,
+so the caller sees `CANCELLED` ("Timeout expired"), not `DEADLINE_EXCEEDED`, and
+nothing is logged.
 
 ## Install
 
