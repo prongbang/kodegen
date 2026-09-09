@@ -53,6 +53,16 @@ tower = { version = "0.5.3", features = ["util"] }
 # clock on the handler (see `api::middleware`). The `Layer` trait it hangs those
 # off is `tower`, already here; nothing else enters the lock but `uuid`.
 tower-http = { version = "0.6.11", features = ["request-id", "timeout", "trace"] }
+# Prometheus metrics, for the same reason as the line above: axum ships none.
+# `metrics` is the facade the ~20-line middleware in `api/mod.rs` records
+# through and this is the recorder `/metrics` renders. `axum-prometheus` was the
+# alternative and is strictly larger both ways — it depends on these two plus a
+# builder of its own, for the same three metric families. `default-features =
+# false` drops the exporter's own HTTP listener and push gateway (a second
+# server on a second port); the handler renders through
+# `PrometheusHandle::render()` on the port already open.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
 # Optional like every other datastore driver, and for the same reason: with
 # `document` selected there is no Diesel code left to compile (see
 # `infrastructure/mod.rs`), so nothing should pull the ORM or its migration

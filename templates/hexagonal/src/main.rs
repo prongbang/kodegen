@@ -46,6 +46,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // The exporter only folds raw histogram samples into buckets on a scrape or
+    // an upkeep pass, so a service nothing scrapes would grow without bound.
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            api::recorder().run_upkeep();
+        }
+    });
+
     let services = bootstrap::build_services_from_env();
     let app = api::router(services.clone());
 

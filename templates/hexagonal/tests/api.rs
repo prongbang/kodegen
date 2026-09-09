@@ -228,3 +228,61 @@ async fn slow_handler_times_out() {
     // never produced is traceable
     assert!(!res.headers()["x-request-id"].is_empty());
 }
+
+/// The scrape endpoint, and the label that keeps it affordable. The recorder is
+/// global to the process and every other test in this file feeds it, so this
+/// asserts the shape of the output and never a count.
+#[tokio::test]
+async fn metrics_are_exported_per_route_template() {
+    let app = bootstrap::build_router();
+    let res = app
+        .clone()
+        .oneshot(Request::get("/users/nope").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // `route_layer` wraps the per-path 405 fallback, so the method label is
+    // client-controlled unless it is a whitelist: this must not mint a series.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("FOOBAR")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let res = app
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/plain"));
+
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    // the route template, never `/users/nope` — one series per route, not one
+    // per user id
+    assert!(body.contains(r#"path="/users/{id}""#), "{body}");
+    assert!(!body.contains("/users/nope"), "{body}");
+    assert!(body.contains("http_requests_total{"), "{body}");
+    // `_bucket`, not the quantiles the exporter emits without `set_buckets`
+    assert!(
+        body.contains("http_request_duration_seconds_bucket"),
+        "{body}"
+    );
+    assert!(body.contains("http_requests_in_flight"), "{body}");
+    // the 405 above is counted, but as `method="other"` — never as the verb the
+    // client picked
+    assert!(!body.contains("FOOBAR"), "{body}");
+}

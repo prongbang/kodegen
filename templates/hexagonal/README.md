@@ -158,6 +158,56 @@ After `kodegen add scalar`, two more routes exist: `GET /docs` (a Scalar UI,
 needs a network for its JS) and `GET /openapi.json` (the spec itself, fully
 offline) — see [API documentation](#api-documentation-kodegen-add-scalar).
 
+### Metrics
+
+`GET /metrics` renders the Prometheus text format (`text/plain; version=0.0.4; charset=utf-8`)
+from an in-process recorder. Three families, fed by the middleware in
+`api/mod.rs`:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `http_requests_total` | counter | `method`, `path`, `status` |
+| `http_request_duration_seconds` | histogram (`_bucket`/`_sum`/`_count`, 5ms…10s) | `method`, `path` |
+| `http_requests_in_flight` | gauge | — |
+
+`path` is the **matched route template** (`/users/{id}`), never the request's
+raw path: the raw path would open one time series per user id, which is how a
+Prometheus server runs out of memory. That label comes from axum's
+`MatchedPath`, which only exists below the router — which is why this one layer
+goes on with `route_layer` in `api::middleware` while everything else there is
+a `.layer()`. Three consequences worth knowing: a request to an *unmatched*
+path is not counted at all (no `path="unmatched"` series for whatever scans the
+internet to fill), while a 405 on a matched path **is** counted — `route_layer`
+wraps the per-path method fallback too, so `curl -X FOOBAR /health` lands as
+`method="other"`, the bucket every method outside the nine standard verbs
+shares so a client cannot mint series by naming them; `/health`, `/ready` and
+`/metrics` *are* counted like any other route, because they are cheap and their
+absence from a dashboard is more confusing than their presence; and a request
+cut off by the 30s timeout is counted nowhere, since that layer sits above this
+one (the in-flight gauge is decremented by a drop guard, so it does not leak
+when that happens).
+
+Latency is measured to the response *headers* — when the handler returns — not
+to the last byte of a streamed body. A background task calls the exporter's
+`run_upkeep` every 10s so raw histogram samples are folded into buckets even
+when nothing scrapes; memory stays bounded on a service no Prometheus has
+found yet.
+
+`/metrics` is unauthenticated and served on the application port, so anything
+that can reach the API can read it. Keep the port off the internet and scrape
+the pod IP directly:
+
+```yaml
+annotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+```
+
+If the app port is public, block `/metrics` at the ingress (or move the scrape
+to a second, cluster-only listener) — the route templates and latencies it
+exposes are a map of the service.
+
 ## Environment Variables
 
 | Variable | Default | Description |

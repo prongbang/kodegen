@@ -55,7 +55,9 @@ that request's one-line access log alongside its method, path, status and
 latency, and every request is bounded at 30s once the handler is invoked →
 `408`. gRPC gets the same budget, but tonic applies it outside the layer stack,
 so the caller sees `CANCELLED` ("Timeout expired"), not `DEADLINE_EXCEEDED`, and
-nothing is logged.
+nothing is logged. `GET /metrics` renders the Prometheus text format — request
+count, duration histogram and in-flight gauge, labelled by the *matched route*
+(`/users/{id}`), never the raw path (see the template README's `Metrics`).
 
 ## Install
 
