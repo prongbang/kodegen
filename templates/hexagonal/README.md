@@ -267,6 +267,86 @@ in particular **cannot** use `TEXT PRIMARY KEY` — indexing a `TEXT` column nee
 a prefix length, so the users table uses `VARCHAR(64)` there. That one fails at
 migration time, not compile time.
 
+### Migrations in Kubernetes
+
+The Diesel backends run pending migrations at boot, in `build_pool`. A rollout
+starts every replica at once, so on an empty database N harnesses would race
+each other — on PostgreSQL that is one pod crash-looping once with `relation
+already exists`; on MySQL/MariaDB, where DDL is not transactional, it can be a
+half-applied migration. So the run is serialized on the **database's own
+lock**: `pg_advisory_lock(hashtext('diesel_migrations'))` on
+PostgreSQL/TimescaleDB, `GET_LOCK('diesel_migrations', 3600)` on MySQL/MariaDB
+(an hour, not `-1`: MariaDB answers a negative timeout with `NULL` at once
+rather than waiting). The second replica waits, then finds nothing pending. The
+lock is session-scoped, so a pod killed mid-migration releases it with its
+connection. Nothing to configure: N replicas booting together is safe as
+shipped.
+
+Session-scoped is also its one requirement. Through a pooler in transaction
+mode (PgBouncer `pool_mode=transaction`, ProxySQL) the lock, the migration and
+the unlock can each land on a *different* server session, so the lock serializes
+nothing and the session that took it holds it until `server_lifetime`. Point
+`DATABASE_URL` at the server itself for migrate runs, or use session pooling.
+
+The waiters pay for the lock too: `build_pool` runs before the listener binds,
+so a replica queued on it answers neither `/health` nor `/ready` — there is no
+open port yet. Size a `startupProbe` to the longest migration you expect
+(`failureThreshold × periodSeconds`); without one the liveness probe restarts
+the waiters and the rollout never converges.
+
+Two switches for when the replicas should not be the ones applying DDL — the
+application role has no `CREATE` rights in production, or a migration is long
+enough to trip the readiness/liveness probes of the pod running it:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RUN_MODE=migrate` | unset | Do everything the boot does before it listens (for Diesel: the migrations), log, exit 0. Nothing is served. A failed migration is a non-zero exit — and so is a missing datastore URL (`MONGODB_URL` after `add mongodb`, `DATABASE_URL` otherwise), so a typo'd secret fails the Job red instead of quietly migrating the in-memory adapter. |
+| `MIGRATE_ON_START=false` | `true` | Skip the migration run at boot: the process only connects. On a database whose schema is behind, the first query fails (a 500 on that request), the process does **not** crash. `/ready` still answers 200 — it checks connectivity, not schema — so the pod takes traffic and 500s on `/users` until the migrate run lands. `RUN_MODE=migrate` ignores this, so a Job and its replicas can share one env. |
+
+The pattern: one `RUN_MODE=migrate` run per rollout, before the replicas.
+Either an `initContainer` on the Deployment (every pod runs it; the lock makes
+that harmless) or a Job with a hook. Same image, same `DATABASE_URL`:
+
+```yaml
+# Deployment: replicas only connect
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: migrate
+          image: ghcr.io/you/app:1.2.3
+          env:
+            - { name: RUN_MODE, value: migrate }
+            - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: app-db, key: url } } }
+      containers:
+        - name: app
+          image: ghcr.io/you/app:1.2.3
+          env:
+            - { name: MIGRATE_ON_START, value: "false" }
+            - { name: DATABASE_URL, valueFrom: { secretKeyRef: { name: app-db, key: url } } }
+```
+
+Migrate mode runs the whole composition root, so every *other* resource's env
+has to be there too — `S3_BUCKET` without its credentials fails the migrate run
+as readily as the app: `envFrom` the same secret in both containers, so the set
+is present or absent together.
+
+For a Job instead of an initContainer, set `activeDeadlineSeconds`: a migrate
+run waits on the lock (indefinitely on PostgreSQL, up to an hour on
+MySQL/MariaDB), and a deadline is what turns "a stuck holder" into a failed Job
+rather than a hung rollout. Roll the schema
+forward only — a Deployment keeps old pods serving while new ones come up, so
+a migration the previous image cannot live with needs its own two-step.
+
+`sqlite` is one file with one writer and gets the two switches but no lock —
+two processes on one file queue on `busy_timeout`, and N replicas over one
+SQLite file is not a deployment. The lazy adapters (`--orm seaorm`, `mongodb`,
+`mssql`, `clickhouse`) create their schema on the first request with
+idempotent statements and a one-shot retry on the loser of a collision, so
+they have no boot-time run to move: `RUN_MODE=migrate` exits 0 having done
+nothing for them — once its datastore URL is set, which it still checks — and
+`MIGRATE_ON_START` is not read.
+
 ### The other ORM (`kodegen add <backend> --orm seaorm`)
 
 The relational capabilities take `--orm diesel` (the default, everything above)

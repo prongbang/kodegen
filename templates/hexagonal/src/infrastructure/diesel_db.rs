@@ -43,13 +43,26 @@ pub fn build_pool(
     // no concurrent connections yet, so no SQLITE_BUSY races at startup
     let mut setup = SqliteConnection::establish(database_url)?;
     setup.batch_execute("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")?;
-    setup.run_pending_migrations(MIGRATIONS)?;
+    // SQLite is one file with one writer, so two processes migrating at once
+    // only ever queue on busy_timeout — no lock of our own, unlike the server
+    // backends `kodegen add` switches this file to
+    if migrate_on_start() {
+        setup.run_pending_migrations(MIGRATIONS)?;
+    }
     drop(setup);
 
     let manager = ConnectionManager::<SqliteConnection>::new(database_url);
     Ok(Pool::builder()
         .connection_customizer(Box::new(SqlitePragmas))
         .build(manager)?)
+}
+
+/// `MIGRATE_ON_START=false` hands the schema to a `RUN_MODE=migrate` run before
+/// the replicas start (README, "Migrations in Kubernetes"). That run always
+/// migrates, so a Job and its replicas can share one env.
+fn migrate_on_start() -> bool {
+    std::env::var("RUN_MODE").as_deref() == Ok("migrate")
+        || !std::env::var("MIGRATE_ON_START").is_ok_and(|v| v.eq_ignore_ascii_case("false"))
 }
 
 /// Cheap-to-clone handle every Diesel repository shares.

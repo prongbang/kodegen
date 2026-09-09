@@ -27,6 +27,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry.with(tracing_subscriber::fmt::layer()).init();
     }
 
+    // RUN_MODE=migrate: everything the boot does before it listens — for the
+    // Diesel backends that is the migration run in `build_pool` — then exit 0.
+    // A Kubernetes Job or initContainer runs this once per rollout so the
+    // replicas can boot with MIGRATE_ON_START=false (README, "Migrations in
+    // Kubernetes"). The lazy adapters (SeaORM, Mongo, SQL Server) set their
+    // schema up on the first request instead, so for them this is a no-op.
+    if std::env::var("RUN_MODE").as_deref() == Ok("migrate") {
+        // No datastore URL means the composition root falls back to the
+        // in-memory adapter, so the Job would exit 0 having migrated nothing —
+        // a typo'd secret has to fail red. `MONGODB_URL` too: `add mongodb`
+        // swaps which variable the composition root reads.
+        if std::env::var("DATABASE_URL").is_err() && std::env::var("MONGODB_URL").is_err() {
+            return Err("RUN_MODE=migrate needs DATABASE_URL".into());
+        }
+        bootstrap::build_services_from_env();
+        tracing::info!("RUN_MODE=migrate: schema is up to date, exiting");
+        return Ok(());
+    }
+
     let services = bootstrap::build_services_from_env();
     let app = api::router(services.clone());
 

@@ -705,6 +705,30 @@ impl Relational {
             .collect()
     }
 
+    /// What serializes N replicas migrating at boot: the server's own named
+    /// lock, session-scoped on both dialects so a crash releases it with the
+    /// connection. Bare `SELECT`s, run through `batch_execute`, so the result
+    /// is never looked at — which is why the `GET_LOCK` timeout is a large
+    /// positive number and not `-1`. MySQL documents `-1` as "wait forever";
+    /// MariaDB (11.8, measured) answers it with `NULL` at once, and a `0`/`NULL`
+    /// from `GET_LOCK` is not an error, so the harness would have carried on
+    /// without the lock. An hour is longer than any rollout waits.
+    // ponytail: after 3600s the loser proceeds unlocked (worst case: the old
+    // collision, which is loud). Read the result with `diesel::select(sql(..))`
+    // and fail on anything but 1 if that ceiling ever matters.
+    fn migrate_lock(self) -> (&'static str, &'static str) {
+        match self {
+            Relational::Postgres | Relational::Timescaledb => (
+                "SELECT pg_advisory_lock(hashtext('diesel_migrations'))",
+                "SELECT pg_advisory_unlock(hashtext('diesel_migrations'))",
+            ),
+            Relational::Mysql | Relational::Mariadb => (
+                "SELECT GET_LOCK('diesel_migrations', 3600)",
+                "SELECT RELEASE_LOCK('diesel_migrations')",
+            ),
+        }
+    }
+
     /// What `.on_conflict(...)` takes. Both dialects get a real upsert, so
     /// `save`'s documented "saving an existing id overwrites it" means the same
     /// thing whichever backend is on.
@@ -754,6 +778,8 @@ impl Relational {
             .replace("{{conflict_target}}", self.conflict_target())
             .replace("{{upsert_note}}", self.upsert_note())
             .replace("{{schema}}", &self.schema_literal())
+            .replace("{{migrate_lock}}", self.migrate_lock().0)
+            .replace("{{migrate_unlock}}", self.migrate_lock().1)
     }
 }
 
@@ -2490,6 +2516,7 @@ const DIESEL_DB_TPL: &str = r##"//! Shared Diesel/{{Dialect}} plumbing for every
 
 use crate::domain::{DomainError, Readiness};
 use async_trait::async_trait;
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
@@ -2506,14 +2533,32 @@ pub fn infra(e: impl std::error::Error + Send + Sync + 'static) -> DomainError {
 /// Builds the shared pool and runs pending migrations.
 /// Owned by the composition root (bootstrap), not by repositories.
 pub fn build_pool(database_url: &str) -> Result<DbPool, Box<dyn std::error::Error + Send + Sync>> {
-    // migrate on one connection before the pool exists: no other connection is
-    // open yet, so nothing can race the schema change at startup
+    // migrate on one connection before the pool exists: no other connection in
+    // *this* process is open yet. Other processes are — a rollout starts every
+    // replica at once, and two harnesses on one empty database collide (a
+    // duplicate `__diesel_schema_migrations`, "relation already exists") — so
+    // the server's own named lock serializes them: the second waits, then finds
+    // nothing pending. Session-scoped, so a crash mid-migration releases it with
+    // the connection; and no transaction around the harness, so each migration
+    // still runs in its own, exactly as before.
     let mut setup = {{Conn}}::establish(database_url)?;
-    setup.run_pending_migrations(MIGRATIONS)?;
+    if migrate_on_start() {
+        setup.batch_execute("{{migrate_lock}}")?;
+        setup.run_pending_migrations(MIGRATIONS)?;
+        setup.batch_execute("{{migrate_unlock}}")?;
+    }
     drop(setup);
 
     let manager = ConnectionManager::<{{Conn}}>::new(database_url);
     Ok(Pool::builder().build(manager)?)
+}
+
+/// `MIGRATE_ON_START=false` hands the schema to a `RUN_MODE=migrate` run before
+/// the replicas start (README, "Migrations in Kubernetes"). That run always
+/// migrates, so a Job and its replicas can share one env.
+fn migrate_on_start() -> bool {
+    std::env::var("RUN_MODE").as_deref() == Ok("migrate")
+        || !std::env::var("MIGRATE_ON_START").is_ok_and(|v| v.eq_ignore_ascii_case("false"))
 }
 
 /// Cheap-to-clone handle every Diesel repository shares.
@@ -5651,6 +5696,71 @@ mod tests {
         assert!(up.contains("VARCHAR(64) PRIMARY KEY"), "{up}");
         assert!(!up.contains("id TEXT"), "{up}");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A rollout starts every replica at once and each one migrates at boot, so
+    /// on an empty database two Diesel harnesses collide unless the server's own
+    /// lock serializes them — taken before the harness looks at what is pending,
+    /// released after. SQLite is one file with one writer: it gets the env
+    /// switches (the k8s story is the same) and no lock.
+    #[test]
+    fn migrations_are_serialized_by_the_databases_own_lock() {
+        for (tag, cap, lock, unlock) in [
+            (
+                "lock-pg",
+                Some(Capability::Postgres),
+                "pg_advisory_lock(hashtext('diesel_migrations'))",
+                "pg_advisory_unlock(hashtext('diesel_migrations'))",
+            ),
+            (
+                "lock-mysql",
+                Some(Capability::Mysql),
+                "GET_LOCK('diesel_migrations', 3600)",
+                "RELEASE_LOCK('diesel_migrations')",
+            ),
+            ("lock-sqlite", None, "", ""),
+        ] {
+            let root = fixture(tag);
+            if let Some(cap) = cap {
+                add(&root, cap, None, false).unwrap();
+            }
+            let db = code_only(&fs::read_to_string(root.join(DIESEL_DB)).unwrap());
+            let at = |needle: &str| {
+                db.find(needle)
+                    .unwrap_or_else(|| panic!("{tag}: no `{needle}` in {db}"))
+            };
+            if lock.is_empty() {
+                assert!(!db.to_lowercase().contains("lock("), "{tag}: {db}");
+            } else {
+                assert!(
+                    at(lock) < at("run_pending_migrations")
+                        && at("run_pending_migrations") < at(unlock),
+                    "{tag}: {db}"
+                );
+                // ordering alone would pass with the lock taken outside the
+                // guard, or on some other connection than the one that migrates
+                assert!(
+                    db.contains("if migrate_on_start() {\n        setup.batch_execute(\""),
+                    "{tag}: {db}"
+                );
+            }
+            // the same two switches on every backend, and the migrate run wins
+            // over the opt-out so a Job and its replicas can share one env
+            assert!(
+                db.contains("MIGRATE_ON_START\").is_ok_and(|v| v.eq_ignore_ascii_case(\"false\"))"),
+                "{tag}: {db}"
+            );
+            assert!(
+                db.contains("RUN_MODE\").as_deref() == Ok(\"migrate\")"),
+                "{tag}: {db}"
+            );
+            let main = fs::read_to_string(root.join("src/main.rs")).unwrap();
+            assert!(
+                main.contains("RUN_MODE\").as_deref() == Ok(\"migrate\")"),
+                "{tag}: {main}"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
     }
 
     /// REPLACE INTO is a DELETE + INSERT on MySQL, so it would cascade to every
