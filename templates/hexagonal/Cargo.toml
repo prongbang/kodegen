@@ -192,6 +192,12 @@ hyper-util = { version = "0.1", default-features = false, features = [
     "tokio",
 ], optional = true }
 http-body-util = { version = "0.1", optional = true }
+# End-to-end encryption for axum: XChaCha20-Poly1305 per-client keys agreed via
+# X25519 on a handshake endpoint, then applied per-request as axum middleware.
+# Pure Rust (no C build deps), so the distroless/cc runtime image needs nothing
+# extra. `E2EE_SHARED_KEY` is the optional pre-shared fallback key (64 hex chars);
+# leaving it unset means clients *must* complete the handshake first.
+lazynton = { version = "0.3", optional = true }
 # OpenAPI, and the one capability with no server behind it: the spec is derived
 # from the handlers themselves (`#[utoipa::path]`), not hand-maintained JSON, so
 # it cannot drift the way a static file would the moment a feature adds a route.
@@ -277,6 +283,11 @@ timeseries = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 # off, every one of those attributes disappears and neither crate below is even
 # compiled — that is the production kill switch (see the README).
 apidocs = ["dep:utoipa", "dep:utoipa-scalar"]
+# E2EE: one axum middleware + one handshake endpoint. No slot — sits alongside any
+# datastore, cache, or blob store. `E2EE_SHARED_KEY` (64 hex chars) is the
+# optional pre-shared fallback; without it clients must complete the X25519
+# handshake before sending an encrypted request.
+e2ee = ["dep:lazynton"]
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

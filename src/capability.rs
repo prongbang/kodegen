@@ -66,6 +66,7 @@ pub enum Capability {
     Influxdb,
     Greptimedb,
     Scalar,
+    E2ee,
 }
 
 /// Which ORM a relational capability is built on. Orthogonal to `Capability`
@@ -122,6 +123,9 @@ enum Kind {
     /// `&[]`, which is what `main.rs` has to not index into — see the
     /// `env[0]` fix next to `Cmd::Add`).
     ApiDocs,
+    /// E2EE: one axum middleware + one handshake endpoint. No slot — sits
+    /// alongside any datastore, cache or blob store. No server to start.
+    E2ee,
 }
 
 impl Kind {
@@ -135,7 +139,7 @@ impl Kind {
         match self {
             Kind::Relational(_) | Kind::Document | Kind::Mssql => Some(Slot::Datastore),
             Kind::Events(_) => Some(Slot::Events),
-            Kind::Cache | Kind::Blob | Kind::ApiDocs => None,
+            Kind::Cache | Kind::Blob | Kind::ApiDocs | Kind::E2ee => None,
         }
     }
 }
@@ -377,6 +381,7 @@ impl Capability {
             Capability::Influxdb => "influxdb",
             Capability::Greptimedb => "greptimedb",
             Capability::Scalar => "scalar",
+            Capability::E2ee => "e2ee",
         }
     }
 
@@ -405,6 +410,7 @@ impl Capability {
             // exactly the relationship mariadb has with mysql
             Capability::Greptimedb => Kind::Events(EventBackend::Greptimedb),
             Capability::Scalar => Kind::ApiDocs,
+            Capability::E2ee => Kind::E2ee,
         }
     }
 
@@ -443,6 +449,9 @@ impl Capability {
             // ...)` disappears from every handler `kodegen feature` writes and
             // neither utoipa crate is even compiled — see the README
             Kind::ApiDocs => "apidocs",
+            // the wire-level kill switch: off, neither the handshake endpoint nor
+            // the decrypt/encrypt middleware is compiled — see the README
+            Kind::E2ee => "e2ee",
         }
     }
 
@@ -459,6 +468,8 @@ impl Capability {
                 "docker compose -f docker-compose.dev.yml up -d --wait mssql",
                 "docker compose -f docker-compose.dev.yml run --rm mssql-init",
             ],
+            // no server: the handshake endpoint and middleware live in the app itself
+            Kind::ApiDocs | Kind::E2ee => &[],
             _ => &["docker compose -f docker-compose.dev.yml up -d"],
         }
     }
@@ -485,6 +496,13 @@ impl Capability {
             // as "nothing to print an env line or a compose_up for" rather
             // than index `env[0]` into a panic
             Kind::ApiDocs => &[],
+            // no external server either: the handshake endpoint and middleware
+            // live inside the app. `E2EE_SHARED_KEY` is an *optional* pre-shared
+            // fallback — callers that have not done the handshake yet can still
+            // send a request if the key is set. Not printing it here: the value
+            // must be a cryptographically-random 64-hex-char key the user fills in,
+            // not a copy-pasteable placeholder.
+            Kind::E2ee => &[],
         }
     }
 }
@@ -807,6 +825,10 @@ pub fn list(project: &Path) -> Result<()> {
         "  scalar       API docs — GET /docs (Scalar) + GET /openapi.json, derived from the code \
          (no --orm, no slot, sits next to anything)"
     );
+    println!(
+        "  e2ee         end-to-end encryption — XChaCha20-Poly1305 per-client keys (X25519 \
+         handshake), axum middleware on every route; sits next to anything, no --orm"
+    );
     println!();
     println!(
         "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb, mssql) and one event \
@@ -876,7 +898,7 @@ fn check_orm(cap: Capability, orm: Option<Orm>) -> Result<()> {
              That is the trade — see `kodegen add --list`."
                 .into(),
         ),
-        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs => Err(format!(
+        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs | Kind::E2ee => Err(format!(
             "--orm applies only to relational capabilities (postgres, mysql, mariadb, timescaledb) \
              — '{}' has no ORM",
             cap.name()
@@ -991,6 +1013,7 @@ pub fn add(
         (Kind::Blob, _) => add_s3(project, dry_run),
         (Kind::Events(backend), _) => add_event_sink(project, backend, dry_run),
         (Kind::ApiDocs, _) => add_scalar(project, dry_run),
+        (Kind::E2ee, _) => add_e2ee(project, dry_run),
     }
 }
 
@@ -2020,8 +2043,103 @@ fn add_scalar(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>
     Ok((paths(&creates), paths(&edits)))
 }
 
+// ── E2EE constants ────────────────────────────────────────────────────────────
+
+const E2EE_RS: &str = "src/api/e2ee.rs";
+const E2EE_TEST: &str = "tests/e2ee.rs";
+
+/// The wiring block inserted above `// kodegen:resources` in `bootstrap.rs`.
+/// Reads `E2EE_SHARED_KEY` once and builds the `E2ee` handle.
+const E2EE_BOOTSTRAP_BLOCK: &str = "\
+    // kodegen:e2ee — wiring for lazynton E2EE middleware\n\
+    #[cfg(feature = \"e2ee\")]\n\
+    let _e2ee = lazynton::E2ee::new(std::env::var(\"E2EE_SHARED_KEY\").ok());\n";
+
+/// Template for `src/api/e2ee.rs`. Mounts the handshake route and wraps every
+/// application route with the decrypt/encrypt middleware.
+const E2EE_API_TPL: &str = "\
+//! lazynton E2EE: handshake + per-request decrypt/encrypt middleware.\n\
+//! Compiled only when the `e2ee` feature is on.\n\
+//!\n\
+//! Wire format: `application/octet-stream` binary = nonce(24) || ciphertext || tag(16).\n\
+//! Per-client session keys are agreed via X25519 on `POST /handshake`.\n\
+//! Set `E2EE_SHARED_KEY` (64 hex chars) to allow clients without a prior handshake.\n\
+\n\
+#[cfg(feature = \"e2ee\")]\n\
+pub fn mount(router: axum::Router, e2ee: lazynton::E2ee) -> axum::Router {\n\
+    router\n\
+        .merge(e2ee.clone().handshake_router(\"/handshake\"))\n\
+        .layer(axum::middleware::from_fn_with_state(\n\
+            e2ee,\n\
+            lazynton::middleware,\n\
+        ))\n\
+}\n";
+
+/// Template for `tests/e2ee.rs`. Exercises the encrypt/decrypt round-trip with
+/// a fixed shared key — no running server required.
+const E2EE_TEST_TPL: &str = "\
+//! Integration smoke-test for lazynton E2EE wiring.\n\
+//! Run with: `cargo test --features e2ee`\n\
+\n\
+#[cfg(feature = \"e2ee\")]\n\
+#[tokio::test]\n\
+async fn encrypt_decrypt_roundtrip() {\n\
+    use lazynton::{E2ee, encrypt_to_binary, decrypt_from_binary};\n\
+\n\
+    // 64-char all-zero key — for testing only, never in production.\n\
+    let e2ee = E2ee::new(Some(\"0\".repeat(64)));\n\
+    let plaintext = b\"hello from kodegen e2ee\";\n\
+\n\
+    let cipher = e2ee\n\
+        .fallback_cipher()\n\
+        .expect(\"shared key configured\");\n\
+    let ciphertext = encrypt_to_binary(&cipher, plaintext)\n\
+        .expect(\"encrypt\");\n\
+    let recovered = decrypt_from_binary(&cipher, &ciphertext)\n\
+        .expect(\"decrypt\");\n\
+\n\
+    assert_eq!(recovered.as_slice(), plaintext);\n\
+}\n";
+
+/// Wires the E2EE feature into a generated project:
+///
+/// - enables the `e2ee` cargo feature in `Cargo.toml`
+/// - creates `src/api/e2ee.rs` with the handshake + middleware mount helper
+/// - creates `tests/e2ee.rs` with a round-trip smoke test
+/// - patches `src/api/mod.rs` to declare `pub mod e2ee`
+/// - patches `src/bootstrap.rs` to build the `E2ee` handle above `// kodegen:resources`
+fn add_e2ee(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(project, &[API_MOD, BOOTSTRAP])?;
+
+    let creates = vec![
+        (E2EE_RS.to_string(), E2EE_API_TPL.to_string()),
+        (E2EE_TEST.to_string(), E2EE_TEST_TPL.to_string()),
+    ];
+
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(
+            format!("{rel} already exists — remove it first, or keep the one you have").into(),
+        );
+    }
+
+    let edits = vec![
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "e2ee", None))?,
+        edit(project, API_MOD, |c| insert_pub_mod(&c, "e2ee"))?,
+        edit(project, BOOTSTRAP, |c| {
+            insert_before_line(&c, RESOURCES_MARKER, E2EE_BOOTSTRAP_BLOCK)
+        })?,
+    ];
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
+/// The scanned-openapi-paths function below (unchanged).
 /// The paths a REST `kodegen feature` already annotated before this ran — the
-/// "feature first" direction described on `add_scalar`.
 ///
 /// `src/api/*.rs` minus the four files this function's caller annotates by hand
 /// (`mod.rs`, `user.rs`, `hello.rs` — already covered) and minus `*_grpc.rs`
