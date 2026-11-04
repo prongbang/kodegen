@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -83,9 +87,11 @@ jobs:
   # is the only thing that keeps "one adapter covers both" a fact rather than a
   # claim about a compatibility layer nobody exercised.
   generated:
+    needs: [test]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 2
       # `include:` with no base dimension, so that the SeaORM row is a row of its
       # own: an include entry whose `capability` matches an existing combination
       # would be merged *into* it, and there would be no plain `postgres` job
@@ -353,6 +359,7 @@ jobs:
   # matrix above proves a generated project is green *without* one, which is a
   # different promise and would be satisfied by an adapter that never works.
   generated-all:
+    needs: [test, generated]
     runs-on: ubuntu-latest
     services:
       # The datastore here is mongodb, not postgres, because it is the only one
