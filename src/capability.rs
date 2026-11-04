@@ -2231,7 +2231,7 @@ impl AuthUser {
         self.claims
             .scope
             .as_deref()
-            .map_or(false, |s| s.split_whitespace().any(|item| item == scope))
+            .is_some_and(|s| s.split_whitespace().any(|item| item == scope))
     }
 }
 
@@ -2417,7 +2417,7 @@ pub fn revoke_token(token: &str) {
 
 #[cfg(feature = "oauth2")]
 pub fn is_token_revoked(token: &str) -> bool {
-    revoked_set().read().map_or(false, |set| set.contains(token))
+    revoked_set().read().is_ok_and(|set| set.contains(token))
 }
 
 #[cfg(feature = "oauth2")]

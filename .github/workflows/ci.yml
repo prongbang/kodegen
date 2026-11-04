@@ -102,6 +102,7 @@ jobs:
           - capability: influxdb
           - capability: greptimedb
           - capability: scalar
+          - capability: oauth2
           # The SeaORM path, and the only rows in this matrix that run their
           # datastore live. That is not a bonus: it is the only way to prove the
           # startup DDL, because there is no migration step to apply and the
