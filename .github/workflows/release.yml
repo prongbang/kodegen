@@ -18,7 +18,7 @@ jobs:
     permissions:
       contents: write # for taiki-e/create-gh-release-action
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # create-gh-release-action parses the version out of the tag but never
       # looks at Cargo.toml, so `v0.1.0` on a `version = "0.2.0"` tree would
@@ -64,7 +64,7 @@ jobs:
     permissions:
       contents: write # for taiki-e/upload-rust-binary-action
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
