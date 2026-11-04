@@ -67,6 +67,7 @@ pub enum Capability {
     Greptimedb,
     Scalar,
     E2ee,
+    Oauth2,
 }
 
 /// Which ORM a relational capability is built on. Orthogonal to `Capability`
@@ -126,6 +127,9 @@ enum Kind {
     /// E2EE: one axum middleware + one handshake endpoint. No slot — sits
     /// alongside any datastore, cache or blob store. No server to start.
     E2ee,
+    /// OAuth2: Authorization Server & Resource Server (RFC 6749, RFC 7517, RFC 7009).
+    /// Issues and verifies JWTs, renders JWKS, and provides `AuthUser` extractor.
+    Oauth2,
 }
 
 impl Kind {
@@ -139,7 +143,7 @@ impl Kind {
         match self {
             Kind::Relational(_) | Kind::Document | Kind::Mssql => Some(Slot::Datastore),
             Kind::Events(_) => Some(Slot::Events),
-            Kind::Cache | Kind::Blob | Kind::ApiDocs | Kind::E2ee => None,
+            Kind::Cache | Kind::Blob | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 => None,
         }
     }
 }
@@ -382,6 +386,7 @@ impl Capability {
             Capability::Greptimedb => "greptimedb",
             Capability::Scalar => "scalar",
             Capability::E2ee => "e2ee",
+            Capability::Oauth2 => "oauth2",
         }
     }
 
@@ -411,6 +416,7 @@ impl Capability {
             Capability::Greptimedb => Kind::Events(EventBackend::Greptimedb),
             Capability::Scalar => Kind::ApiDocs,
             Capability::E2ee => Kind::E2ee,
+            Capability::Oauth2 => Kind::Oauth2,
         }
     }
 
@@ -452,6 +458,7 @@ impl Capability {
             // the wire-level kill switch: off, neither the handshake endpoint nor
             // the decrypt/encrypt middleware is compiled — see the README
             Kind::E2ee => "e2ee",
+            Kind::Oauth2 => "oauth2",
         }
     }
 
@@ -469,7 +476,7 @@ impl Capability {
                 "docker compose -f docker-compose.dev.yml run --rm mssql-init",
             ],
             // no server: the handshake endpoint and middleware live in the app itself
-            Kind::ApiDocs | Kind::E2ee => &[],
+            Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 => &[],
             _ => &["docker compose -f docker-compose.dev.yml up -d"],
         }
     }
@@ -503,6 +510,7 @@ impl Capability {
             // must be a cryptographically-random 64-hex-char key the user fills in,
             // not a copy-pasteable placeholder.
             Kind::E2ee => &[],
+            Kind::Oauth2 => &[],
         }
     }
 }
@@ -829,6 +837,10 @@ pub fn list(project: &Path) -> Result<()> {
         "  e2ee         end-to-end encryption — XChaCha20-Poly1305 per-client keys (X25519 \
          handshake), axum middleware on every route; sits next to anything, no --orm"
     );
+    println!(
+        "  oauth2       OAuth2 — authorization & resource server (RFC 6749, RFC 7517), token issuing/jwks \
+         + AuthUser extractor; sits next to anything, no --orm"
+    );
     println!();
     println!(
         "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb, mssql) and one event \
@@ -898,7 +910,7 @@ fn check_orm(cap: Capability, orm: Option<Orm>) -> Result<()> {
              That is the trade — see `kodegen add --list`."
                 .into(),
         ),
-        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs | Kind::E2ee => Err(format!(
+        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 => Err(format!(
             "--orm applies only to relational capabilities (postgres, mysql, mariadb, timescaledb) \
              — '{}' has no ORM",
             cap.name()
@@ -1014,6 +1026,7 @@ pub fn add(
         (Kind::Events(backend), _) => add_event_sink(project, backend, dry_run),
         (Kind::ApiDocs, _) => add_scalar(project, dry_run),
         (Kind::E2ee, _) => add_e2ee(project, dry_run),
+        (Kind::Oauth2, _) => add_oauth2(project, dry_run),
     }
 }
 
@@ -2127,6 +2140,604 @@ fn add_e2ee(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)>
         edit(project, API_MOD, |c| insert_pub_mod(&c, "e2ee"))?,
         edit(project, BOOTSTRAP, |c| {
             insert_before_line(&c, RESOURCES_MARKER, E2EE_BOOTSTRAP_BLOCK)
+        })?,
+    ];
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
+// ── OAuth2 constants ─────────────────────────────────────────────────────────
+
+const OAUTH2_RS: &str = "src/api/oauth2.rs";
+const OAUTH2_TEST: &str = "tests/oauth2.rs";
+
+const OAUTH2_API_TPL: &str = r##"//! OAuth2 Authorization Server & Resource Server (RFC 6749, RFC 7517, RFC 7009).
+//! Compiled only when the `oauth2` feature is on.
+
+#[cfg(feature = "oauth2")]
+use axum::{
+    body::Bytes,
+    extract::FromRequestParts,
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        request::Parts,
+        HeaderMap, StatusCode,
+    },
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+#[cfg(feature = "oauth2")]
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+#[cfg(feature = "oauth2")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "oauth2")]
+use std::sync::{atomic::{AtomicU64, Ordering}, OnceLock, RwLock};
+
+#[cfg(feature = "oauth2")]
+static NTH: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "oauth2")]
+static REVOKED_TOKENS: OnceLock<RwLock<std::collections::HashSet<String>>> = OnceLock::new();
+
+#[cfg(feature = "oauth2")]
+fn revoked_set() -> &'static RwLock<std::collections::HashSet<String>> {
+    REVOKED_TOKENS.get_or_init(|| RwLock::new(std::collections::HashSet::new()))
+}
+
+/// Token payload claims conforming to RFC 7519.
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Claims {
+    pub sub: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
+    pub exp: usize,
+    pub iat: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+/// Authenticated user / client extractor for Axum handlers.
+///
+/// Inject `auth: AuthUser` into any handler to require a valid Bearer token.
+/// Automatically validates signature, expiration, issuer, audience, and revocation status.
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Clone)]
+pub struct AuthUser {
+    pub claims: Claims,
+}
+
+#[cfg(feature = "oauth2")]
+impl AuthUser {
+    pub fn sub(&self) -> &str {
+        &self.claims.sub
+    }
+
+    pub fn client_id(&self) -> &str {
+        &self.claims.sub
+    }
+
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.claims
+            .scope
+            .as_deref()
+            .map_or(false, |s| s.split_whitespace().any(|item| item == scope))
+    }
+}
+
+#[cfg(feature = "oauth2")]
+impl<S> FromRequestParts<S> for AuthUser
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, [(&'static str, &'static str); 1], Json<OAuthError>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let auth_header = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
+
+        let token = match auth_header {
+            Some(header) if header.starts_with("Bearer ") => &header[7..],
+            _ => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    [("WWW-Authenticate", "Bearer error=\"invalid_token\", error_description=\"Missing or malformed Authorization header\"")],
+                    Json(OAuthError {
+                        error: "invalid_token".into(),
+                        error_description: Some("Missing or malformed Authorization header".into()),
+                    }),
+                ));
+            }
+        };
+
+        match verify_token(token) {
+            Ok(claims) => Ok(AuthUser { claims }),
+            Err(e) => Err((
+                StatusCode::UNAUTHORIZED,
+                [("WWW-Authenticate", "Bearer error=\"invalid_token\", error_description=\"Invalid or expired token\"")],
+                Json(OAuthError {
+                    error: "invalid_token".into(),
+                    error_description: Some(format!("Invalid or expired token: {e}")),
+                }),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TokenRequest {
+    #[serde(default)]
+    pub grant_type: String,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub refresh_token: Option<String>,
+    pub scope: Option<String>,
+}
+
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthError {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_description: Option<String>,
+}
+
+#[cfg(feature = "oauth2")]
+impl IntoResponse for OAuthError {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, Json(self)).into_response()
+    }
+}
+
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwkKey {
+    pub kty: String,
+    pub r#use: String,
+    pub alg: String,
+    pub kid: String,
+}
+
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwksResponse {
+    pub keys: Vec<JwkKey>,
+}
+
+#[cfg(feature = "oauth2")]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[cfg(feature = "oauth2")]
+fn get_keys() -> (EncodingKey, DecodingKey, Algorithm) {
+    if let (Ok(priv_pem), Ok(pub_pem)) = (
+        std::env::var("OAUTH2_PRIVATE_KEY_PEM"),
+        std::env::var("OAUTH2_PUBLIC_KEY_PEM"),
+    ) {
+        if let (Ok(enc), Ok(dec)) = (
+            EncodingKey::from_rsa_pem(priv_pem.as_bytes()),
+            DecodingKey::from_rsa_pem(pub_pem.as_bytes()),
+        ) {
+            return (enc, dec, Algorithm::RS256);
+        }
+    }
+    let secret = std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| "super-secret-dev-key-change-in-production-32b".into());
+    (
+        EncodingKey::from_secret(secret.as_bytes()),
+        DecodingKey::from_secret(secret.as_bytes()),
+        Algorithm::HS256,
+    )
+}
+
+#[cfg(feature = "oauth2")]
+pub fn verify_token(token: &str) -> Result<Claims, String> {
+    if is_token_revoked(token) {
+        return Err("Token has been revoked".into());
+    }
+    let (_, decoding_key, alg) = get_keys();
+    let mut validation = Validation::new(alg);
+    validation.validate_exp = true;
+    validation.leeway = 60;
+    if let Ok(iss) = std::env::var("OAUTH2_ISSUER") {
+        validation.set_issuer(&[iss]);
+    }
+    if let Ok(aud) = std::env::var("OAUTH2_AUDIENCE") {
+        validation.set_audience(&[aud]);
+    }
+    decode::<Claims>(token, &decoding_key, &validation)
+        .map(|data| data.claims)
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "oauth2")]
+pub fn issue_token(
+    sub: &str,
+    scope: Option<String>,
+    expiry_secs: u64,
+) -> Result<(String, usize), String> {
+    let (encoding_key, _, alg) = get_keys();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs() as usize;
+    let exp = now + expiry_secs as usize;
+    let jti = format!("{now}-{:08x}", NTH.fetch_add(1, Ordering::Relaxed));
+    let claims = Claims {
+        sub: sub.to_string(),
+        iss: std::env::var("OAUTH2_ISSUER").ok(),
+        aud: std::env::var("OAUTH2_AUDIENCE").ok(),
+        exp,
+        iat: now,
+        jti: Some(jti),
+        scope,
+    };
+    let token = encode(&Header::new(alg), &claims, &encoding_key).map_err(|e| e.to_string())?;
+    Ok((token, expiry_secs as usize))
+}
+
+#[cfg(feature = "oauth2")]
+pub fn revoke_token(token: &str) {
+    if let Ok(mut set) = revoked_set().write() {
+        set.insert(token.to_string());
+    }
+}
+
+#[cfg(feature = "oauth2")]
+pub fn is_token_revoked(token: &str) -> bool {
+    revoked_set().read().map_or(false, |set| set.contains(token))
+}
+
+#[cfg(feature = "oauth2")]
+fn validate_client(client_id: &str, client_secret: &str) -> bool {
+    let expected_id = std::env::var("OAUTH2_CLIENT_ID").unwrap_or_else(|_| "dev-client".into());
+    let expected_secret =
+        std::env::var("OAUTH2_CLIENT_SECRET").unwrap_or_else(|_| "dev-secret".into());
+    constant_time_eq(client_id.as_bytes(), expected_id.as_bytes())
+        && constant_time_eq(client_secret.as_bytes(), expected_secret.as_bytes())
+}
+
+#[cfg(feature = "oauth2")]
+fn parse_form(bytes: &[u8]) -> std::collections::HashMap<String, String> {
+    let s = String::from_utf8_lossy(bytes);
+    s.split('&')
+        .filter_map(|pair| {
+            let mut it = pair.splitn(2, '=');
+            let k = it.next()?;
+            let v = it.next().unwrap_or("");
+            Some((k.to_string(), v.replace('+', " ")))
+        })
+        .collect()
+}
+
+#[cfg(feature = "oauth2")]
+async fn token(
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<TokenResponse>, (StatusCode, Json<OAuthError>)> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let req = if content_type.contains("application/json") || body.first() == Some(&b'{') {
+        serde_json::from_slice::<TokenRequest>(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(OAuthError {
+                    error: "invalid_request".into(),
+                    error_description: Some(format!("Invalid JSON: {e}")),
+                }),
+            )
+        })?
+    } else {
+        let map = parse_form(&body);
+        TokenRequest {
+            grant_type: map.get("grant_type").cloned().unwrap_or_default(),
+            client_id: map.get("client_id").cloned(),
+            client_secret: map.get("client_secret").cloned(),
+            refresh_token: map.get("refresh_token").cloned(),
+            scope: map.get("scope").cloned(),
+        }
+    };
+
+    match req.grant_type.as_str() {
+        "client_credentials" => {
+            let client_id = req.client_id.unwrap_or_default();
+            let client_secret = req.client_secret.unwrap_or_default();
+            if !validate_client(&client_id, &client_secret) {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(OAuthError {
+                        error: "invalid_client".into(),
+                        error_description: Some("Client authentication failed".into()),
+                    }),
+                ));
+            }
+            let expiry = std::env::var("OAUTH2_TOKEN_EXPIRY_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(3600);
+            let (access_token, expires_in) =
+                issue_token(&client_id, req.scope.clone(), expiry).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(OAuthError {
+                            error: "server_error".into(),
+                            error_description: Some(e),
+                        }),
+                    )
+                })?;
+            Ok(Json(TokenResponse {
+                access_token,
+                token_type: "Bearer".into(),
+                expires_in,
+                refresh_token: None,
+                scope: req.scope,
+            }))
+        }
+        "refresh_token" => {
+            let rt = req.refresh_token.ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(OAuthError {
+                        error: "invalid_request".into(),
+                        error_description: Some("Missing refresh_token parameter".into()),
+                    }),
+                )
+            })?;
+            let claims = verify_token(&rt).map_err(|e| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(OAuthError {
+                        error: "invalid_grant".into(),
+                        error_description: Some(format!("Invalid refresh token: {e}")),
+                    }),
+                )
+            })?;
+            let expiry = std::env::var("OAUTH2_TOKEN_EXPIRY_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(3600);
+            let (access_token, expires_in) =
+                issue_token(&claims.sub, claims.scope.clone(), expiry).map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(OAuthError {
+                            error: "server_error".into(),
+                            error_description: Some(e),
+                        }),
+                    )
+                })?;
+            Ok(Json(TokenResponse {
+                access_token,
+                token_type: "Bearer".into(),
+                expires_in,
+                refresh_token: None,
+                scope: claims.scope,
+            }))
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(OAuthError {
+                error: "unsupported_grant_type".into(),
+                error_description: Some(format!(
+                    "Grant type '{}' is not supported. Use 'client_credentials' or 'refresh_token'.",
+                    req.grant_type
+                )),
+            }),
+        )),
+    }
+}
+
+#[cfg(feature = "oauth2")]
+async fn revoke(
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = if content_type.contains("application/json") || body.first() == Some(&b'{') {
+        serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("token").and_then(|t| t.as_str().map(String::from)))
+    } else {
+        let map = parse_form(&body);
+        map.get("token").cloned()
+    };
+    if let Some(t) = token {
+        revoke_token(&t);
+    }
+    (StatusCode::OK, Json(serde_json::json!({})))
+}
+
+#[cfg(feature = "oauth2")]
+async fn jwks() -> Json<JwksResponse> {
+    let (_, _, alg) = get_keys();
+    let (alg_name, kty) = match alg {
+        Algorithm::RS256 => ("RS256", "RSA"),
+        _ => ("HS256", "oct"),
+    };
+    Json(JwksResponse {
+        keys: vec![JwkKey {
+            kty: kty.into(),
+            r#use: "sig".into(),
+            alg: alg_name.into(),
+            kid: "default".into(),
+        }],
+    })
+}
+
+pub fn routes() -> Router<super::Services> {
+    #[cfg(feature = "oauth2")]
+    {
+        Router::new()
+            .route("/oauth/token", post(token))
+            .route("/oauth/revoke", post(revoke))
+            .route("/.well-known/jwks.json", get(jwks))
+    }
+    #[cfg(not(feature = "oauth2"))]
+    {
+        Router::new()
+    }
+}
+"##;
+
+const OAUTH2_TEST_TPL: &str = r##"#![cfg(feature = "oauth2")]
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use {{crate_name}}::api::oauth2;
+use {{crate_name}}::bootstrap;
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn oauth2_token_and_auth_flow() {
+    let app = bootstrap::build_router();
+
+    // 1. Request token with bad credentials -> 401
+    let bad_body = "grant_type=client_credentials&client_id=dev-client&client_secret=wrong";
+    let req = Request::post("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(bad_body))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Request token with valid credentials -> 200 OK
+    let good_body = "grant_type=client_credentials&client_id=dev-client&client_secret=dev-secret&scope=read write";
+    let req = Request::post("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(good_body))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+    let token_res: oauth2::TokenResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(token_res.token_type, "Bearer");
+    assert!(!token_res.access_token.is_empty());
+    assert_eq!(token_res.expires_in, 3600);
+
+    // 3. Verify token with verify_token
+    let claims = oauth2::verify_token(&token_res.access_token).expect("token must verify");
+    assert_eq!(claims.sub, "dev-client");
+    assert_eq!(claims.scope.as_deref(), Some("read write"));
+
+    // 4. Test JWKS endpoint -> 200 OK
+    let req = Request::get("/.well-known/jwks.json")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let jwks_bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+    let jwks: oauth2::JwksResponse = serde_json::from_slice(&jwks_bytes).unwrap();
+    assert_eq!(jwks.keys.len(), 1);
+
+    // 5. Revoke token
+    let revoke_body = format!("token={}", token_res.access_token);
+    let req = Request::post("/oauth/revoke")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(revoke_body))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 6. Token after revocation must fail verification
+    assert!(oauth2::verify_token(&token_res.access_token).is_err());
+}
+
+#[tokio::test]
+async fn oauth2_json_request_supported() {
+    let app = bootstrap::build_router();
+
+    let json_body = serde_json::json!({
+        "grant_type": "client_credentials",
+        "client_id": "dev-client",
+        "client_secret": "dev-secret",
+        "scope": "admin"
+    });
+    let req = Request::post("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json_body.to_string()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+    let token_res: oauth2::TokenResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(token_res.token_type, "Bearer");
+
+    let claims = oauth2::verify_token(&token_res.access_token).expect("token must verify");
+    assert_eq!(claims.sub, "dev-client");
+    assert_eq!(claims.scope.as_deref(), Some("admin"));
+}
+"##;
+
+/// Wires the OAuth2 feature into a generated project:
+///
+/// - enables the `oauth2` cargo feature in `Cargo.toml`
+/// - creates `src/api/oauth2.rs` with token issuing, verification, jwks and AuthUser extractor
+/// - creates `tests/oauth2.rs` with an integration test
+/// - patches `src/api/mod.rs` to declare `pub mod oauth2` and merge `oauth2::routes()`
+fn add_oauth2(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(project, &[API_MOD, "Cargo.toml"])?;
+    let crate_name = crate::package_name(project)
+        .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
+        .replace('-', "_");
+
+    let creates = vec![
+        (OAUTH2_RS.to_string(), OAUTH2_API_TPL.to_string()),
+        (
+            OAUTH2_TEST.to_string(),
+            OAUTH2_TEST_TPL.replace("{{crate_name}}", &crate_name),
+        ),
+    ];
+
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(
+            format!("{rel} already exists — remove it first, or keep the one you have").into(),
+        );
+    }
+
+    let edits = vec![
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "oauth2", None))?,
+        edit(project, API_MOD, |c| {
+            let c = insert_pub_mod(&c, "oauth2")?;
+            insert_before_line(&c, ".with_state(services)", "        .merge(oauth2::routes())")
         })?,
     ];
 
@@ -6257,6 +6868,59 @@ mod tests {
         add(&root, Capability::Scalar, None, false).unwrap();
         let err = add(&root, Capability::Scalar, None, true).unwrap_err().to_string();
         assert!(err.contains("capability 'scalar' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn oauth2_writes_api_and_test_and_modifies_cargo_and_api_mod() {
+        let root = fixture("oauth2");
+        add(&root, Capability::Oauth2, None, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"sqlite\", \"oauth2\"]"), "{toml}");
+
+        let oauth2_rs = fs::read_to_string(root.join(OAUTH2_RS)).unwrap();
+        assert!(oauth2_rs.contains("pub fn routes()"), "{oauth2_rs}");
+        assert!(oauth2_rs.contains("pub struct AuthUser"), "{oauth2_rs}");
+        assert!(oauth2_rs.contains("/oauth/token"), "{oauth2_rs}");
+        assert!(oauth2_rs.contains("/oauth/revoke"), "{oauth2_rs}");
+        assert!(oauth2_rs.contains("/.well-known/jwks.json"), "{oauth2_rs}");
+
+        let api_mod = fs::read_to_string(root.join(API_MOD)).unwrap();
+        assert!(api_mod.contains("pub mod oauth2;"), "{api_mod}");
+        assert!(api_mod.contains(".merge(oauth2::routes())"), "{api_mod}");
+
+        let test = fs::read_to_string(root.join(OAUTH2_TEST)).unwrap();
+        assert!(test.contains("demo_svc::api::oauth2"), "must import project crate: {test}");
+        assert!(test.contains("/oauth/token"), "{test}");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn adding_oauth2_twice_fails() {
+        let root = fixture("oauth2-twice");
+        add(&root, Capability::Oauth2, None, false).unwrap();
+        let err = add(&root, Capability::Oauth2, None, true).unwrap_err().to_string();
+        assert!(err.contains("capability 'oauth2' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn oauth2_dry_run_writes_nothing_but_plans_the_same_change() {
+        let root = fixture("oauth2-dry");
+        let before = snapshot(&root);
+        let planned = add(&root, Capability::Oauth2, None, true).unwrap();
+        assert_eq!(before, snapshot(&root), "dry run wrote to the fixture");
+        assert_eq!(planned, add(&root, Capability::Oauth2, None, false).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn oauth2_takes_no_orm() {
+        let root = fixture("oauth2-orm");
+        let err = add(&root, Capability::Oauth2, Some(Orm::Diesel), true).unwrap_err().to_string();
+        assert!(err.contains("'oauth2' has no ORM"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
 

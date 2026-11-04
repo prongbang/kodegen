@@ -21,7 +21,7 @@ are used in place, so `kodegen update` refuses on either — see
 
 ### Capabilities
 
-All 12 supported by `kodegen add <capability>` / `kodegen new --with`:
+All 14 supported by `kodegen add <capability>` / `kodegen new --with`:
 
 | Capability | Slot | `--orm` | Default adapter (capability off / env unset) | Main env |
 |---|---|---|---|---|
@@ -37,11 +37,13 @@ All 12 supported by `kodegen add <capability>` / `kodegen new --with`:
 | `influxdb` | event sink | not applicable | tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`/`_ORG`/`_TOKEN`) |
 | `greptimedb` | event sink — alias of `influxdb` (same adapter, GreptimeDB image + `INFLUX_URL` path) | not applicable | tracing log | `INFLUX_URL` (+ `INFLUX_BUCKET`) |
 | `scalar` | — (additive, no port at all) | not applicable | routes absent (`GET /docs`/`GET /openapi.json` compile out with the feature) | none — compile-time switch only |
+| `e2ee` | — (additive) | not applicable | middleware + handshake endpoint | `E2EE_SHARED_KEY` (optional) |
+| `oauth2` | — (additive) | not applicable | routes absent (`POST /oauth/token`, `GET /.well-known/jwks.json`, `POST /oauth/revoke`) | `JWT_SECRET`, `OAUTH2_CLIENT_ID`, `OAUTH2_CLIENT_SECRET` |
 
 A **slot** holds exactly one adapter: `postgres`/`mysql`/`mariadb`/`timescaledb`/`mongodb`/`mssql`
 are all adapters of the datastore slot (`UserRepository`), and `clickhouse`/`influxdb`/`greptimedb`
-are all adapters of the event-sink slot (`EventSink`) — one occupant per slot, `redis`, `s3` and
-`scalar` fill no slot and sit alongside anything. Usage and per-capability details are in
+are all adapters of the event-sink slot (`EventSink`) — one occupant per slot, `redis`, `s3`,
+`scalar`, `e2ee` and `oauth2` fill no slot and sit alongside anything. Usage and per-capability details are in
 [Add a capability](#add-a-capability) below.
 
 Every adapter above also implements the template's `Readiness` port with its

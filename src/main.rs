@@ -237,13 +237,20 @@ fn print_plan(created: &[String], edited: &[String]) {
 fn add_epilogue(cap: capability::Capability) -> Vec<String> {
     let env = cap.env();
     if env.is_empty() {
-        // `scalar` and `e2ee` both have no external server, but their messages differ
+        // `scalar`, `e2ee`, and `oauth2` have no external server, but their messages differ
         return match cap {
             capability::Capability::E2ee => vec![
                 "cargo run".to_string(),
                 "Clients handshake at POST /handshake (binary X25519) to get a session key.".to_string(),
                 "Set E2EE_SHARED_KEY=<64 hex chars> for a pre-shared fallback (optional).".to_string(),
                 "Drop \"e2ee\" from default = [...] in Cargo.toml to ship without encryption.".to_string(),
+            ],
+            capability::Capability::Oauth2 => vec![
+                "cargo run".to_string(),
+                "Token endpoint: POST /oauth/token (grant_type=client_credentials or refresh_token).".to_string(),
+                "JWKS: GET /.well-known/jwks.json | Revocation: POST /oauth/revoke.".to_string(),
+                "Protect any handler by injecting `auth: AuthUser` as a parameter.".to_string(),
+                "Drop \"oauth2\" from default = [...] in Cargo.toml to disable.".to_string(),
             ],
             _ => vec![
                 "cargo run".to_string(),

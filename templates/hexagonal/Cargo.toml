@@ -198,6 +198,10 @@ http-body-util = { version = "0.1", optional = true }
 # extra. `E2EE_SHARED_KEY` is the optional pre-shared fallback key (64 hex chars);
 # leaving it unset means clients *must* complete the handshake first.
 lazynton = { version = "0.3", optional = true }
+# OAuth2: self-hosted Authorization Server & Resource Server (RFC 6749, RFC 7517).
+# Signs and verifies JWTs with HMAC or RSA/EdDSA, issues tokens, renders JWKS,
+# and provides `AuthUser` extractor for route protection.
+jsonwebtoken = { version = "9.3", features = ["use_pem"], optional = true }
 # OpenAPI, and the one capability with no server behind it: the spec is derived
 # from the handlers themselves (`#[utoipa::path]`), not hand-maintained JSON, so
 # it cannot drift the way a static file would the moment a feature adds a route.
@@ -288,6 +292,9 @@ apidocs = ["dep:utoipa", "dep:utoipa-scalar"]
 # optional pre-shared fallback; without it clients must complete the X25519
 # handshake before sending an encrypted request.
 e2ee = ["dep:lazynton"]
+# OAuth2 server & token verification: POST /oauth/token, GET /.well-known/jwks.json,
+# POST /oauth/revoke and `AuthUser` extractor.
+oauth2 = ["dep:jsonwebtoken"]
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }
