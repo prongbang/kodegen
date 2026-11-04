@@ -1,3 +1,5 @@
+#![allow(clippy::double_must_use)]
+
 pub mod api;
 pub mod application;
 pub mod bootstrap;
