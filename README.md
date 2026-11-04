@@ -21,7 +21,7 @@ are used in place, so `kodegen update` refuses on either — see
 
 ### Capabilities
 
-All 15 supported by `kodegen add <capability>` / `kodegen new --with`:
+All 16 supported by `kodegen add <capability>` / `kodegen new --with`:
 
 | Capability | Slot | `--orm` | Default adapter (capability off / env unset) | Main env |
 |---|---|---|---|---|
@@ -40,11 +40,12 @@ All 15 supported by `kodegen add <capability>` / `kodegen new --with`:
 | `e2ee` | — (additive) | not applicable | middleware + handshake endpoint | `E2EE_SHARED_KEY` (optional) |
 | `oauth2` | — (additive) | not applicable | routes absent (`POST /oauth/token`, `GET /.well-known/jwks.json`, `POST /oauth/revoke`) | `JWT_SECRET`, `OAUTH2_CLIENT_ID`, `OAUTH2_CLIENT_SECRET` |
 | `mcp` | — (additive) | not applicable | routes absent (`GET /mcp/sse`, `POST /mcp/message`, `POST /mcp`) | none — compile-time switch only |
+| `websocket` | — (additive) | not applicable | routes absent (`GET /ws?channel=<name>`) | none — compile-time switch only |
 
 A **slot** holds exactly one adapter: `postgres`/`mysql`/`mariadb`/`timescaledb`/`mongodb`/`mssql`
 are all adapters of the datastore slot (`UserRepository`), and `clickhouse`/`influxdb`/`greptimedb`
 are all adapters of the event-sink slot (`EventSink`) — one occupant per slot; `redis`, `s3`,
-`scalar`, `e2ee`, `oauth2` and `mcp` fill no slot and sit alongside anything. Usage and per-capability details are in
+`scalar`, `e2ee`, `oauth2`, `mcp` and `websocket` fill no slot and sit alongside anything. Usage and per-capability details are in
 [Add a capability](#add-a-capability) below.
 
 Every adapter above also implements the template's `Readiness` port with its
@@ -176,6 +177,7 @@ kodegen add scalar                       # GET /docs + GET /openapi.json, derive
 kodegen add e2ee                         # end-to-end encryption — XChaCha20-Poly1305 middleware
 kodegen add oauth2                       # OAuth2 server & token issuing + AuthUser extractor
 kodegen add mcp                          # Model Context Protocol (MCP) SSE & JSON-RPC 2.0 server
+kodegen add websocket                    # real-time full-duplex WebSocket hub with pub/sub channel broadcast
 kodegen add postgres --orm seaorm        # the same PostgreSQL, on SeaORM instead of Diesel
 kodegen add mysql --orm seaorm           # same again on MySQL/MariaDB — no C driver to build
 kodegen add postgres --path ~/svc        # run from outside the project
@@ -859,6 +861,24 @@ tests/mcp.rs             created — initialize, ping, tools/list, tools/call, a
   - Running `kodegen feature <name>` automatically appends `create_<name>` and `get_<name>` tools into `src/api/mcp.rs`.
   - Running `kodegen add mcp` on an existing project automatically scans and exposes tools for all previously scaffolded features.
 - **Zero external heavyweight dependencies**: Built directly on `axum`, `tokio`, `tokio-stream`, and `serde_json`.
+
+#### `add websocket`
+
+Adds a **WebSocket real-time communication engine** (`axum/ws`) with an in-memory pub/sub channel broadcast hub:
+
+```
+Cargo.toml               default = [...] gains "websocket"
+src/api/websocket.rs     created — GET /ws?channel=<name> and WsHub channel dispatcher
+src/api/mod.rs           .merge(websocket::routes())
+tests/websocket.rs       created — full TCP connection and bi-directional broadcast integration tests
+```
+
+- **Endpoint**: `GET /ws?channel=<name>` (defaults to channel `"default"` if omitted).
+- **Pub/Sub Hub (`WsHub`)**:
+  - Thread-safe broadcast channels (`tokio::sync::broadcast`) indexed by channel topic.
+  - Broadcasts messages to all subscribers on the same channel while echoing events back to clients.
+  - Clean client disconnect handling without leaking task handles or channels.
+- **Zero Overhead**: Fully gated behind the `websocket = ["axum/ws"]` feature flag. Compiles out cleanly when omitted.
 
 ### Update a cached template
 
