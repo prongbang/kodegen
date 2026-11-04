@@ -260,6 +260,12 @@ fn add_epilogue(cap: capability::Capability) -> Vec<String> {
                 "Connect your AI agent (Claude, Cursor, Antigravity) using SSE transport.".to_string(),
                 "Drop \"mcp\" from default = [...] in Cargo.toml to disable.".to_string(),
             ],
+            capability::Capability::Websocket => vec![
+                "cargo run".to_string(),
+                "WebSocket endpoint: ws://localhost:8080/ws (optional ?channel=<name> query).".to_string(),
+                "Supports bi-directional messaging, channel pub/sub broadcast, and JSON events.".to_string(),
+                "Drop \"websocket\" from default = [...] in Cargo.toml to disable.".to_string(),
+            ],
             _ => vec![
                 "cargo run".to_string(),
                 "Open http://localhost:8080/docs — the spec itself is at /openapi.json.".to_string(),

@@ -69,6 +69,7 @@ pub enum Capability {
     E2ee,
     Oauth2,
     Mcp,
+    Websocket,
 }
 
 /// Which ORM a relational capability is built on. Orthogonal to `Capability`
@@ -134,6 +135,9 @@ enum Kind {
     /// MCP: Model Context Protocol (2024-11-05 spec) server over JSON-RPC 2.0 & SSE.
     /// Exposes tools and resources to AI agents; sits next to anything.
     Mcp,
+    /// WebSocket: Real-time bi-directional pub/sub communication over `ws://`.
+    /// Sits next to anything, no slot, no --orm.
+    Websocket,
 }
 
 impl Kind {
@@ -147,7 +151,7 @@ impl Kind {
         match self {
             Kind::Relational(_) | Kind::Document | Kind::Mssql => Some(Slot::Datastore),
             Kind::Events(_) => Some(Slot::Events),
-            Kind::Cache | Kind::Blob | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp => None,
+            Kind::Cache | Kind::Blob | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp | Kind::Websocket => None,
         }
     }
 }
@@ -392,6 +396,7 @@ impl Capability {
             Capability::E2ee => "e2ee",
             Capability::Oauth2 => "oauth2",
             Capability::Mcp => "mcp",
+            Capability::Websocket => "websocket",
         }
     }
 
@@ -423,6 +428,7 @@ impl Capability {
             Capability::E2ee => Kind::E2ee,
             Capability::Oauth2 => Kind::Oauth2,
             Capability::Mcp => Kind::Mcp,
+            Capability::Websocket => Kind::Websocket,
         }
     }
 
@@ -466,6 +472,7 @@ impl Capability {
             Kind::E2ee => "e2ee",
             Kind::Oauth2 => "oauth2",
             Kind::Mcp => "mcp",
+            Kind::Websocket => "websocket",
         }
     }
 
@@ -483,7 +490,7 @@ impl Capability {
                 "docker compose -f docker-compose.dev.yml run --rm mssql-init",
             ],
             // no server: the handshake endpoint and middleware live in the app itself
-            Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp => &[],
+            Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp | Kind::Websocket => &[],
             _ => &["docker compose -f docker-compose.dev.yml up -d"],
         }
     }
@@ -519,6 +526,7 @@ impl Capability {
             Kind::E2ee => &[],
             Kind::Oauth2 => &[],
             Kind::Mcp => &[],
+            Kind::Websocket => &[],
         }
     }
 }
@@ -853,6 +861,10 @@ pub fn list(project: &Path) -> Result<()> {
         "  mcp          Model Context Protocol (MCP) — JSON-RPC 2.0 & SSE server (2024-11-05 spec); \
          exposes tools over /mcp and /mcp/sse; sits next to anything, no --orm"
     );
+    println!(
+        "  websocket    WebSocket — real-time bi-directional pub/sub communication over /ws; \
+         sits next to anything, no --orm"
+    );
     println!();
     println!(
         "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb, mssql) and one event \
@@ -922,7 +934,7 @@ fn check_orm(cap: Capability, orm: Option<Orm>) -> Result<()> {
              That is the trade — see `kodegen add --list`."
                 .into(),
         ),
-        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp => Err(format!(
+        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp | Kind::Websocket => Err(format!(
             "--orm applies only to relational capabilities (postgres, mysql, mariadb, timescaledb) \
              — '{}' has no ORM",
             cap.name()
@@ -1040,6 +1052,7 @@ pub fn add(
         (Kind::E2ee, _) => add_e2ee(project, dry_run),
         (Kind::Oauth2, _) => add_oauth2(project, dry_run),
         (Kind::Mcp, _) => add_mcp(project, dry_run),
+        (Kind::Websocket, _) => add_websocket(project, dry_run),
     }
 }
 
@@ -3298,6 +3311,266 @@ fn add_mcp(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> 
         edit(project, API_MOD, |c| {
             let c = insert_pub_mod(&c, "mcp")?;
             insert_before_line(&c, ".with_state(services)", "        .merge(mcp::routes())")
+        })?,
+    ];
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
+// ── WebSocket constants ──────────────────────────────────────────────────────
+
+pub const WS_RS: &str = "src/api/websocket.rs";
+pub const WS_TEST: &str = "tests/websocket.rs";
+
+const WS_API_TPL: &str = r##"//! WebSocket Real-Time Communication Adapter.
+//! Exposes an Axum route for WebSocket upgrade and pub/sub message broadcasting.
+
+#[cfg(feature = "websocket")]
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Query, State,
+    },
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+#[cfg(feature = "websocket")]
+use serde::Deserialize;
+#[cfg(feature = "websocket")]
+use serde_json::{json, Value};
+#[cfg(feature = "websocket")]
+use std::{
+    collections::HashMap,
+    sync::OnceLock,
+};
+#[cfg(feature = "websocket")]
+use tokio::sync::{broadcast, RwLock};
+
+#[cfg(feature = "websocket")]
+#[derive(Debug, Deserialize)]
+pub struct WsQuery {
+    #[serde(default = "default_channel")]
+    pub channel: String,
+}
+
+#[cfg(feature = "websocket")]
+fn default_channel() -> String {
+    "general".to_string()
+}
+
+#[cfg(feature = "websocket")]
+#[derive(Default)]
+pub struct WsHub {
+    pub channels: RwLock<HashMap<String, broadcast::Sender<String>>>,
+}
+
+#[cfg(feature = "websocket")]
+impl WsHub {
+    pub fn new() -> Self {
+        Self {
+            channels: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub async fn sender_for(&self, channel: &str) -> broadcast::Sender<String> {
+        let mut map = self.channels.write().await;
+        if let Some(tx) = map.get(channel) {
+            return tx.clone();
+        }
+        let (tx, _) = broadcast::channel(256);
+        map.insert(channel.to_string(), tx.clone());
+        tx
+    }
+}
+
+#[cfg(feature = "websocket")]
+pub fn hub() -> &'static WsHub {
+    static HUB: OnceLock<WsHub> = OnceLock::new();
+    HUB.get_or_init(WsHub::new)
+}
+
+#[cfg(feature = "websocket")]
+pub fn routes() -> Router<super::Services> {
+    Router::new().route("/ws", get(ws_handler))
+}
+
+#[cfg(not(feature = "websocket"))]
+pub fn routes() -> Router<super::Services> {
+    Router::new()
+}
+
+#[cfg(feature = "websocket")]
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<WsQuery>,
+    State(_services): State<super::Services>,
+) -> impl IntoResponse {
+    let channel = query.channel;
+    ws.max_frame_size(64 * 1024)
+        .max_message_size(64 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, channel))
+}
+
+#[cfg(feature = "websocket")]
+async fn handle_socket(mut socket: WebSocket, channel: String) {
+    let tx = hub().sender_for(&channel).await;
+    let mut rx = tx.subscribe();
+
+    // Welcome event
+    let welcome = json!({
+        "event": "connected",
+        "channel": channel,
+        "message": format!("Joined channel '{channel}'")
+    });
+    let _ = socket.send(Message::Text(welcome.to_string().into())).await;
+
+    loop {
+        tokio::select! {
+            broadcast_msg = rx.recv() => {
+                match broadcast_msg {
+                    Ok(text) => {
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+            client_msg = socket.recv() => {
+                let Some(msg) = client_msg else {
+                    break;
+                };
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        let parsed: Result<Value, _> = serde_json::from_str(&text);
+                        let broadcast_payload = match parsed {
+                            Ok(val) => val.to_string(),
+                            Err(_) => json!({
+                                "event": "message",
+                                "channel": channel,
+                                "data": text.to_string()
+                            }).to_string(),
+                        };
+                        let _ = tx.send(broadcast_payload);
+                    }
+                    Ok(Message::Binary(_)) => {}
+                    Ok(Message::Ping(p)) => {
+                        if socket.send(Message::Pong(p)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Message::Pong(_)) => {}
+                    Ok(Message::Close(_)) | Err(_) => {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+"##;
+
+const WS_TEST_TPL: &str = r##"#![cfg(feature = "websocket")]
+use futures_util::{SinkExt, StreamExt};
+use {{crate_name}}::bootstrap;
+
+#[tokio::test]
+async fn websocket_connect_and_broadcast_flow() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = bootstrap::build_router();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws?channel=chat");
+    let (mut client_a, _) = tokio_tungstenite::connect_async(&url).await.expect("client A connect");
+    let (mut client_b, _) = tokio_tungstenite::connect_async(&url).await.expect("client B connect");
+
+    // 1. Receive welcome messages
+    let msg_a = client_a.next().await.unwrap().unwrap();
+    assert!(msg_a.to_text().unwrap().contains("Joined channel 'chat'"));
+
+    let msg_b = client_b.next().await.unwrap().unwrap();
+    assert!(msg_b.to_text().unwrap().contains("Joined channel 'chat'"));
+
+    // 2. Client A sends a message
+    let payload = serde_json::json!({
+        "event": "chat",
+        "data": "hello from client A"
+    });
+    client_a
+        .send(tokio_tungstenite::tungstenite::Message::Text(payload.to_string().into()))
+        .await
+        .unwrap();
+
+    // 3. Both Client A and Client B receive the broadcast
+    let broadcast_to_a = client_a.next().await.unwrap().unwrap();
+    assert!(broadcast_to_a.to_text().unwrap().contains("hello from client A"));
+
+    let broadcast_to_b = client_b.next().await.unwrap().unwrap();
+    assert!(broadcast_to_b.to_text().unwrap().contains("hello from client A"));
+}
+
+#[tokio::test]
+async fn websocket_hub_direct_test() {
+    use {{crate_name}}::api::websocket;
+
+    let hub = websocket::hub();
+    let tx = hub.sender_for("general").await;
+    let mut rx = tx.subscribe();
+
+    let msg = "{\"event\":\"ping\"}".to_string();
+    tx.send(msg.clone()).expect("send must succeed");
+
+    let received = rx.recv().await.expect("receive must succeed");
+    assert_eq!(received, msg);
+}
+"##;
+
+/// Wires the WebSocket server capability into a generated project:
+///
+/// - enables the `websocket` cargo feature in `Cargo.toml`
+/// - creates `src/api/websocket.rs` with WebSocket upgrade and pub/sub broadcast hub
+/// - creates `tests/websocket.rs` with integration tests
+/// - patches `src/api/mod.rs` to declare `pub mod websocket` and merge `websocket::routes()`
+fn add_websocket(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(project, &[API_MOD, "Cargo.toml"])?;
+    let crate_name = crate::package_name(project)
+        .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
+        .replace('-', "_");
+
+    let creates = vec![
+        (WS_RS.to_string(), WS_API_TPL.to_string()),
+        (
+            WS_TEST.to_string(),
+            WS_TEST_TPL.replace("{{crate_name}}", &crate_name),
+        ),
+    ];
+
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(
+            format!("{rel} already exists — remove it first, or keep the one you have").into(),
+        );
+    }
+
+    let edits = vec![
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "websocket", None))?,
+        edit(project, API_MOD, |c| {
+            let c = insert_pub_mod(&c, "websocket")?;
+            insert_before_line(&c, ".with_state(services)", "        .merge(websocket::routes())")
         })?,
     ];
 
@@ -7564,6 +7837,73 @@ mod tests {
         assert!(mcp_rs.contains("\"get_order\""), "{mcp_rs}");
         assert!(mcp_rs.contains("Some(\"create_order\")"), "{mcp_rs}");
         assert!(mcp_rs.contains("Some(\"get_order\")"), "{mcp_rs}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn websocket_writes_api_and_test_and_modifies_cargo_and_api_mod() {
+        let root = fixture("websocket");
+        add(&root, Capability::Websocket, None, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"sqlite\", \"websocket\"]"), "{toml}");
+
+        let ws_rs = fs::read_to_string(root.join(WS_RS)).unwrap();
+        assert!(ws_rs.contains("pub fn routes()"), "{ws_rs}");
+        assert!(ws_rs.contains("/ws"), "{ws_rs}");
+        assert!(ws_rs.contains("WebSocketUpgrade"), "{ws_rs}");
+
+        let api_mod = fs::read_to_string(root.join(API_MOD)).unwrap();
+        assert!(api_mod.contains("pub mod websocket;"), "{api_mod}");
+        assert!(api_mod.contains(".merge(websocket::routes())"), "{api_mod}");
+
+        let test = fs::read_to_string(root.join(WS_TEST)).unwrap();
+        assert!(test.contains("demo_svc::bootstrap"), "must import project crate: {test}");
+        assert!(test.contains("/ws"), "{test}");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn adding_websocket_twice_fails() {
+        let root = fixture("websocket-twice");
+        add(&root, Capability::Websocket, None, false).unwrap();
+        let err = add(&root, Capability::Websocket, None, true).unwrap_err().to_string();
+        assert!(err.contains("capability 'websocket' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn websocket_dry_run_writes_nothing_but_plans_the_same_change() {
+        let root = fixture("websocket-dry");
+        let before = snapshot(&root);
+        let planned = add(&root, Capability::Websocket, None, true).unwrap();
+        assert_eq!(before, snapshot(&root), "dry run wrote to the fixture");
+        assert_eq!(planned, add(&root, Capability::Websocket, None, false).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn websocket_takes_no_orm() {
+        let root = fixture("websocket-orm");
+        let err = add(&root, Capability::Websocket, Some(Orm::Diesel), true).unwrap_err().to_string();
+        assert!(err.contains("'websocket' has no ORM"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn websocket_coexists_with_other_capabilities() {
+        let root = fixture("websocket-coexist");
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::Oauth2, None, false).unwrap();
+        add(&root, Capability::Mcp, None, false).unwrap();
+        add(&root, Capability::Websocket, None, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("\"cache\""), "{toml}");
+        assert!(toml.contains("\"oauth2\""), "{toml}");
+        assert!(toml.contains("\"mcp\""), "{toml}");
+        assert!(toml.contains("\"websocket\""), "{toml}");
         fs::remove_dir_all(&root).unwrap();
     }
 
