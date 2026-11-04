@@ -212,7 +212,7 @@ tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 # it cannot drift the way a static file would the moment a feature adds a route.
 # Default features only (`macros`) — the schema collector is recursive over
 # `paths(...)`, so `components(schemas(...))` needs no template of its own.
-utoipa = { version = "5.5.0", optional = true }
+utoipa = { version = "6.0.0", optional = true }
 # `axum` is what brings `Scalar::with_url` and the `Servable` trait `add scalar`
 # calls into a `Router`; the two other frameworks it supports are not this
 # template's problem.
