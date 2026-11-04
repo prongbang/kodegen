@@ -21,7 +21,7 @@ are used in place, so `kodegen update` refuses on either — see
 
 ### Capabilities
 
-All 14 supported by `kodegen add <capability>` / `kodegen new --with`:
+All 15 supported by `kodegen add <capability>` / `kodegen new --with`:
 
 | Capability | Slot | `--orm` | Default adapter (capability off / env unset) | Main env |
 |---|---|---|---|---|
@@ -39,11 +39,12 @@ All 14 supported by `kodegen add <capability>` / `kodegen new --with`:
 | `scalar` | — (additive, no port at all) | not applicable | routes absent (`GET /docs`/`GET /openapi.json` compile out with the feature) | none — compile-time switch only |
 | `e2ee` | — (additive) | not applicable | middleware + handshake endpoint | `E2EE_SHARED_KEY` (optional) |
 | `oauth2` | — (additive) | not applicable | routes absent (`POST /oauth/token`, `GET /.well-known/jwks.json`, `POST /oauth/revoke`) | `JWT_SECRET`, `OAUTH2_CLIENT_ID`, `OAUTH2_CLIENT_SECRET` |
+| `mcp` | — (additive) | not applicable | routes absent (`GET /mcp/sse`, `POST /mcp/message`, `POST /mcp`) | none — compile-time switch only |
 
 A **slot** holds exactly one adapter: `postgres`/`mysql`/`mariadb`/`timescaledb`/`mongodb`/`mssql`
 are all adapters of the datastore slot (`UserRepository`), and `clickhouse`/`influxdb`/`greptimedb`
-are all adapters of the event-sink slot (`EventSink`) — one occupant per slot, `redis`, `s3`,
-`scalar`, `e2ee` and `oauth2` fill no slot and sit alongside anything. Usage and per-capability details are in
+are all adapters of the event-sink slot (`EventSink`) — one occupant per slot; `redis`, `s3`,
+`scalar`, `e2ee`, `oauth2` and `mcp` fill no slot and sit alongside anything. Usage and per-capability details are in
 [Add a capability](#add-a-capability) below.
 
 Every adapter above also implements the template's `Readiness` port with its
@@ -172,6 +173,9 @@ kodegen add clickhouse                   # an EventSink port + a ClickHouse adap
 kodegen add influxdb                     # the same port, over line protocol (InfluxDB v2/v3)
 kodegen add greptimedb                   # same adapter as influxdb, GreptimeDB image + URL
 kodegen add scalar                       # GET /docs + GET /openapi.json, derived from the code
+kodegen add e2ee                         # end-to-end encryption — XChaCha20-Poly1305 middleware
+kodegen add oauth2                       # OAuth2 server & token issuing + AuthUser extractor
+kodegen add mcp                          # Model Context Protocol (MCP) SSE & JSON-RPC 2.0 server
 kodegen add postgres --orm seaorm        # the same PostgreSQL, on SeaORM instead of Diesel
 kodegen add mysql --orm seaorm           # same again on MySQL/MariaDB — no C driver to build
 kodegen add postgres --path ~/svc        # run from outside the project
@@ -800,6 +804,61 @@ before shipping anything you would not want the API surface publicly readable
 for, or put `/docs`/`/openapi.json` behind the same auth/ingress rule as the
 rest of the API. There is deliberately no env-based kill switch — see the
 generated project's README for why.
+
+#### `add e2ee`
+
+Adds end-to-end request/response payload encryption using **XChaCha20-Poly1305** and **X25519** ECDH key exchange (via `lazynton`). Sits alongside any datastore, cache, or event sink:
+
+```
+Cargo.toml               default = [...] gains "e2ee"
+src/api/e2ee.rs          created — handshake endpoint (POST /e2ee/handshake) + encryption middleware
+src/api/mod.rs           .merge(e2ee::routes()) + wraps the router with e2ee middleware
+tests/e2ee.rs            created — handshake verification + encrypted request/response roundtrip
+```
+
+- **Per-client ephemeral keys**: Clients perform an X25519 ECDH handshake (`POST /e2ee/handshake`) to negotiate a symmetric session key.
+- **Optional pre-shared key**: Setting `E2EE_SHARED_KEY` (64-character hex string) enables static encryption fallback for clients without handshake.
+- **Zero overhead when disabled**: Remove `"e2ee"` from `default = [...]` in `Cargo.toml` to compile out the middleware and handshake route entirely.
+
+#### `add oauth2`
+
+Adds an **OAuth2 Authorization Server & Resource Server** (RFC 6749, RFC 7517, RFC 7009) with JWT token issuing, JWKS key discovery, and the `AuthUser` extractor:
+
+```
+Cargo.toml               default = [...] gains "oauth2"
+src/api/oauth2.rs        created — POST /oauth/token, GET /.well-known/jwks.json, POST /oauth/revoke, AuthUser
+src/api/mod.rs           .merge(oauth2::routes())
+tests/oauth2.rs          created — client credentials token flow, JWKS verification, and revocation
+```
+
+- **Endpoints**:
+  - `POST /oauth/token`: Issue access tokens via `grant_type=client_credentials` (accepts both `application/x-www-form-urlencoded` and `application/json`).
+  - `GET /.well-known/jwks.json`: Public JSON Web Key Set for upstream token verification.
+  - `POST /oauth/revoke`: Token revocation endpoint.
+- **Protecting routes**: Inject `auth: AuthUser` as a parameter into any handler; unauthenticated requests receive `401 Unauthorized`.
+- **Environment variables**: `JWT_SECRET` (token signing key), `OAUTH2_CLIENT_ID`, and `OAUTH2_CLIENT_SECRET`.
+
+#### `add mcp`
+
+Adds a **Model Context Protocol (MCP 2024-11-05 spec)** server to expose application domain tools to AI agents (such as Antigravity, Claude Desktop, Cursor, and custom agentic frameworks):
+
+```
+Cargo.toml               default = [...] gains "mcp"
+src/api/mcp.rs           created — GET /mcp/sse, POST /mcp/message, POST /mcp, JSON-RPC 2.0 tool dispatch
+src/api/mod.rs           .merge(mcp::routes())
+tests/mcp.rs             created — initialize, ping, tools/list, tools/call, and SSE stream tests
+```
+
+- **Dual Transport**:
+  - **SSE Transport**: `GET /mcp/sse` initiates a streaming connection and emits the session endpoint; requests are sent to `POST /mcp/message?sessionId=<id>`.
+  - **Direct JSON-RPC**: `POST /mcp` for direct synchronous request-response execution.
+- **Lifecycle & Tools**:
+  - Implements standard MCP methods: `initialize` (protocol version `2024-11-05`), `ping`, `tools/list`, `tools/call`, and `resources/list`.
+  - Shipped tools: `create_user` and `get_user`.
+- **Automatic Feature Integration**:
+  - Running `kodegen feature <name>` automatically appends `create_<name>` and `get_<name>` tools into `src/api/mcp.rs`.
+  - Running `kodegen add mcp` on an existing project automatically scans and exposes tools for all previously scaffolded features.
+- **Zero external heavyweight dependencies**: Built directly on `axum`, `tokio`, `tokio-stream`, and `serde_json`.
 
 ### Update a cached template
 
