@@ -252,6 +252,14 @@ fn add_epilogue(cap: capability::Capability) -> Vec<String> {
                 "Protect any handler by injecting `auth: AuthUser` as a parameter.".to_string(),
                 "Drop \"oauth2\" from default = [...] in Cargo.toml to disable.".to_string(),
             ],
+            capability::Capability::Mcp => vec![
+                "cargo run".to_string(),
+                "MCP SSE endpoint: http://localhost:8080/mcp/sse".to_string(),
+                "MCP message endpoint: POST http://localhost:8080/mcp/message".to_string(),
+                "Direct JSON-RPC: POST http://localhost:8080/mcp".to_string(),
+                "Connect your AI agent (Claude, Cursor, Antigravity) using SSE transport.".to_string(),
+                "Drop \"mcp\" from default = [...] in Cargo.toml to disable.".to_string(),
+            ],
             _ => vec![
                 "cargo run".to_string(),
                 "Open http://localhost:8080/docs — the spec itself is at /openapi.json.".to_string(),

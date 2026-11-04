@@ -151,6 +151,19 @@ pub fn add_feature(
         })?);
     }
 
+    if transport == Transport::Rest && project.join("src/api/mcp.rs").is_file() {
+        edits.push(edit(project, "src/api/mcp.rs", |c| {
+            let tool_json = format!(
+                "                    {{\n                        \"name\": \"create_{name}\",\n                        \"description\": \"Create a new {name}\",\n                        \"inputSchema\": {{\n                            \"type\": \"object\",\n                            \"properties\": {{\n                                \"id\": {{ \"type\": \"string\" }},\n                                \"name\": {{ \"type\": \"string\" }}\n                            }},\n                            \"required\": [\"id\", \"name\"]\n                        }}\n                    }},\n                    {{\n                        \"name\": \"get_{name}\",\n                        \"description\": \"Get {name} by ID\",\n                        \"inputSchema\": {{\n                            \"type\": \"object\",\n                            \"properties\": {{\n                                \"id\": {{ \"type\": \"string\" }}\n                            }},\n                            \"required\": [\"id\"]\n                        }}\n                    }},"
+            );
+            let dispatch_code = format!(
+                "                Some(\"create_{name}\") => {{\n                    let id = args.get(\"id\").and_then(Value::as_str).unwrap_or(\"\");\n                    let name = args.get(\"name\").and_then(Value::as_str).unwrap_or(\"\");\n                    if id.is_empty() || name.is_empty() {{\n                        return Some(json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"error\": {{ \"code\": -32602, \"message\": \"Missing 'id' or 'name'\" }} }}));\n                    }}\n                    match services.{name}.create_{name}(id.to_string(), name.to_string()).await {{\n                        Ok(()) => json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": {{ \"content\": [{{ \"type\": \"text\", \"text\": format!(\"{name} '{{id}}' created\") }}] }} }}),\n                        Err(e) => json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": {{ \"content\": [{{ \"type\": \"text\", \"text\": format!(\"{{e}}\") }}], \"isError\": true }} }}),\n                    }}\n                }}\n                Some(\"get_{name}\") => {{\n                    let id = args.get(\"id\").and_then(Value::as_str).unwrap_or(\"\");\n                    if id.is_empty() {{\n                        return Some(json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"error\": {{ \"code\": -32602, \"message\": \"Missing required argument 'id'\" }} }}));\n                    }}\n                    match services.{name}.get_{name}(id.to_string()).await {{\n                        Ok(item) => json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": {{ \"content\": [{{ \"type\": \"text\", \"text\": serde_json::to_string(&item).unwrap_or_default() }}] }} }}),\n                        Err(e) => json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": {{ \"content\": [{{ \"type\": \"text\", \"text\": format!(\"{{e}}\") }}], \"isError\": true }} }}),\n                    }}\n                }}"
+            );
+            let c = insert_before_line(&c, crate::capability::MCP_TOOLS_MARKER, &tool_json)?;
+            insert_before_line(&c, crate::capability::MCP_DISPATCH_MARKER, &dispatch_code)
+        })?);
+    }
+
     let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
 
     // everything above is pure, so this is the only side effect — dry-run skips it

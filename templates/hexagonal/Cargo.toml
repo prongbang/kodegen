@@ -205,6 +205,8 @@ lazynton = { version = "0.3", optional = true }
 # Signs and verifies JWTs with HMAC or RSA/EdDSA, issues tokens, renders JWKS,
 # and provides `AuthUser` extractor for route protection.
 jsonwebtoken = { version = "9.3", features = ["use_pem"], optional = true }
+# Model Context Protocol (MCP) SSE streaming
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
 # OpenAPI, and the one capability with no server behind it: the spec is derived
 # from the handlers themselves (`#[utoipa::path]`), not hand-maintained JSON, so
 # it cannot drift the way a static file would the moment a feature adds a route.
@@ -298,6 +300,8 @@ e2ee = ["dep:lazynton"]
 # OAuth2 server & token verification: POST /oauth/token, GET /.well-known/jwks.json,
 # POST /oauth/revoke and `AuthUser` extractor.
 oauth2 = ["dep:jsonwebtoken"]
+# Model Context Protocol (MCP) server: SSE & JSON-RPC 2.0 endpoints for AI agents
+mcp = ["dep:tokio-stream"]
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

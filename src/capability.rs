@@ -68,6 +68,7 @@ pub enum Capability {
     Scalar,
     E2ee,
     Oauth2,
+    Mcp,
 }
 
 /// Which ORM a relational capability is built on. Orthogonal to `Capability`
@@ -130,6 +131,9 @@ enum Kind {
     /// OAuth2: Authorization Server & Resource Server (RFC 6749, RFC 7517, RFC 7009).
     /// Issues and verifies JWTs, renders JWKS, and provides `AuthUser` extractor.
     Oauth2,
+    /// MCP: Model Context Protocol (2024-11-05 spec) server over JSON-RPC 2.0 & SSE.
+    /// Exposes tools and resources to AI agents; sits next to anything.
+    Mcp,
 }
 
 impl Kind {
@@ -143,7 +147,7 @@ impl Kind {
         match self {
             Kind::Relational(_) | Kind::Document | Kind::Mssql => Some(Slot::Datastore),
             Kind::Events(_) => Some(Slot::Events),
-            Kind::Cache | Kind::Blob | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 => None,
+            Kind::Cache | Kind::Blob | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp => None,
         }
     }
 }
@@ -387,6 +391,7 @@ impl Capability {
             Capability::Scalar => "scalar",
             Capability::E2ee => "e2ee",
             Capability::Oauth2 => "oauth2",
+            Capability::Mcp => "mcp",
         }
     }
 
@@ -417,6 +422,7 @@ impl Capability {
             Capability::Scalar => Kind::ApiDocs,
             Capability::E2ee => Kind::E2ee,
             Capability::Oauth2 => Kind::Oauth2,
+            Capability::Mcp => Kind::Mcp,
         }
     }
 
@@ -459,6 +465,7 @@ impl Capability {
             // the decrypt/encrypt middleware is compiled — see the README
             Kind::E2ee => "e2ee",
             Kind::Oauth2 => "oauth2",
+            Kind::Mcp => "mcp",
         }
     }
 
@@ -476,7 +483,7 @@ impl Capability {
                 "docker compose -f docker-compose.dev.yml run --rm mssql-init",
             ],
             // no server: the handshake endpoint and middleware live in the app itself
-            Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 => &[],
+            Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp => &[],
             _ => &["docker compose -f docker-compose.dev.yml up -d"],
         }
     }
@@ -511,6 +518,7 @@ impl Capability {
             // not a copy-pasteable placeholder.
             Kind::E2ee => &[],
             Kind::Oauth2 => &[],
+            Kind::Mcp => &[],
         }
     }
 }
@@ -841,6 +849,10 @@ pub fn list(project: &Path) -> Result<()> {
         "  oauth2       OAuth2 — authorization & resource server (RFC 6749, RFC 7517), token issuing/jwks \
          + AuthUser extractor; sits next to anything, no --orm"
     );
+    println!(
+        "  mcp          Model Context Protocol (MCP) — JSON-RPC 2.0 & SSE server (2024-11-05 spec); \
+         exposes tools over /mcp and /mcp/sse; sits next to anything, no --orm"
+    );
     println!();
     println!(
         "Only one datastore (postgres, mysql, mariadb, timescaledb, mongodb, mssql) and one event \
@@ -910,7 +922,7 @@ fn check_orm(cap: Capability, orm: Option<Orm>) -> Result<()> {
              That is the trade — see `kodegen add --list`."
                 .into(),
         ),
-        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 => Err(format!(
+        Kind::Document | Kind::Cache | Kind::Blob | Kind::Events(_) | Kind::ApiDocs | Kind::E2ee | Kind::Oauth2 | Kind::Mcp => Err(format!(
             "--orm applies only to relational capabilities (postgres, mysql, mariadb, timescaledb) \
              — '{}' has no ORM",
             cap.name()
@@ -1027,6 +1039,7 @@ pub fn add(
         (Kind::ApiDocs, _) => add_scalar(project, dry_run),
         (Kind::E2ee, _) => add_e2ee(project, dry_run),
         (Kind::Oauth2, _) => add_oauth2(project, dry_run),
+        (Kind::Mcp, _) => add_mcp(project, dry_run),
     }
 }
 
@@ -2738,6 +2751,553 @@ fn add_oauth2(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>
         edit(project, API_MOD, |c| {
             let c = insert_pub_mod(&c, "oauth2")?;
             insert_before_line(&c, ".with_state(services)", "        .merge(oauth2::routes())")
+        })?,
+    ];
+
+    let paths = |v: &[(String, String)]| v.iter().map(|(rel, _)| rel.clone()).collect();
+
+    if !dry_run {
+        write_plan(project, &creates, &edits)?;
+    }
+    Ok((paths(&creates), paths(&edits)))
+}
+
+// ── MCP constants ────────────────────────────────────────────────────────────
+
+pub const MCP_RS: &str = "src/api/mcp.rs";
+pub const MCP_TEST: &str = "tests/mcp.rs";
+pub const MCP_TOOLS_MARKER: &str = "                    // kodegen:mcp:tools";
+pub const MCP_DISPATCH_MARKER: &str = "                // kodegen:mcp:dispatch";
+
+const MCP_API_TPL: &str = r##"//! Model Context Protocol (MCP) 2024-11-05 Server Adapter.
+//! Exposes Axum routes for HTTP SSE transport and JSON-RPC 2.0 tool execution.
+
+#[cfg(feature = "mcp")]
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+    routing::{get, post},
+    Json, Router,
+};
+#[cfg(feature = "mcp")]
+use serde::Deserialize;
+#[cfg(feature = "mcp")]
+use serde_json::{json, Value};
+#[cfg(feature = "mcp")]
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+};
+#[cfg(feature = "mcp")]
+use tokio::sync::{broadcast, RwLock};
+#[cfg(feature = "mcp")]
+use tokio_stream::wrappers::BroadcastStream;
+#[cfg(feature = "mcp")]
+use tokio_stream::{Stream, StreamExt};
+
+#[cfg(feature = "mcp")]
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "mcp")]
+fn sessions() -> &'static RwLock<HashMap<String, broadcast::Sender<String>>> {
+    static SESSIONS: OnceLock<RwLock<HashMap<String, broadcast::Sender<String>>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+#[cfg(feature = "mcp")]
+fn new_session_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let count = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("sess_{now:x}_{count:x}")
+}
+
+#[cfg(feature = "mcp")]
+pub fn routes() -> Router<super::Services> {
+    Router::new()
+        .route("/mcp/sse", get(sse_handler))
+        .route("/mcp/message", post(message_handler))
+        .route("/mcp", post(direct_rpc_handler))
+}
+
+#[cfg(not(feature = "mcp"))]
+pub fn routes() -> Router<super::Services> {
+    Router::new()
+}
+
+#[derive(Deserialize)]
+pub struct MessageQuery {
+    #[serde(rename = "sessionId", default)]
+    pub session_id: String,
+}
+
+#[cfg(feature = "mcp")]
+pub async fn sse_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let session_id = new_session_id();
+    let (tx, rx) = broadcast::channel(32);
+    {
+        let mut map = sessions().write().await;
+        map.insert(session_id.clone(), tx);
+    }
+
+    let initial = tokio_stream::once(Ok(Event::default()
+        .event("endpoint")
+        .data(format!("/mcp/message?sessionId={session_id}"))));
+
+    let stream = BroadcastStream::new(rx).filter_map(|msg| match msg {
+        Ok(data) => Some(Ok(Event::default().event("message").data(data))),
+        Err(_) => None,
+    });
+
+    let combined = initial.chain(stream);
+    Sse::new(combined).keep_alive(KeepAlive::default())
+}
+
+#[cfg(feature = "mcp")]
+pub async fn message_handler(
+    State(services): State<super::Services>,
+    Query(query): Query<MessageQuery>,
+    Json(payload): Json<Value>,
+) -> Response {
+    if query.session_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Missing sessionId query parameter").into_response();
+    }
+
+    let tx_opt = {
+        let map = sessions().read().await;
+        map.get(&query.session_id).cloned()
+    };
+
+    let Some(tx) = tx_opt else {
+        return (StatusCode::NOT_FOUND, "Session not found").into_response();
+    };
+
+    let response = handle_rpc(payload, &services).await;
+    if let Some(resp) = response {
+        if let Ok(serialized) = serde_json::to_string(&resp) {
+            let _ = tx.send(serialized);
+        }
+    }
+
+    StatusCode::ACCEPTED.into_response()
+}
+
+#[cfg(feature = "mcp")]
+pub async fn direct_rpc_handler(
+    State(services): State<super::Services>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let response = handle_rpc(payload, &services).await;
+    match response {
+        Some(resp) => Json(resp).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+#[cfg(feature = "mcp")]
+pub async fn handle_rpc(req: Value, services: &super::Services) -> Option<Value> {
+    let jsonrpc = req.get("jsonrpc").and_then(Value::as_str);
+    let id = req.get("id").cloned();
+    let method = req.get("method").and_then(Value::as_str);
+
+    if jsonrpc != Some("2.0") {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32600, "message": "Invalid Request: jsonrpc must be '2.0'" }
+        }));
+    }
+
+    let Some(method) = method else {
+        return Some(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32600, "message": "Missing method" }
+        }));
+    };
+
+    let req_id = id.unwrap_or(Value::Null);
+
+    match method {
+        "initialize" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                    "resources": {}
+                },
+                "serverInfo": {
+                    "name": "kodegen-mcp",
+                    "version": "0.1.0"
+                }
+            }
+        })),
+        "notifications/initialized" => None,
+        "ping" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {}
+        })),
+        "tools/list" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "create_user",
+                        "description": "Create a new user with id and name",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "name": { "type": "string" }
+                            },
+                            "required": ["id", "name"]
+                        }
+                    },
+                    {
+                        "name": "get_user",
+                        "description": "Retrieve user details by user ID",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" }
+                            },
+                            "required": ["id"]
+                        }
+                    },
+                    // kodegen:mcp:tools
+                ]
+            }
+        })),
+        "tools/call" => {
+            let params = req.get("params");
+            let tool_name = params.and_then(|p| p.get("name")).and_then(Value::as_str);
+            let args = params.and_then(|p| p.get("arguments")).cloned().unwrap_or(json!({}));
+
+            let res = match tool_name {
+                Some("create_user") => {
+                    let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+                    let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                    if id.is_empty() || name.is_empty() {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": { "code": -32602, "message": "Missing 'id' or 'name'" }
+                        }));
+                    }
+                    match services.user.create_user(id.to_string(), name.to_string()).await {
+                        Ok(()) => json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "content": [{ "type": "text", "text": format!("User '{id}' created") }]
+                            }
+                        }),
+                        Err(e) => json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "content": [{ "type": "text", "text": format!("{e}") }],
+                                "isError": true
+                            }
+                        }),
+                    }
+                }
+                Some("get_user") => {
+                    let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+                    if id.is_empty() {
+                        return Some(json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "error": { "code": -32602, "message": "Missing required argument 'id'" }
+                        }));
+                    }
+                    match services.user.get_user(id.to_string()).await {
+                        Ok(user) => json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "content": [{ "type": "text", "text": serde_json::to_string(&user).unwrap_or_default() }]
+                            }
+                        }),
+                        Err(e) => json!({
+                            "jsonrpc": "2.0",
+                            "id": req_id,
+                            "result": {
+                                "content": [{ "type": "text", "text": format!("{e}") }],
+                                "isError": true
+                            }
+                        }),
+                    }
+                }
+                // kodegen:mcp:dispatch
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": { "code": -32601, "message": format!("Tool not found: {:?}", tool_name) }
+                }),
+            };
+            Some(res)
+        }
+        "resources/list" => Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resources": []
+            }
+        })),
+        _ => Some(json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": { "code": -32601, "message": format!("Method not found: {method}") }
+        })),
+    }
+}
+"##;
+
+const MCP_TEST_TPL: &str = r##"#![cfg(feature = "mcp")]
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use {{crate_name}}::bootstrap;
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn mcp_initialize_and_tools_flow() {
+    let app = bootstrap::build_router();
+
+    // 1. Initialize
+    let init_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "test-client", "version": "1.0.0" }
+        }
+    });
+    let req = Request::post("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(init_req.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 8192).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(body["result"]["serverInfo"]["name"], "kodegen-mcp");
+
+    // 2. Ping
+    let ping_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "ping"
+    });
+    let req = Request::post("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(ping_req.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 8192).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"], 2);
+    assert!(body["result"].is_object());
+
+    // 3. tools/list
+    let list_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/list"
+    });
+    let req = Request::post("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(list_req.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 8192).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let tools = body["result"]["tools"].as_array().expect("tools array");
+    assert!(tools.iter().any(|t| t["name"] == "create_user"));
+    assert!(tools.iter().any(|t| t["name"] == "get_user"));
+
+    // 4. tools/call create_user
+    let call_create = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "create_user",
+            "arguments": {
+                "id": "usr_mcp_1",
+                "name": "Alice MCP"
+            }
+        }
+    });
+    let req = Request::post("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(call_create.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 8192).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"], 4);
+    assert!(!body["result"]["isError"].as_bool().unwrap_or(false));
+
+    // 5. tools/call get_user
+    let call_get = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "get_user",
+            "arguments": {
+                "id": "usr_mcp_1"
+            }
+        }
+    });
+    let req = Request::post("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(call_get.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 8192).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["id"], 5);
+    let content = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(content.contains("usr_mcp_1"));
+    assert!(content.contains("Alice MCP"));
+}
+
+#[tokio::test]
+async fn mcp_sse_endpoint_and_message_flow() {
+    let app = bootstrap::build_router();
+
+    // 1. Connect to SSE
+    let req = Request::get("/mcp/sse")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+}
+"##;
+
+fn scanned_mcp_tools(project: &Path) -> Result<String> {
+    let api_dir = project.join("src/api");
+    if !api_dir.is_dir() {
+        return Ok(String::new());
+    }
+    let mut modules: Vec<String> = fs::read_dir(&api_dir)
+        .map_err(|e| format!("src/api: {e}"))?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stem = name.strip_suffix(".rs")?.to_string();
+            (!matches!(stem.as_str(), "mod" | "user" | "hello" | "mcp" | "oauth2" | "openapi") && !stem.ends_with("_grpc")).then_some(stem)
+        })
+        .collect();
+    modules.sort();
+
+    let mut out = String::new();
+    for name in modules {
+        out.push_str(&format!(
+            "                    {{\n                        \"name\": \"create_{name}\",\n                        \"description\": \"Create a new {name}\",\n                        \"inputSchema\": {{\n                            \"type\": \"object\",\n                            \"properties\": {{\n                                \"id\": {{ \"type\": \"string\" }},\n                                \"name\": {{ \"type\": \"string\" }}\n                            }},\n                            \"required\": [\"id\", \"name\"]\n                        }}\n                    }},\n                    {{\n                        \"name\": \"get_{name}\",\n                        \"description\": \"Get {name} by ID\",\n                        \"inputSchema\": {{\n                            \"type\": \"object\",\n                            \"properties\": {{\n                                \"id\": {{ \"type\": \"string\" }}\n                            }},\n                            \"required\": [\"id\"]\n                        }}\n                    }},\n"
+        ));
+    }
+    Ok(out)
+}
+
+fn scanned_mcp_dispatch(project: &Path) -> Result<String> {
+    let api_dir = project.join("src/api");
+    if !api_dir.is_dir() {
+        return Ok(String::new());
+    }
+    let mut modules: Vec<String> = fs::read_dir(&api_dir)
+        .map_err(|e| format!("src/api: {e}"))?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stem = name.strip_suffix(".rs")?.to_string();
+            (!matches!(stem.as_str(), "mod" | "user" | "hello" | "mcp" | "oauth2" | "openapi") && !stem.ends_with("_grpc")).then_some(stem)
+        })
+        .collect();
+    modules.sort();
+
+    let mut out = String::new();
+    for name in modules {
+        out.push_str(&format!(
+            "                Some(\"create_{name}\") => {{\n                    let id = args.get(\"id\").and_then(Value::as_str).unwrap_or(\"\");\n                    let name = args.get(\"name\").and_then(Value::as_str).unwrap_or(\"\");\n                    if id.is_empty() || name.is_empty() {{\n                        return Some(json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"error\": {{ \"code\": -32602, \"message\": \"Missing 'id' or 'name'\" }} }}));\n                    }}\n                    match services.{name}.create_{name}(id.to_string(), name.to_string()).await {{\n                        Ok(()) => json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": {{ \"content\": [{{ \"type\": \"text\", \"text\": format!(\"{name} '{{id}}' created\") }}] }} }}),\n                        Err(e) => json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": {{ \"content\": [{{ \"type\": \"text\", \"text\": format!(\"{{e}}\") }}], \"isError\": true }} }}),\n                    }}\n                }}\n                Some(\"get_{name}\") => {{\n                    let id = args.get(\"id\").and_then(Value::as_str).unwrap_or(\"\");\n                    if id.is_empty() {{\n                        return Some(json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"error\": {{ \"code\": -32602, \"message\": \"Missing required argument 'id'\" }} }}));\n                    }}\n                    match services.{name}.get_{name}(id.to_string()).await {{\n                        Ok(item) => json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": {{ \"content\": [{{ \"type\": \"text\", \"text\": serde_json::to_string(&item).unwrap_or_default() }}] }} }}),\n                        Err(e) => json!({{ \"jsonrpc\": \"2.0\", \"id\": req_id, \"result\": {{ \"content\": [{{ \"type\": \"text\", \"text\": format!(\"{{e}}\") }}], \"isError\": true }} }}),\n                    }}\n                }}\n"
+        ));
+    }
+    Ok(out)
+}
+
+/// Wires the Model Context Protocol (MCP) server capability into a generated project:
+///
+/// - enables the `mcp` cargo feature in `Cargo.toml`
+/// - creates `src/api/mcp.rs` with JSON-RPC 2.0 & SSE tool dispatch
+/// - creates `tests/mcp.rs` with integration tests for initialization, tool listing, and execution
+/// - patches `src/api/mod.rs` to declare `pub mod mcp` and merge `mcp::routes()`
+fn add_mcp(project: &Path, dry_run: bool) -> Result<(Vec<String>, Vec<String>)> {
+    require_files(project, &[API_MOD, "Cargo.toml"])?;
+    let crate_name = crate::package_name(project)
+        .ok_or("Cargo.toml with a package name not found — run inside a generated project")?
+        .replace('-', "_");
+
+    let scanned_tools = scanned_mcp_tools(project)?;
+    let scanned_dispatch = scanned_mcp_dispatch(project)?;
+
+    let mut api_content = MCP_API_TPL.to_string();
+    if !scanned_tools.is_empty() {
+        api_content = insert_before_line(&api_content, MCP_TOOLS_MARKER, &scanned_tools)?;
+    }
+    if !scanned_dispatch.is_empty() {
+        api_content = insert_before_line(&api_content, MCP_DISPATCH_MARKER, &scanned_dispatch)?;
+    }
+
+    let creates = vec![
+        (MCP_RS.to_string(), api_content),
+        (
+            MCP_TEST.to_string(),
+            MCP_TEST_TPL.replace("{{crate_name}}", &crate_name),
+        ),
+    ];
+
+    if let Some((rel, _)) = creates.iter().find(|(rel, _)| project.join(rel).exists()) {
+        return Err(
+            format!("{rel} already exists — remove it first, or keep the one you have").into(),
+        );
+    }
+
+    let edits = vec![
+        edit(project, "Cargo.toml", |c| enable_feature(&c, "mcp", None))?,
+        edit(project, API_MOD, |c| {
+            let c = insert_pub_mod(&c, "mcp")?;
+            insert_before_line(&c, ".with_state(services)", "        .merge(mcp::routes())")
         })?,
     ];
 
@@ -6921,6 +7481,89 @@ mod tests {
         let root = fixture("oauth2-orm");
         let err = add(&root, Capability::Oauth2, Some(Orm::Diesel), true).unwrap_err().to_string();
         assert!(err.contains("'oauth2' has no ORM"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mcp_writes_api_and_test_and_modifies_cargo_and_api_mod() {
+        let root = fixture("mcp");
+        add(&root, Capability::Mcp, None, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("default = [\"sqlite\", \"mcp\"]"), "{toml}");
+
+        let mcp_rs = fs::read_to_string(root.join(MCP_RS)).unwrap();
+        assert!(mcp_rs.contains("pub fn routes()"), "{mcp_rs}");
+        assert!(mcp_rs.contains("/mcp/sse"), "{mcp_rs}");
+        assert!(mcp_rs.contains("/mcp/message"), "{mcp_rs}");
+        assert!(mcp_rs.contains("/mcp"), "{mcp_rs}");
+        assert!(mcp_rs.contains("create_user"), "{mcp_rs}");
+        assert!(mcp_rs.contains("get_user"), "{mcp_rs}");
+
+        let api_mod = fs::read_to_string(root.join(API_MOD)).unwrap();
+        assert!(api_mod.contains("pub mod mcp;"), "{api_mod}");
+        assert!(api_mod.contains(".merge(mcp::routes())"), "{api_mod}");
+
+        let test = fs::read_to_string(root.join(MCP_TEST)).unwrap();
+        assert!(test.contains("demo_svc::bootstrap"), "must import project crate: {test}");
+        assert!(test.contains("/mcp"), "{test}");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn adding_mcp_twice_fails() {
+        let root = fixture("mcp-twice");
+        add(&root, Capability::Mcp, None, false).unwrap();
+        let err = add(&root, Capability::Mcp, None, true).unwrap_err().to_string();
+        assert!(err.contains("capability 'mcp' already added"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mcp_dry_run_writes_nothing_but_plans_the_same_change() {
+        let root = fixture("mcp-dry");
+        let before = snapshot(&root);
+        let planned = add(&root, Capability::Mcp, None, true).unwrap();
+        assert_eq!(before, snapshot(&root), "dry run wrote to the fixture");
+        assert_eq!(planned, add(&root, Capability::Mcp, None, false).unwrap());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mcp_takes_no_orm() {
+        let root = fixture("mcp-orm");
+        let err = add(&root, Capability::Mcp, Some(Orm::Diesel), true).unwrap_err().to_string();
+        assert!(err.contains("'mcp' has no ORM"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mcp_coexists_with_other_capabilities() {
+        let root = fixture("mcp-coexist");
+        add(&root, Capability::Redis, None, false).unwrap();
+        add(&root, Capability::Oauth2, None, false).unwrap();
+        add(&root, Capability::Mcp, None, false).unwrap();
+
+        let toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        assert!(toml.contains("\"cache\""), "{toml}");
+        assert!(toml.contains("\"oauth2\""), "{toml}");
+        assert!(toml.contains("\"mcp\""), "{toml}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mcp_scans_existing_features_into_tools_and_dispatch() {
+        let root = fixture("mcp-scan");
+        // Add a mock feature file in src/api/order.rs
+        fs::write(root.join("src/api/order.rs"), "// mock order api").unwrap();
+        add(&root, Capability::Mcp, None, false).unwrap();
+
+        let mcp_rs = fs::read_to_string(root.join(MCP_RS)).unwrap();
+        assert!(mcp_rs.contains("\"create_order\""), "{mcp_rs}");
+        assert!(mcp_rs.contains("\"get_order\""), "{mcp_rs}");
+        assert!(mcp_rs.contains("Some(\"create_order\")"), "{mcp_rs}");
+        assert!(mcp_rs.contains("Some(\"get_order\")"), "{mcp_rs}");
         fs::remove_dir_all(&root).unwrap();
     }
 
