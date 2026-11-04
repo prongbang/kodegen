@@ -62,7 +62,7 @@ tower-http = { version = "0.6.11", features = ["request-id", "timeout", "trace"]
 # server on a second port); the handler renders through
 # `PrometheusHandle::render()` on the port already open.
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.17", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Optional like every other datastore driver, and for the same reason: with
 # `document` selected there is no Diesel code left to compile (see
 # `infrastructure/mod.rs`), so nothing should pull the ORM or its migration
