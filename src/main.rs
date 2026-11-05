@@ -119,7 +119,7 @@ fn run() -> Result<()> {
             // an `--orm` that no entry in the list can take
             capability::check_combination(&with, orm)?;
             let dest = output.join(&name);
-            if dest.exists() {
+            if dest.exists() && !is_empty_or_cache(&dest) {
                 return Err(format!("{} already exists", dest.display()).into());
             }
             let (tpl_dir, staging) = resolve_template(&template)?;
@@ -458,6 +458,23 @@ fn render_tree(src: &Path, dst: &Path, subs: &[(String, String)]) -> Result<()> 
     Ok(())
 }
 
+fn is_empty_or_cache(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    match fs::read_dir(path) {
+        Ok(mut entries) => entries.all(|entry| match entry {
+            Ok(e) => {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                matches!(s.as_ref(), ".git" | "target" | ".DS_Store")
+            }
+            Err(_) => false,
+        }),
+        Err(_) => false,
+    }
+}
+
 fn validate_name(name: &str) -> Result<()> {
     let mut chars = name.chars();
     let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase())
@@ -606,5 +623,28 @@ mod tests {
         assert!(validate_name("my-app").is_ok());
         assert!(validate_name("My App").is_err());
         assert!(validate_name("1app").is_err());
+    }
+
+    #[test]
+    fn empty_or_cache_directory_is_allowed_for_new() {
+        let dir = std::env::temp_dir().join("kodegen-cache-dir-test");
+        let _ = fs::remove_dir_all(&dir);
+
+        // does not exist yet
+        assert!(!is_empty_or_cache(&dir));
+
+        // empty directory
+        fs::create_dir_all(&dir).unwrap();
+        assert!(is_empty_or_cache(&dir));
+
+        // directory containing only target/
+        fs::create_dir_all(dir.join("target")).unwrap();
+        assert!(is_empty_or_cache(&dir));
+
+        // directory containing real files
+        fs::write(dir.join("Cargo.toml"), "dummy").unwrap();
+        assert!(!is_empty_or_cache(&dir));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
