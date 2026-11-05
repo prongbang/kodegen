@@ -161,7 +161,7 @@ sqlx = { version = "0.8", default-features = false, optional = true }
 # rest of this graph, with no provider system (so `ring` comes back) and three
 # unfixable advisories in `rustls-webpki 0.101` that sit squarely in certificate
 # validation. See the README.
-tiberius = { version = "0.12.3", default-features = false, features = [
+tiberius = { version = "0.13.0", default-features = false, features = [
     "tds73",
     "native-tls",
 ], optional = true }
