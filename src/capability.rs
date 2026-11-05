@@ -5573,6 +5573,8 @@ const MONGO_COMPOSE: &str = r##"  mongo:
     # timeout — 30s by default — before answering 503. Append
     # `?serverSelectionTimeoutMS=2000` to MONGODB_URL to find out sooner.
     image: mongo:8
+    environment:
+      - GLIBC_TUNABLES=glibc.pthread.rseq=1
     ports:
       - "27017:27017"
     healthcheck:

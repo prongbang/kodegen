@@ -372,6 +372,8 @@ jobs:
       # at runtime here.
       mongo:
         image: mongo:8
+        env:
+          GLIBC_TUNABLES: glibc.pthread.rseq=1
         ports:
           - 27017:27017
         options: >-
