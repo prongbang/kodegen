@@ -211,6 +211,9 @@ fn run() -> Result<()> {
                     "gRPC: {name}.{}Api Create/Get — serve with GRPC_PORT=50052, run `cargo test` to verify",
                     scaffold::pascal_case(&name)
                 ),
+                scaffold::Transport::Mcp => println!(
+                    "MCP: create_{name} and get_{name} tools scaffolded — serve with POST /mcp or RUN_MODE=mcp, run `cargo test` to verify"
+                ),
             }
         }
     }

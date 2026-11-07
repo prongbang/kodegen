@@ -13,6 +13,7 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 pub enum Transport {
     Rest,
     Grpc,
+    Mcp,
 }
 
 /// Computes the whole change in memory first (rendering every new file and
@@ -63,6 +64,12 @@ pub fn add_feature(
             creates.push((format!("src/api/{name}_grpc.rs"), render(API_GRPC_TPL)));
             creates.push((format!("tests/{name}.rs"), render(TEST_GRPC_TPL)));
         }
+        Transport::Mcp => {
+            if !project.join("src/api/mcp.rs").is_file() {
+                return Err("MCP transport requires the MCP capability — run `kodegen add mcp` first".into());
+            }
+            creates.push((format!("tests/{name}.rs"), render(TEST_MCP_TPL)));
+        }
     }
 
     // the write phase overwrites blindly, so nothing in `creates` may exist yet —
@@ -93,6 +100,7 @@ pub fn add_feature(
                     )?
                 }
                 Transport::Grpc => insert_pub_mod(&c, &format!("{name}_grpc"))?,
+                Transport::Mcp => c.to_string(),
             };
             insert_after_line(
                 &c,
@@ -151,7 +159,9 @@ pub fn add_feature(
         })?);
     }
 
-    if transport == Transport::Rest && project.join("src/api/mcp.rs").is_file() {
+    if (transport == Transport::Rest || transport == Transport::Mcp)
+        && project.join("src/api/mcp.rs").is_file()
+    {
         edits.push(edit(project, "src/api/mcp.rs", |c| {
             let tool_json = format!(
                 "                    {{\n                        \"name\": \"create_{name}\",\n                        \"description\": \"Create a new {name}\",\n                        \"inputSchema\": {{\n                            \"type\": \"object\",\n                            \"properties\": {{\n                                \"id\": {{ \"type\": \"string\" }},\n                                \"name\": {{ \"type\": \"string\" }}\n                            }},\n                            \"required\": [\"id\", \"name\"]\n                        }}\n                    }},\n                    {{\n                        \"name\": \"get_{name}\",\n                        \"description\": \"Get {name} by ID\",\n                        \"inputSchema\": {{\n                            \"type\": \"object\",\n                            \"properties\": {{\n                                \"id\": {{ \"type\": \"string\" }}\n                            }},\n                            \"required\": [\"id\"]\n                        }}\n                    }},"
@@ -536,6 +546,61 @@ async fn create_then_get_{{feature}}() {
 }
 "##;
 
+const TEST_MCP_TPL: &str = r##"use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use {{crate_name}}::bootstrap;
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn call_{{feature}}_tools_over_mcp() {
+    let app = bootstrap::build_router();
+
+    // Call create_{{feature}}
+    let create_call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "create_{{feature}}",
+            "arguments": {
+                "id": "{{feature}}_1",
+                "name": "First {{Feature}}"
+            }
+        }
+    });
+    let req = Request::post("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(create_call.to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Call get_{{feature}}
+    let get_call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "get_{{feature}}",
+            "arguments": {
+                "id": "{{feature}}_1"
+            }
+        }
+    });
+    let req = Request::post("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(get_call.to_string()))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 8192).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let text = body["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("{{feature}}_1"));
+    assert!(text.contains("First {{Feature}}"));
+}
+"##;
+
 const PROTO_TPL: &str = r##"syntax = "proto3";
 
 package {{feature}};
@@ -810,8 +875,23 @@ mod tests {
 
     #[test]
     fn dry_run_writes_nothing() {
-        for (tag, transport) in [("rest", Transport::Rest), ("grpc", Transport::Grpc)] {
+        for (tag, transport) in [
+            ("rest", Transport::Rest),
+            ("grpc", Transport::Grpc),
+            ("mcp", Transport::Mcp),
+        ] {
             let root = fixture(tag);
+            if transport == Transport::Mcp {
+                fs::write(
+                    root.join("src/api/mcp.rs"),
+                    format!(
+                        "fn tools() {{\n{}\n}}\nfn dispatch() {{\n{}\n}}\n",
+                        crate::capability::MCP_TOOLS_MARKER,
+                        crate::capability::MCP_DISPATCH_MARKER
+                    ),
+                )
+                .unwrap();
+            }
             let before = snapshot(&root);
             add_feature(&root, "order", transport, true).unwrap();
             assert_eq!(before, snapshot(&root), "{tag}: dry run touched the tree");
@@ -854,6 +934,44 @@ mod tests {
         fs::write(root.join("src/bootstrap.rs"), "fn nothing() {}\n").unwrap();
         let err = add_feature(&root, "order", Transport::Rest, true).unwrap_err().to_string();
         assert!(err.contains("anchor"), "unexpected error: {err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mcp_feature_requires_mcp_capability() {
+        let root = fixture("mcp-require");
+        let err = add_feature(&root, "order", Transport::Mcp, false).unwrap_err().to_string();
+        assert!(err.contains("requires the MCP capability"), "{err}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn mcp_feature_scaffolds_tools_and_dispatch() {
+        let root = fixture("mcp-scaffold");
+        fs::write(
+            root.join("src/api/mcp.rs"),
+            format!(
+                "fn tools() {{\n{}\n}}\nfn dispatch() {{\n{}\n}}\n",
+                crate::capability::MCP_TOOLS_MARKER,
+                crate::capability::MCP_DISPATCH_MARKER
+            ),
+        )
+        .unwrap();
+
+        let (created, edited) = add_feature(&root, "order", Transport::Mcp, false).unwrap();
+        assert!(created.contains(&"tests/order.rs".to_string()));
+        assert!(!created.contains(&"src/api/order.rs".to_string()));
+        assert!(edited.contains(&"src/api/mcp.rs".to_string()));
+
+        let mcp_src = fs::read_to_string(root.join("src/api/mcp.rs")).unwrap();
+        assert!(mcp_src.contains("\"name\": \"create_order\""));
+        assert!(mcp_src.contains("\"name\": \"get_order\""));
+        assert!(mcp_src.contains("Some(\"create_order\") =>"));
+        assert!(mcp_src.contains("Some(\"get_order\") =>"));
+
+        let test_src = fs::read_to_string(root.join("tests/order.rs")).unwrap();
+        assert!(test_src.contains("call_order_tools_over_mcp"));
+
         fs::remove_dir_all(&root).unwrap();
     }
 
